@@ -2,6 +2,7 @@
   "candidate": {
     "basis": {
       "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
+      "committed_at_utc": "2026-08-21T10:28:21Z",
       "tree_sha1": "acd75254067861dc33ef4a754734138ae3c37af3"
     },
     "package_projection_contract": "agent-plugin-tree-v1",
@@ -108,11 +109,12 @@
       }
     ],
     "packages_sha256": "sha256:ed6726c4a1749f216f936b59b94263c18ac2dfe3e349fce9bc1a9bb4f33f07c5",
+    "refreshed_at_utc": "2026-08-21T13:22:47Z",
     "repository_id": "nisavid/agents"
   },
-  "content_sha256": "sha256:9ff281acf5526196bd6bf5e43d8c23fab230dc2a488057392524b40c027865b1",
+  "content_sha256": "sha256:963c86c5b289c78fd2c8ff39aadd65426e39fb887d6af695afa1c2dfc566f6ee",
   "contract": "coordinated-source-skill-manifest-v1",
-  "observed_at_utc": "2026-08-18T06:07:48Z",
+  "research_observed_at_utc": "2026-08-18T06:07:48Z",
   "schema_version": 1,
   "scope": {
     "distribution_ids": [

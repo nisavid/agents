@@ -71,7 +71,7 @@ RESEARCH_REPORT = Path(
     "docs/superpowers/research/2026-08-18-source-skill-lineage-and-drift.md"
 )
 RESEARCH_REPORT_SHA256 = (
-    "sha256:b4b9e359a084a2b75c84804c91586c544df187b750be86393a4dc181505127ea"
+    "sha256:fd27baa90363c27cedd3a1ffeb0734aa01d207535874dd02d2d6ad9f92240dff"
 )
 LINEAGE_TREE = {
     LINEAGE_ROOT / "installed-hosts",
@@ -86,7 +86,18 @@ DISTRIBUTIONS = (
     "versionkeeping",
 )
 CANDIDATE_COMMIT_SHA1 = "8ec465ea915c6759a3693ac8515f0ee3901b8a4f"
+CANDIDATE_COMMITTED_AT_UTC = "2026-08-21T10:28:21Z"
+CANDIDATE_REFRESHED_AT_UTC = "2026-08-21T13:22:47Z"
 CANDIDATE_TREE_SHA1 = "acd75254067861dc33ef4a754734138ae3c37af3"
+CANDIDATE_REPORT_NAMES = {
+    "artifact-customs": "Artifact Customs",
+    "mergecraft": "Mergecraft",
+    "rolecasting": "Rolecasting",
+    "task-witness": "Task Witness",
+    "tricritical": "Tricritical",
+    "versionkeeping": "Versionkeeping",
+}
+RESEARCH_OBSERVED_AT_UTC = "2026-08-18T06:07:48Z"
 CANDIDATE_PACKAGE_GIT_TREES = {
     "artifact-customs": "f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4",
     "mergecraft": "82ef6a75c03d2794ea6c792dc348903a9ddfe51c",
@@ -265,7 +276,7 @@ SOURCE_MANIFEST_FIELDS = {
     "candidate",
     "content_sha256",
     "contract",
-    "observed_at_utc",
+    "research_observed_at_utc",
     "schema_version",
     "scope",
     "sources",
@@ -1850,12 +1861,22 @@ def _validate_research_report_bytes(raw: bytes) -> bytes:
         f"(https://github.com/nisavid/agents/commit/{CANDIDATE_COMMIT_SHA1}),\n"
         f"tree `{CANDIDATE_TREE_SHA1}`."
     )
+    candidate_rows = {}
+    for line in report.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 6 and cells[0] in CANDIDATE_REPORT_NAMES.values():
+            candidate_rows[cells[0]] = cells
     require(
         candidate_marker in report
+        and f"Research inventory observed at: {RESEARCH_OBSERVED_AT_UTC}" in report
+        and (
+            f"Candidate projection refreshed at: {CANDIDATE_REFRESHED_AT_UTC}" in report
+        )
         and f"| Refreshed candidate at `{CANDIDATE_COMMIT_SHA1[:8]}` |" in report
         and all(
-            f"`{tree_sha1}`" in report
-            for tree_sha1 in CANDIDATE_PACKAGE_GIT_TREES.values()
+            candidate_rows.get(CANDIDATE_REPORT_NAMES[identifier], [None] * 6)[4]
+            == f"`{tree_sha1}`"
+            for identifier, tree_sha1 in CANDIDATE_PACKAGE_GIT_TREES.items()
         ),
         "source-lineage research report candidate boundary drift",
     )
@@ -2050,6 +2071,7 @@ def _validate_candidate(
             "package_projection_contract",
             "packages",
             "packages_sha256",
+            "refreshed_at_utc",
             "repository_id",
         },
         "candidate schema drift",
@@ -2057,7 +2079,8 @@ def _validate_candidate(
     require(value["repository_id"] == "nisavid/agents", "candidate repository drift")
     basis = value["basis"]
     require(
-        type(basis) is dict and set(basis) == {"commit_sha1", "tree_sha1"},
+        type(basis) is dict
+        and set(basis) == {"commit_sha1", "committed_at_utc", "tree_sha1"},
         "candidate basis schema drift",
     )
     commit = _sha1(basis["commit_sha1"], "candidate commit")
@@ -2065,6 +2088,14 @@ def _validate_candidate(
     require(
         commit == CANDIDATE_COMMIT_SHA1 and tree == CANDIDATE_TREE_SHA1,
         "candidate basis identity drift",
+    )
+    committed_at = _utc(basis["committed_at_utc"], "candidate commit")
+    refreshed_at = _utc(value["refreshed_at_utc"], "candidate refresh")
+    require(
+        committed_at == CANDIDATE_COMMITTED_AT_UTC
+        and refreshed_at == CANDIDATE_REFRESHED_AT_UTC
+        and committed_at <= refreshed_at,
+        "candidate refresh timestamp drift",
     )
     require(
         value["package_projection_contract"] == "agent-plugin-tree-v1",
@@ -2257,7 +2288,9 @@ def validate_source_manifest(
         value["contract"] == "coordinated-source-skill-manifest-v1",
         "source manifest contract drift",
     )
-    _utc(value["observed_at_utc"], "source manifest observation")
+    research_observed_at = _utc(
+        value["research_observed_at_utc"], "source manifest research observation"
+    )
     scope = value["scope"]
     require(
         type(scope) is dict
@@ -2268,6 +2301,11 @@ def validate_source_manifest(
         "source manifest scope drift",
     )
     _validate_candidate(repository, value["candidate"], budget=budget)
+    require(
+        research_observed_at == RESEARCH_OBSERVED_AT_UTC
+        and research_observed_at <= value["candidate"]["refreshed_at_utc"],
+        "source manifest research observation drift",
+    )
     sources = value["sources"]
     require(
         type(sources) is list and bool(sources), "source inventory must be non-empty"

@@ -1,5 +1,5 @@
 {
-  "content_sha256": "sha256:1831c0bd5098412cff00100fa305d639fc11ce2cc3a1987562d9e660ebf7b5c1",
+  "content_sha256": "sha256:cce502d1c4f48bf95717e2dda6359af645ceaebd14ab49d0c828a35c46af9420",
   "contract": "coordinated-installed-source-skill-manifest-v1",
   "discovery_precedence": {
     "evidence_needed": [
@@ -13,7 +13,7 @@
   "schema_version": 1,
   "source_manifest": {
     "path": "release/source-skill-lineage/source-manifest.json",
-    "sha256": "sha256:964a37115670c65ac3453663347b9c97336f736b5923d2c4056424f1f04785c0"
+    "sha256": "sha256:d11961ed2d46231f74087e8ce50f96b5087bb3f84d39010f154d4ab475b83670"
   },
   "source_observations": [
     {

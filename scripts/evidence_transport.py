@@ -642,7 +642,7 @@ def _trusted_candidate_git_executable(*, error_factory: ErrorFactory) -> str:
     return str(resolved)
 
 
-def _run_candidate_git(
+def run_candidate_git(
     root: Path,
     arguments: list[str],
     *,
@@ -704,13 +704,13 @@ def candidate_content_identity(
         raise error_factory("cannot inspect the candidate root") from error
     if not stat.S_ISDIR(root_status.st_mode):
         _raise(error_factory, "candidate root is unsafe")
-    inventory = _run_candidate_git(
+    inventory = run_candidate_git(
         root,
         ["ls-files", "-co", "--exclude-standard", "-z"],
         error_factory=error_factory,
         operation="enumerate the candidate",
     )
-    index_inventory = _run_candidate_git(
+    index_inventory = run_candidate_git(
         root,
         ["ls-files", "--stage", "-z"],
         error_factory=error_factory,

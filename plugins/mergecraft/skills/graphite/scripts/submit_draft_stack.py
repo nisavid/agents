@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -63,6 +64,38 @@ SCP_ENDPOINT_RE = re.compile(
 )
 GRAPHITE_METADATA_MAX_BYTES = 64 * 1024 * 1024
 SUPPORTED_GRAPHITE_VERSION = "1.8.6"
+TRUSTED_COMMAND_PATH = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
+TRUSTED_SYSTEM_EXECUTABLES = {
+    "git": Path("/usr/bin/git"),
+    "ssh": Path("/usr/bin/ssh"),
+}
+TRUSTED_GRAPHITE_EXECUTABLE_ENV = "MERGECRAFT_TRUSTED_GT_EXECUTABLE"
+SUBPROCESS_ENV_ALLOWLIST = {
+    "ALL_PROXY",
+    "COMSPEC",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GRAPHITE_API_TOKEN",
+    "GRAPHITE_TOKEN",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LOGNAME",
+    "NO_PROXY",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SSH_AUTH_SOCK",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "XDG_CONFIG_HOME",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+}
 GRAPHITE_METADATA_TABLES = {
     "branch_metadata": (
         ("branch_name", "text", 1, None, 1),
@@ -193,21 +226,91 @@ def _empty_hooks_path() -> Path:
     return Path(_EMPTY_HOOKS.name).resolve()
 
 
+def _trusted_system_executable(name: str) -> str:
+    path = TRUSTED_SYSTEM_EXECUTABLES[name]
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise OSError("system executable is redirected")
+        for parent in (Path("/"), Path("/usr"), Path("/usr/bin")):
+            metadata = parent.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise OSError("system executable ancestry is mutable")
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise GraphiteTransportError(
+            f"trusted {name} executable is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+    ):
+        raise GraphiteTransportError(f"trusted {name} executable is unavailable")
+    return str(resolved)
+
+
+def _trusted_graphite_executable(root: Path) -> str:
+    configured = os.environ.get(TRUSTED_GRAPHITE_EXECUTABLE_ENV)
+    if configured is not None:
+        selected = Path(configured)
+        if not selected.is_absolute():
+            raise GraphiteTransportError("trusted gt executable is unavailable")
+    else:
+        located = shutil.which("gt", path=TRUSTED_COMMAND_PATH)
+        if located is None:
+            raise GraphiteTransportError("trusted gt executable is unavailable")
+        selected = Path(located)
+    try:
+        resolved = selected.resolve(strict=True)
+        repository = root.resolve(strict=True)
+        if resolved == repository or repository in resolved.parents:
+            raise OSError("Graphite executable is candidate-controlled")
+        for parent in reversed(resolved.parents):
+            metadata = parent.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise OSError("Graphite executable ancestry is mutable")
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError) as error:
+        raise GraphiteTransportError("trusted gt executable is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+    ):
+        raise GraphiteTransportError("trusted gt executable is unavailable")
+    return str(resolved)
+
+
+def _bind_executable(arguments: list[str], root: Path) -> list[str]:
+    if not arguments:
+        raise GraphiteTransportError("command is empty")
+    executable = arguments[0]
+    if executable in TRUSTED_SYSTEM_EXECUTABLES:
+        bound = _trusted_system_executable(executable)
+    elif executable == "gt":
+        bound = _trusted_graphite_executable(root)
+    elif Path(executable).is_absolute():
+        bound = executable
+    else:
+        raise GraphiteTransportError("command executable lacks trusted provenance")
+    return [bound, *arguments[1:]]
+
+
 def _environment() -> dict[str, str]:
     environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("GIT_")
-        and key.upper() not in {"SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"}
+        key: value for key, value in os.environ.items() if key in SUBPROCESS_ENV_ALLOWLIST
     }
-    for key in tuple(environment):
-        upper = key.upper()
-        if (
-            upper in {"GH_HOST", "GITHUB_HOST"}
-            or upper.startswith("GH_ENTERPRISE_")
-            or upper.startswith("GITHUB_ENTERPRISE_")
-        ):
-            environment.pop(key, None)
     environment["GH_HOST"] = "github.com"
     environment["GITHUB_HOST"] = "github.com"
     environment.update(
@@ -224,12 +327,18 @@ def _environment() -> dict[str, str]:
             "GIT_PROTOCOL_FROM_USER": "0",
             "GIT_SEQUENCE_EDITOR": "true",
             "GIT_SSH_COMMAND": (
-                "ssh -oBatchMode=yes -oConnectionAttempts=1 "
+                f"{_trusted_system_executable('ssh')} "
+                "-oBatchMode=yes -oConnectionAttempts=1 "
                 f"-oConnectTimeout={READ_TIMEOUT_SECONDS}"
             ),
+            "GIT_SSH_VARIANT": "ssh",
             "GIT_TERMINAL_PROMPT": "0",
             "GCM_INTERACTIVE": "never",
+            "LANG": "C",
             "LC_ALL": "C",
+            "PATH": TRUSTED_COMMAND_PATH,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "SHELL": "/bin/sh",
             "SSH_ASKPASS_REQUIRE": "never",
         }
     )
@@ -263,9 +372,10 @@ def _run_raw(
     timeout: int = READ_TIMEOUT_SECONDS,
     allowed: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
+    bound_arguments = _bind_executable(arguments, cwd)
     try:
         result = subprocess.run(
-            arguments,
+            bound_arguments,
             cwd=cwd,
             env=_environment(),
             text=True,
@@ -1146,6 +1256,7 @@ def _candidate(entry: dict[str, Any], repository: str) -> dict[str, Any]:
         raise GraphiteTransportError(f"review input drift: {error}") from error
     arguments = [
         sys.executable,
+        "-B",
         str(VALIDATOR),
         "/dev/stdin",
         "--repository",

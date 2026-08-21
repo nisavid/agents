@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -360,6 +361,32 @@ class RepositoryPlanningTests(unittest.TestCase):
 
     def plan(self, request):
         return plan_repository(self.repo, request)
+
+    def test_policy_bootstrap_never_executes_candidate_path_git(self):
+        candidate_bin = self.root / "candidate-bin"
+        candidate_bin.mkdir()
+        marker = self.root / "candidate-git-ran"
+        fake_git = candidate_bin / "git"
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            f"printf 'executed\\n' >> {shlex.quote(str(marker))}\n"
+            "case \"$*\" in\n"
+            "  *config*--name-only*) exit 0 ;;\n"
+            "  *rev-parse*--show-object-format=storage*) printf 'sha1\\n'; exit 0 ;;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+
+        with mock.patch.dict(os.environ, {"PATH": str(candidate_bin)}):
+            with adapter.GitRepository(self.repo) as repository:
+                self.assertEqual(
+                    repository.output(["rev-parse", "--show-object-format=storage"]),
+                    "sha1",
+                )
+
+        self.assertFalse(marker.exists())
 
     def test_existing_fast_forward_and_terminal_verified(self):
         source = commit(self.repo, "change")
@@ -765,7 +792,11 @@ class RepositoryPlanningTests(unittest.TestCase):
 
         def recording_run(*args, **kwargs):
             command = args[0] if args else kwargs.get("args")
-            if command and command[0] == "git" and kwargs.get("cwd") == str(self.repo):
+            if (
+                command
+                and Path(command[0]) == adapter.TRUSTED_SYSTEM_EXECUTABLES["git"]
+                and kwargs.get("cwd") == str(self.repo)
+            ):
                 observed.append(kwargs["env"])
                 observed_commands.append(command)
                 observed_stdin.append(kwargs["stdin"])
@@ -790,6 +821,8 @@ class RepositoryPlanningTests(unittest.TestCase):
                 and env.get("GIT_ASKPASS") == "false"
                 and env.get("GIT_EDITOR") == "true"
                 and "BatchMode=yes" in env.get("GIT_SSH_COMMAND", "")
+                and env.get("GIT_SSH_COMMAND", "").startswith("/usr/bin/ssh ")
+                and env.get("PATH") == adapter.TRUSTED_COMMAND_PATH
                 and "GIT_DIR" not in env
                 and "GIT_WORK_TREE" not in env
                 and "GIT_INDEX_FILE" not in env
@@ -811,6 +844,9 @@ class RepositoryPlanningTests(unittest.TestCase):
                 and "SSH_ASKPASS" not in env
                 for env in observed
             )
+        )
+        self.assertTrue(
+            all(command[0] == "/usr/bin/git" for command in observed_commands)
         )
         transport_commands = [
             command

@@ -19,13 +19,12 @@ CONTROL = re.compile(r"[\x00-\x20\x7f]")
 FORBIDDEN_REF_TOKENS = ("..", "@{", "\\", "~", "^", ":", "?", "*", "[")
 GIT_TIMEOUT_SECONDS = 120
 OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+TRUSTED_GIT_EXECUTABLE = Path("/usr/bin/git")
+TRUSTED_COMMAND_PATH = "/usr/bin:/bin"
 GIT_ENV_ALLOWLIST = {
     "COMSPEC",
     "HOME",
     "LOGNAME",
-    "PATH",
-    "PATHEXT",
-    "SHELL",
     "SYSTEMROOT",
     "TEMP",
     "TMP",
@@ -93,6 +92,34 @@ class ArgumentParser(argparse.ArgumentParser):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise InvalidTarget(message)
+
+
+def trusted_git_executable() -> str:
+    try:
+        resolved = TRUSTED_GIT_EXECUTABLE.resolve(strict=True)
+        require(
+            resolved == TRUSTED_GIT_EXECUTABLE,
+            "trusted Git executable is unavailable",
+        )
+        for parent in (Path("/"), Path("/usr"), Path("/usr/bin")):
+            metadata = parent.lstat()
+            require(
+                stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == 0
+                and stat.S_IMODE(metadata.st_mode) & 0o022 == 0,
+                "trusted Git executable is unavailable",
+            )
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise InvalidTarget("trusted Git executable is unavailable") from error
+    require(
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == 0
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+        and stat.S_IMODE(metadata.st_mode) & 0o111 != 0,
+        "trusted Git executable is unavailable",
+    )
+    return str(resolved)
 
 
 def lexical_absolute(path: Path) -> Path:
@@ -223,10 +250,18 @@ def git_environment(hooks_path: Path) -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_EDITOR": "true",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
             "GIT_PAGER": "cat",
+            "GIT_PROTOCOL_FROM_USER": "0",
             "GIT_TERMINAL_PROMPT": "0",
             "GCM_INTERACTIVE": "never",
+            "LANG": "C",
             "LC_ALL": "C",
+            "PATH": TRUSTED_COMMAND_PATH,
+            "SHELL": "/bin/sh",
+            "SSH_ASKPASS_REQUIRE": "never",
         }
     )
     closed_config = (
@@ -240,8 +275,8 @@ def git_environment(hooks_path: Path) -> dict[str, str]:
         ("protocol.allow", "never"),
         ("protocol.ext.allow", "never"),
         ("protocol.file.allow", "never"),
-        ("protocol.https.allow", "always"),
-        ("protocol.ssh.allow", "always"),
+        ("protocol.https.allow", "never"),
+        ("protocol.ssh.allow", "never"),
         ("gc.auto", "0"),
         ("maintenance.auto", "false"),
     )
@@ -254,7 +289,7 @@ def git_environment(hooks_path: Path) -> dict[str, str]:
 
 def git_arguments(clone: Path, hooks_path: Path, *arguments: str) -> list[str]:
     return [
-        "git",
+        trusted_git_executable(),
         "-c",
         f"core.hooksPath={hooks_path}",
         "-C",

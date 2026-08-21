@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -87,6 +88,32 @@ class ValidateWorktreeTargetTests(unittest.TestCase):
         self.assertEqual(closed["push.gpgSign"], "false")
         self.assertEqual(closed["commit.gpgSign"], "false")
         self.assertEqual(closed["tag.gpgSign"], "false")
+
+    def test_policy_bootstrap_never_executes_candidate_path_git(self) -> None:
+        module = load_validator_module()
+        subprocess.run(["/usr/bin/git", "init", "-q"], cwd=self.clone, check=True)
+        candidate_bin = self.root / "candidate-bin"
+        candidate_bin.mkdir()
+        marker = self.root / "candidate-git-ran"
+        fake_git = candidate_bin / "git"
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            f"printf 'executed\\n' >> {shlex.quote(str(marker))}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+        hooks = self.root / "empty-hooks"
+        hooks.mkdir()
+
+        with mock.patch.dict(os.environ, {"PATH": str(candidate_bin)}):
+            module.establish_inert_git_policy(
+                module.run_command,
+                self.clone,
+                hooks,
+            )
+
+        self.assertFalse(marker.exists())
 
     def run_validator(
         self,

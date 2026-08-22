@@ -4806,9 +4806,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 f"{epoch_three_plan['plan_digest'][:12]}"
             ).encode()
         ).hexdigest()
+        terminal_selected_ids = {
+            item["operation_id"]
+            for item in epoch_three_plan["selected_operations"]
+        }
         epoch_four_rows = deepcopy(epoch_three_recovered_rows)
         for item in epoch_four_rows:
-            if item["operation_id"] not in epoch_three_selected_ids:
+            if item["operation_id"] not in terminal_selected_ids:
                 continue
             item.update(
                 status="failed",
@@ -4870,6 +4874,390 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 prior_retry_recovery=epoch_three_retry,
                 schema_version=12,
                 created_at=1_786_830_300,
+            )
+
+        terminal_status_body = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-status",
+            "plan_digest": epoch_three_plan["plan_digest"],
+            "generation_before": epoch_four_interrupted[
+                "generation_before"
+            ],
+            "generation_after": epoch_four_interrupted["generation_after"],
+            "selected_operation_count": len(terminal_selected_ids),
+            "selected_status_counts": {
+                "failed": len(terminal_selected_ids)
+            },
+            "preserved_status_counts": epoch_three_plan[
+                "preserved_status_counts"
+            ],
+            "outside_nonterminal_counts": [],
+            "failure_classifications": [
+                {
+                    "cause_family": "provider_transport",
+                    "error_digest": "5" * 64,
+                    "occurrence_count": len(terminal_selected_ids),
+                }
+            ],
+            "observed_at": epoch_four_interrupted["observed_at"],
+        }
+        terminal_status = {
+            **terminal_status_body,
+            "status_digest": digest(terminal_status_body),
+        }
+        terminal_journal = exact_drain_application_journal(epoch_three_plan)
+        worker_exit_body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-worker-exit-evidence",
+            "worker_pid": terminal_journal["worker_pid"],
+            "worker_start_time": terminal_journal["worker_start_time"],
+            "observed_at": epoch_four_interrupted["observed_at"],
+            "state": "inactive",
+        }
+        worker_exit = {
+            **worker_exit_body,
+            "evidence_digest": digest(worker_exit_body),
+        }
+        def create_reconciliation(
+            snapshot=epoch_four_interrupted,
+            *,
+            status=terminal_status,
+            exit_evidence=worker_exit,
+        ):
+            return create_post_abort_recovery_plan(
+                epoch_three_plan,
+                snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=epoch_four_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v13-reconcile-backup.age",
+                rollback_bundle_path="/private/tmp/v13-reconcile-bundle.age",
+                authorization_receipt_path="/private/tmp/v13-reconcile-auth.json",
+                application_receipt_path="/private/tmp/v13-reconcile-app.json",
+                verification_receipt_path=(
+                    "/private/tmp/v13-reconcile-verify.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/v13-reconcile-rollback.json"
+                ),
+                reference_application_authorization=(
+                    exact_drain_authorization(epoch_three_plan)
+                ),
+                reference_application_journal=terminal_journal,
+                reference_application_progress_digest="6" * 64,
+                reference_application_receipt_digest="7" * 64,
+                reference_terminal_status=status,
+                reference_worker_exit=exit_evidence,
+                prior_retry_recovery=epoch_three_retry,
+                schema_version=13,
+                created_at=1_786_830_300,
+            )
+
+        reconciliation = create_reconciliation()
+        self.assertEqual(reconciliation["schema_version"], 13)
+        self.assertEqual(
+            reconciliation["kind"],
+            "operation-recovery-exact-drain-post-terminal-reconciliation-plan",
+        )
+        self.assertEqual(
+            reconciliation["action"],
+            "reconcile-exact-drain-post-terminal",
+        )
+        self.assertEqual(
+            reconciliation["selected_status_counts"],
+            {"failed": len(terminal_selected_ids)},
+        )
+        retry = reconciliation["retry_recovery"]
+        self.assertEqual(retry["schema_version"], 4)
+        self.assertEqual(retry["recovery_epoch_before"], 3)
+        self.assertEqual(retry["recovery_epoch_after"], 3)
+        self.assertEqual(retry["recovery_epoch_ceiling"], 3)
+        self.assertEqual(retry["reconciliation_cycle_before"], 0)
+        self.assertEqual(retry["reconciliation_cycle_after"], 1)
+        self.assertEqual(retry["reconciliation_cycle_ceiling"], 1)
+        self.assertEqual(retry["maximum_cumulative_attempts"], 20)
+        self.assertEqual(
+            verify_post_abort_recovery_plan(
+                reconciliation,
+                now=reconciliation["created_at"],
+            ),
+            reconciliation,
+        )
+
+        nonterminal = deepcopy(epoch_four_interrupted)
+        nonterminal_row = next(
+            item
+            for item in nonterminal["operations"]
+            if item["operation_id"] in terminal_selected_ids
+        )
+        nonterminal_row.update(
+            current_status="pending",
+            completed_at=None,
+            worker_id_present=False,
+            worker_id_digest=None,
+            claimed_at=None,
+        )
+        nonterminal_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in nonterminal_row.items()
+                if key != "row_digest"
+            }
+        )
+        nonterminal["status_counts"] = {
+            **nonterminal["status_counts"],
+            "failed": len(terminal_selected_ids) - 1,
+            "pending": 1,
+        }
+        nonterminal["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in nonterminal.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "row set is invalid",
+        ):
+            create_reconciliation(nonterminal)
+
+        active_worker_body = {
+            **worker_exit_body,
+            "state": "running",
+        }
+        active_worker = {
+            **active_worker_body,
+            "evidence_digest": digest(active_worker_body),
+        }
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "worker exit is invalid",
+        ):
+            create_reconciliation(exit_evidence=active_worker)
+
+        reconciled_rows = []
+        for item in epoch_four_interrupted["operations"]:
+            row = {
+                "operation_id": item["operation_id"],
+                "bank_id": "engineering",
+                "operation_type": item["operation_type"],
+                "status": item["current_status"],
+                "created_at": item["created_at"],
+                "updated_at": item["updated_at"],
+                "completed_at": item["completed_at"],
+                "retry_count": item["retry_count"],
+                "next_retry_at": item["next_retry_at"],
+                "worker_id_present": item["worker_id_present"],
+                "worker_id_digest": item["worker_id_digest"],
+                "claimed_at": item["claimed_at"],
+                "task_payload_present": item["task_payload_present"],
+                "task_payload_digest": item["task_payload_digest"],
+                "result_metadata_digest": item["result_metadata_digest"],
+                "error_category": item["error_category"],
+                "error_digest": item["error_digest"],
+            }
+            if item["operation_id"] in terminal_selected_ids:
+                row.update(
+                    status="pending",
+                    updated_at="2026-08-20T15:00:00.000000Z",
+                    completed_at=None,
+                    retry_count=0,
+                    next_retry_at=None,
+                    worker_id_present=False,
+                    worker_id_digest=None,
+                    claimed_at=None,
+                    error_category="none",
+                    error_digest=None,
+                )
+            reconciled_rows.append(row)
+        reconciled_snapshot = dict(
+            create_live_snapshot(
+                self.cohort(),
+                reconciled_rows,
+                generation_before="systalyze:public:81706",
+                generation_after="systalyze:public:81706",
+                installation_authority=rebound_installation_authority(),
+                observed_at=1_786_830_400,
+            )
+        )
+        reconciliation_context = {
+            "schema_version": 4,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-terminal-reconciliation",
+            "generation": reconciled_snapshot["generation_before"],
+            "recovery_epoch": 3,
+            "reconciliation_cycle": 1,
+            "candidate_release_digest": release_identity()["release_digest"],
+            "selected_operation_ids_digest": digest(
+                sorted(terminal_selected_ids)
+            ),
+            "initial_origin_digest": None,
+            "post_terminal_reconciliation_plan_digest": reconciliation[
+                "plan_digest"
+            ],
+            "post_terminal_reconciliation_application_receipt_digest": (
+                "8" * 64
+            ),
+            "post_terminal_reconciliation_verification_receipt_digest": (
+                "9" * 64
+            ),
+            "terminal_plan_digest": epoch_three_plan["plan_digest"],
+            "terminal_authorization_receipt_digest": (
+                exact_drain_authorization(epoch_three_plan)["receipt_digest"]
+            ),
+            "terminal_application_receipt_digest": "7" * 64,
+            "terminal_progress_digest": "6" * 64,
+            "terminal_status_digest": terminal_status["status_digest"],
+            "retry_recovery_digest": reconciliation[
+                "retry_recovery_digest"
+            ],
+            "selected_checkpoint_set_digest": reconciliation[
+                "selected_checkpoint_set_digest"
+            ],
+            "preserved_row_set_digest": reconciliation[
+                "preserved_row_set_digest"
+            ],
+        }
+        reconciled_backup = drain_backup_evidence()
+        reconciled_backup["source_authority"]["data_identity_digest"] = (
+            reconciled_snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        for key in ("generation_before", "generation_after"):
+            reconciled_backup["source_authority"][key] = (
+                reconciled_snapshot[key]
+            )
+        reconciled_backup["source_authority_digest"] = digest(
+            reconciled_backup["source_authority"]
+        )
+        capability = recovery_contract.create_hatchery_capability_receipt(
+            provider_policy_digest="9" * 64,
+            provider_identity_digest="a" * 64,
+            model_digest="b" * 64,
+            observed_at=1_786_830_400,
+            successful=True,
+        )
+        schema_thirteen_plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            reconciled_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=reconciled_backup,
+            rollback_backup_path="/private/tmp/v13-drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/v13-drain-auth.json",
+            application_receipt_path="/private/tmp/v13-drain-app.json",
+            status_artifact_path="/private/tmp/v13-drain-status.json",
+            verification_receipt_path="/private/tmp/v13-drain-verify.json",
+            recovery_context=reconciliation_context,
+            hatchery_capability_receipt=capability,
+            created_at=1_786_830_401,
+            schema_version=13,
+        )
+        self.assertEqual(
+            schema_thirteen_plan["recovery_context"],
+            reconciliation_context,
+        )
+        self.assertEqual(
+            schema_thirteen_plan["phase_repair_contract_digest"],
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                schema_thirteen_plan,
+                now=schema_thirteen_plan["created_at"],
+            ),
+            schema_thirteen_plan,
+        )
+
+        unsuccessful = deepcopy(schema_thirteen_plan)
+        unsuccessful_capability = (
+            recovery_contract.create_hatchery_capability_receipt(
+                provider_policy_digest="9" * 64,
+                provider_identity_digest="a" * 64,
+                model_digest="b" * 64,
+                observed_at=1_786_830_400,
+                successful=False,
+            )
+        )
+        unsuccessful["hatchery_capability_receipt"] = (
+            unsuccessful_capability
+        )
+        unsuccessful["hatchery_capability_receipt_digest"] = (
+            unsuccessful_capability["receipt_digest"]
+        )
+        unsuccessful["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in unsuccessful.items()
+                if key != "plan_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain plan is invalid",
+        ):
+            recovery_contract.verify_exact_drain_plan(
+                unsuccessful,
+                now=unsuccessful["created_at"],
+            )
+
+        stale_authorization = exact_drain_authorization(
+            schema_thirteen_plan
+        )
+        stale_authorization["authorized_at"] = (
+            capability["observed_at"]
+            + recovery_contract.EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+            + 1
+        )
+        stale_authorization["receipt_digest"] = digest(
+            {
+                key: value
+                for key, value in stale_authorization.items()
+                if key != "receipt_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "authorization receipt is invalid",
+        ):
+            verify_exact_drain_authorization_receipt(
+                stale_authorization,
+                plan=schema_thirteen_plan,
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "schema does not match recovery epoch",
+        ):
+            create_post_abort_recovery_plan(
+                schema_thirteen_plan,
+                epoch_four_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=epoch_four_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v13-cycle2-backup.age",
+                rollback_bundle_path="/private/tmp/v13-cycle2-bundle.age",
+                authorization_receipt_path="/private/tmp/v13-cycle2-auth.json",
+                application_receipt_path="/private/tmp/v13-cycle2-app.json",
+                verification_receipt_path="/private/tmp/v13-cycle2-verify.json",
+                rollback_receipt_path="/private/tmp/v13-cycle2-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(schema_thirteen_plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(schema_thirteen_plan)
+                ),
+                reference_application_progress_digest="c" * 64,
+                prior_retry_recovery=reconciliation["retry_recovery"],
+                reference_application_receipt_digest="d" * 64,
+                reference_terminal_status=terminal_status,
+                reference_worker_exit=worker_exit,
+                schema_version=13,
+                created_at=1_786_830_500,
             )
 
         for legacy_schema_version in range(4, 10):

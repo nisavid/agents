@@ -769,6 +769,30 @@ EXACT_DRAIN_RECOVERY_CONTEXT_KEYS = frozenset(
         "preserved_row_set_digest",
     }
 )
+EXACT_DRAIN_RECOVERY_CONTEXT_V4_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "origin",
+        "generation",
+        "recovery_epoch",
+        "reconciliation_cycle",
+        "candidate_release_digest",
+        "selected_operation_ids_digest",
+        "initial_origin_digest",
+        "post_terminal_reconciliation_plan_digest",
+        "post_terminal_reconciliation_application_receipt_digest",
+        "post_terminal_reconciliation_verification_receipt_digest",
+        "terminal_plan_digest",
+        "terminal_authorization_receipt_digest",
+        "terminal_application_receipt_digest",
+        "terminal_progress_digest",
+        "terminal_status_digest",
+        "retry_recovery_digest",
+        "selected_checkpoint_set_digest",
+        "preserved_row_set_digest",
+    }
+)
 EXACT_DRAIN_PLAN_V10_KEYS = (
     EXACT_DRAIN_PLAN_V9_KEYS - frozenset({"execution_lease_seconds"})
 ) | frozenset(
@@ -788,6 +812,22 @@ EXACT_DRAIN_PLAN_V11_KEYS = EXACT_DRAIN_PLAN_V10_KEYS | frozenset(
 )
 EXACT_DRAIN_PLAN_V12_KEYS = EXACT_DRAIN_PLAN_V11_KEYS | frozenset(
     {"operation_attempt_timeout_disposition"}
+)
+EXACT_DRAIN_PLAN_V13_KEYS = EXACT_DRAIN_PLAN_V12_KEYS | frozenset(
+    {"hatchery_capability_receipt", "hatchery_capability_receipt_digest"}
+)
+HATCHERY_CAPABILITY_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "provider_id",
+        "provider_policy_digest",
+        "provider_identity_digest",
+        "model_digest",
+        "observed_at",
+        "successful",
+        "receipt_digest",
+    }
 )
 POST_ABORT_PLAN_V1_KEYS = frozenset(
     {
@@ -855,6 +895,15 @@ POST_ABORT_PLAN_V10_KEYS = POST_ABORT_PLAN_V9_KEYS | frozenset(
 )
 POST_ABORT_PLAN_V11_KEYS = POST_ABORT_PLAN_V10_KEYS
 POST_ABORT_PLAN_V12_KEYS = POST_ABORT_PLAN_V11_KEYS
+POST_ABORT_PLAN_V13_KEYS = POST_ABORT_PLAN_V12_KEYS | frozenset(
+    {
+        "reference_application_receipt_digest",
+        "reference_terminal_status",
+        "reference_terminal_status_digest",
+        "reference_worker_exit",
+        "reference_worker_exit_digest",
+    }
+)
 POST_ABORT_V10_RETRY_RECOVERY_KEYS = frozenset(
     {
         "schema_version",
@@ -909,6 +958,28 @@ POST_ABORT_V11_RETRY_OPERATION_KEYS = frozenset(
 )
 POST_ABORT_V12_RETRY_RECOVERY_KEYS = POST_ABORT_V11_RETRY_RECOVERY_KEYS
 POST_ABORT_V12_RETRY_OPERATION_KEYS = POST_ABORT_V11_RETRY_OPERATION_KEYS
+POST_ABORT_V13_RETRY_RECOVERY_KEYS = (
+    POST_ABORT_V12_RETRY_RECOVERY_KEYS
+    | frozenset(
+        {
+            "reconciliation_cycle_before",
+            "reconciliation_cycle_after",
+            "reconciliation_cycle_ceiling",
+        }
+    )
+)
+POST_ABORT_V13_RETRY_OPERATION_KEYS = POST_ABORT_V12_RETRY_OPERATION_KEYS
+POST_ABORT_REFERENCE_WORKER_EXIT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "worker_pid",
+        "worker_start_time",
+        "observed_at",
+        "state",
+        "evidence_digest",
+    }
+)
 POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
     {
         "schema_version",
@@ -1885,7 +1956,7 @@ def _assert_installation_authority_schema(
     *,
     plan_schema_version: int,
 ) -> None:
-    if "schema_version" in authority and plan_schema_version not in {11, 12}:
+    if "schema_version" in authority and plan_schema_version not in {11, 12, 13}:
         raise OperationRecoveryError(
             "operation-recovery verified rebind authority requires "
             "schema 11"
@@ -2613,7 +2684,7 @@ def _exact_drain_execution_window(
     )
     attempt_timeout_seconds = (
         EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
-        if schema_version in {11, 12}
+        if schema_version in {11, 12, 13}
         else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
     )
     calculated_seconds = (
@@ -2628,7 +2699,7 @@ def _exact_drain_execution_window(
             "operation-recovery exact drain execution window exceeds maximum"
         )
     return {
-        "schema_version": 2 if schema_version in {11, 12} else 1,
+        "schema_version": 2 if schema_version in {11, 12, 13} else 1,
         "kind": "operation-recovery-exact-drain-execution-window",
         "anchor": "authorization-receipt-authorized-at",
         "renewable": False,
@@ -2644,7 +2715,7 @@ def _exact_drain_execution_window(
                     EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
                 )
             }
-            if schema_version in {11, 12}
+            if schema_version in {11, 12, 13}
             else {
                 "phase_one_timeout_seconds": (
                     EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
@@ -2829,6 +2900,103 @@ def _verified_exact_drain_provider_timeout_contract(
     }
 
 
+def create_hatchery_capability_receipt(
+    *,
+    provider_policy_digest: str,
+    provider_identity_digest: str,
+    model_digest: str,
+    observed_at: int | None = None,
+    successful: bool,
+) -> Mapping[str, Any]:
+    """Create payload-free evidence for one exact Hatchery route probe."""
+    if type(successful) is not bool:
+        raise OperationRecoveryError(
+            "operation-recovery Hatchery capability result is invalid"
+        )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-hatchery-capability-receipt",
+        "provider_id": "hatchery",
+        "provider_policy_digest": _sha(
+            provider_policy_digest,
+            "Hatchery capability provider policy digest",
+        ),
+        "provider_identity_digest": _sha(
+            provider_identity_digest,
+            "Hatchery capability provider identity digest",
+        ),
+        "model_digest": _sha(
+            model_digest,
+            "Hatchery capability model digest",
+        ),
+        "observed_at": (
+            int(time.time())
+            if observed_at is None
+            else _integer(
+                observed_at,
+                "Hatchery capability observed-at",
+            )
+        ),
+        "successful": successful,
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
+def verify_hatchery_capability_receipt(value: Any) -> Mapping[str, Any]:
+    receipt = _closed(
+        _normalized(value),
+        HATCHERY_CAPABILITY_RECEIPT_KEYS,
+        "Hatchery capability receipt",
+    )
+    body = {
+        "schema_version": _integer(
+            receipt["schema_version"],
+            "Hatchery capability schema version",
+        ),
+        "kind": _text(
+            receipt["kind"],
+            "Hatchery capability kind",
+        ),
+        "provider_id": _text(
+            receipt["provider_id"],
+            "Hatchery capability provider ID",
+        ),
+        "provider_policy_digest": _sha(
+            receipt["provider_policy_digest"],
+            "Hatchery capability provider policy digest",
+        ),
+        "provider_identity_digest": _sha(
+            receipt["provider_identity_digest"],
+            "Hatchery capability provider identity digest",
+        ),
+        "model_digest": _sha(
+            receipt["model_digest"],
+            "Hatchery capability model digest",
+        ),
+        "observed_at": _integer(
+            receipt["observed_at"],
+            "Hatchery capability observed-at",
+        ),
+        "successful": receipt["successful"],
+    }
+    if (
+        type(body["successful"]) is not bool
+        or body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-hatchery-capability-receipt"
+        or body["provider_id"] != "hatchery"
+        or _sha(
+            receipt["receipt_digest"],
+            "Hatchery capability receipt digest",
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery Hatchery capability receipt is invalid"
+        )
+    return {**body, "receipt_digest": receipt["receipt_digest"]}
+
+
 def _exact_drain_recovery_context(
     value: Mapping[str, Any] | None,
     *,
@@ -2931,8 +3099,85 @@ def _exact_drain_recovery_context(
             "selected_checkpoint_set_digest": None,
             "preserved_row_set_digest": None,
         }
+    normalized_value = _normalized(value)
+    if (
+        isinstance(normalized_value, Mapping)
+        and normalized_value.get("schema_version") == 4
+    ):
+        context = _closed(
+            normalized_value,
+            EXACT_DRAIN_RECOVERY_CONTEXT_V4_KEYS,
+            "exact drain recovery context",
+        )
+        digest_keys = (
+            "post_terminal_reconciliation_plan_digest",
+            "post_terminal_reconciliation_application_receipt_digest",
+            "post_terminal_reconciliation_verification_receipt_digest",
+            "terminal_plan_digest",
+            "terminal_authorization_receipt_digest",
+            "terminal_application_receipt_digest",
+            "terminal_progress_digest",
+            "terminal_status_digest",
+            "retry_recovery_digest",
+            "selected_checkpoint_set_digest",
+            "preserved_row_set_digest",
+        )
+        body = {
+            "schema_version": 4,
+            "kind": _text(
+                context["kind"],
+                "exact drain recovery context kind",
+            ),
+            "origin": _text(
+                context["origin"],
+                "exact drain recovery context origin",
+            ),
+            "generation": _text(
+                context["generation"],
+                "exact drain recovery context generation",
+            ),
+            "recovery_epoch": _integer(
+                context["recovery_epoch"],
+                "exact drain recovery epoch",
+            ),
+            "reconciliation_cycle": _integer(
+                context["reconciliation_cycle"],
+                "exact drain reconciliation cycle",
+            ),
+            "candidate_release_digest": _sha(
+                context["candidate_release_digest"],
+                "exact drain recovery candidate release digest",
+            ),
+            "selected_operation_ids_digest": _sha(
+                context["selected_operation_ids_digest"],
+                "exact drain selected operation ids digest",
+            ),
+            "initial_origin_digest": context["initial_origin_digest"],
+            **{
+                key: _sha(context[key], f"exact drain recovery {key}")
+                for key in digest_keys
+            },
+        }
+        if (
+            plan_schema_version != 13
+            or body["kind"]
+            != "operation-recovery-exact-drain-recovery-context"
+            or body["origin"] != "post-terminal-reconciliation"
+            or body["generation"] != snapshot["generation_before"]
+            or body["recovery_epoch"] != 3
+            or body["reconciliation_cycle"] != 1
+            or body["candidate_release_digest"]
+            != candidate_release["release_digest"]
+            or body["selected_operation_ids_digest"]
+            != selected_operation_ids_digest
+            or body["initial_origin_digest"] is not None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain recovery context is invalid"
+            )
+        return body
     context = _closed(
-        _normalized(value),
+        normalized_value,
         EXACT_DRAIN_RECOVERY_CONTEXT_KEYS,
         "exact drain recovery context",
     )
@@ -3051,7 +3296,7 @@ def exact_drain_execution_window_seconds(
             plan.get("execution_lease_seconds"),
             "exact drain legacy execution lease",
         )
-    if schema_version in {10, 11, 12}:
+    if schema_version in {10, 11, 12, 13}:
         return _verified_exact_drain_execution_window(
             plan.get("execution_window")
         )["calculated_seconds"]
@@ -3089,11 +3334,12 @@ def create_exact_drain_plan(
     status_artifact_path: str,
     verification_receipt_path: str,
     recovery_context: Mapping[str, Any] | None = None,
+    hatchery_capability_receipt: Mapping[str, Any] | None = None,
     created_at: int | None = None,
     schema_version: int = 12,
 ) -> Mapping[str, Any]:
     """Plan an exact-ID worker drain without starting a worker."""
-    if type(schema_version) is not int or schema_version not in {10, 11, 12}:
+    if type(schema_version) is not int or schema_version not in {10, 11, 12, 13}:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan schema is invalid"
         )
@@ -3233,6 +3479,32 @@ def create_exact_drain_plan(
         candidate_release=release,
         plan_schema_version=schema_version,
     )
+    capability_fields = {}
+    if schema_version == 13:
+        if hatchery_capability_receipt is None:
+            raise OperationRecoveryError(
+                "operation-recovery Hatchery capability receipt is required"
+            )
+        capability = verify_hatchery_capability_receipt(
+            hatchery_capability_receipt
+        )
+        if (
+            not capability["successful"]
+            or capability["provider_policy_digest"]
+            != _sha(provider_policy_digest, "provider policy digest")
+            or capability["observed_at"] > planned_at
+            or planned_at - capability["observed_at"]
+            > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery Hatchery capability receipt is invalid"
+            )
+        capability_fields = {
+            "hatchery_capability_receipt": capability,
+            "hatchery_capability_receipt_digest": capability[
+                "receipt_digest"
+            ],
+        }
     body = {
         "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-plan",
@@ -3276,6 +3548,7 @@ def create_exact_drain_plan(
         "execution_window": execution_window,
         "recovery_context": checked_recovery_context,
         "recovery_context_digest": digest(checked_recovery_context),
+        **capability_fields,
         "phase_one_statement_timeout_seconds": (
             EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
         ),
@@ -3301,26 +3574,32 @@ def create_exact_drain_plan(
                             "task-retry-after-quiescence"
                         )
                     }
-                    if schema_version == 12
+                    if schema_version in {12, 13}
                     else {}
                 ),
             }
         ),
         "phase_repair_contract_digest": (
-            EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
-            if schema_version == 12
+            EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
+            if schema_version == 13
             else (
-                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST
-                if schema_version == 11
-                else EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
+                if schema_version == 12
+                else (
+                    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST
+                    if schema_version == 11
+                    else EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST
+                )
             )
         ),
         "progress_schema_version": (
-            5 if schema_version == 12 else (4 if schema_version == 11 else 3)
+            5
+            if schema_version in {12, 13}
+            else (4 if schema_version == 11 else 3)
         ),
         "failure_evidence_contract_digest": (
             EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
-            if schema_version == 12
+            if schema_version in {12, 13}
             else (
                 EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
                 if schema_version == 11
@@ -3346,7 +3625,7 @@ def verify_exact_drain_plan(
         )
     schema_version = normalized.get("schema_version")
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
     }:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
@@ -3366,6 +3645,7 @@ def verify_exact_drain_plan(
             10: EXACT_DRAIN_PLAN_V10_KEYS,
             11: EXACT_DRAIN_PLAN_V11_KEYS,
             12: EXACT_DRAIN_PLAN_V12_KEYS,
+            13: EXACT_DRAIN_PLAN_V13_KEYS,
         }[schema_version],
         "operation-recovery exact drain plan",
     )
@@ -3430,7 +3710,7 @@ def verify_exact_drain_plan(
     )
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery exact drain plan expired")
-    if schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
         evidence_observed_at = _integer(
             plan["evidence_observed_at"],
             "exact drain evidence observed-at",
@@ -3456,7 +3736,7 @@ def verify_exact_drain_plan(
         evidence_max_age_seconds = None
         transaction_timeout_seconds = None
         execution_lease_seconds = None
-    if schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
         phase_one_statement_timeout_seconds = _integer(
             plan["phase_one_statement_timeout_seconds"],
             "exact drain phase-one statement timeout",
@@ -3473,7 +3753,7 @@ def verify_exact_drain_plan(
         phase_one_statement_timeout_seconds = None
         phase_one_timeout_seconds = None
         phase_repair_contract_digest = None
-    if schema_version in {6, 7, 8, 9, 10, 11, 12}:
+    if schema_version in {6, 7, 8, 9, 10, 11, 12, 13}:
         phase_one_client_timeout_seconds = _integer(
             plan["phase_one_client_timeout_seconds"],
             "exact drain phase-one client timeout",
@@ -3491,7 +3771,7 @@ def verify_exact_drain_plan(
         progress_schema_version = None
         failure_evidence_contract_digest = None
     release = _candidate_release(plan["candidate_release"])
-    if schema_version in {10, 11, 12}:
+    if schema_version in {10, 11, 12, 13}:
         execution_window = _verified_exact_drain_execution_window(
             plan["execution_window"]
         )
@@ -3517,7 +3797,7 @@ def verify_exact_drain_plan(
         expected_execution_window = None
         recovery_context = None
         recovery_context_digest = None
-    if schema_version in {11, 12}:
+    if schema_version in {11, 12, 13}:
         operation_attempt_timeout_seconds = _integer(
             plan["operation_attempt_timeout_seconds"],
             "exact drain operation-attempt timeout",
@@ -3539,7 +3819,7 @@ def verify_exact_drain_plan(
                 "exact drain operation-attempt timeout disposition",
                 maximum=128,
             )
-            if schema_version == 12
+            if schema_version in {12, 13}
             else None
         )
     else:
@@ -3548,6 +3828,19 @@ def verify_exact_drain_plan(
         phase_one_nested_stage_prefixes = None
         provider_timeout_contract = None
         operation_attempt_timeout_disposition = None
+    capability_fields = {}
+    if schema_version == 13:
+        capability = verify_hatchery_capability_receipt(
+            plan["hatchery_capability_receipt"]
+        )
+        capability_digest = _sha(
+            plan["hatchery_capability_receipt_digest"],
+            "Hatchery capability receipt digest",
+        )
+        capability_fields = {
+            "hatchery_capability_receipt": capability,
+            "hatchery_capability_receipt_digest": capability_digest,
+        }
     backup = _backup(
         plan["rollback_backup"],
         "operation-recovery exact drain backup",
@@ -3596,7 +3889,7 @@ def verify_exact_drain_plan(
         )
     )
     if (
-        schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+        schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
         or plan.get("action") != "drain-exact-operation-cohort"
         or plan.get("authority") != "unapproved-plan"
@@ -3649,7 +3942,7 @@ def verify_exact_drain_plan(
             else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
         )
         or (
-            schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
             and (
                 evidence_observed_at != snapshot["observed_at"]
                 or evidence_max_age_seconds
@@ -3667,14 +3960,14 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {10, 11, 12}
+            schema_version in {10, 11, 12, 13}
             and (
                 execution_window != expected_execution_window
                 or recovery_context_digest != digest(recovery_context)
             )
         )
         or (
-            schema_version in {11, 12}
+            schema_version in {11, 12, 13}
             and (
                 operation_attempt_timeout_seconds
                 != EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
@@ -3683,14 +3976,14 @@ def verify_exact_drain_plan(
                 or provider_timeout_contract
                 != EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
                 or (
-                    schema_version == 12
+                    schema_version in {12, 13}
                     and operation_attempt_timeout_disposition
                     != "task-retry-after-quiescence"
                 )
             )
         )
         or (
-            schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
             and (
                 phase_one_statement_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
@@ -3709,12 +4002,13 @@ def verify_exact_drain_plan(
                         10: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
                         11: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
                         12: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST,
+                        13: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
                     }[schema_version]
                 )
             )
         )
         or (
-            schema_version in {6, 7, 8, 9, 10, 11, 12}
+            schema_version in {6, 7, 8, 9, 10, 11, 12, 13}
             and (
                 phase_one_client_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS
@@ -3723,7 +4017,7 @@ def verify_exact_drain_plan(
                 or progress_schema_version
                 != (
                     5
-                    if schema_version == 12
+                    if schema_version in {12, 13}
                     else (
                         4
                         if schema_version == 11
@@ -3733,7 +4027,7 @@ def verify_exact_drain_plan(
                 or failure_evidence_contract_digest
                 != (
                     EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
-                    if schema_version == 12
+                    if schema_version in {12, 13}
                     else (
                         EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
                         if schema_version == 11
@@ -3744,6 +4038,31 @@ def verify_exact_drain_plan(
                         )
                     )
                 )
+            )
+        )
+        or (
+            schema_version == 13
+            and (
+                capability_fields["hatchery_capability_receipt_digest"]
+                != capability_fields["hatchery_capability_receipt"][
+                    "receipt_digest"
+                ]
+                or capability_fields["hatchery_capability_receipt"][
+                    "provider_policy_digest"
+                ]
+                != plan["provider_policy_digest"]
+                or not capability_fields["hatchery_capability_receipt"][
+                    "successful"
+                ]
+                or capability_fields["hatchery_capability_receipt"][
+                    "observed_at"
+                ]
+                > created_at
+                or created_at
+                - capability_fields["hatchery_capability_receipt"][
+                    "observed_at"
+                ]
+                > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
             )
         )
         or len(
@@ -3827,7 +4146,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
             else {
                 "phase_one_statement_timeout_seconds": (
                     phase_one_statement_timeout_seconds
@@ -3840,7 +4159,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {6, 7, 8, 9, 10, 11, 12}
+            if schema_version not in {6, 7, 8, 9, 10, 11, 12, 13}
             else {
                 "phase_one_client_timeout_seconds": (
                     phase_one_client_timeout_seconds
@@ -3853,7 +4172,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {11, 12}
+            if schema_version not in {11, 12, 13}
             else {
                 "operation_attempt_timeout_seconds": (
                     operation_attempt_timeout_seconds
@@ -3869,11 +4188,12 @@ def verify_exact_drain_plan(
                             operation_attempt_timeout_disposition
                         )
                     }
-                    if schema_version == 12
+                    if schema_version in {12, 13}
                     else {}
                 ),
             }
         ),
+        **capability_fields,
         "created_at": created_at,
         "expires_at": expires_at,
     }
@@ -4121,7 +4441,7 @@ def _verified_post_abort_retry_recovery(
     *,
     expected_schema_version: int,
 ) -> dict[str, Any]:
-    if expected_schema_version not in {1, 2, 3}:
+    if expected_schema_version not in {1, 2, 3, 4}:
         raise OperationRecoveryError(
             "operation-recovery post-abort retry recovery is invalid"
         )
@@ -4133,7 +4453,11 @@ def _verified_post_abort_retry_recovery(
             else (
                 POST_ABORT_V11_RETRY_RECOVERY_KEYS
                 if expected_schema_version == 2
-                else POST_ABORT_V12_RETRY_RECOVERY_KEYS
+                else (
+                    POST_ABORT_V12_RETRY_RECOVERY_KEYS
+                    if expected_schema_version == 3
+                    else POST_ABORT_V13_RETRY_RECOVERY_KEYS
+                )
             )
         ),
         "post-abort retry recovery",
@@ -4150,7 +4474,11 @@ def _verified_post_abort_retry_recovery(
         else (
             POST_ABORT_V11_RETRY_OPERATION_KEYS
             if expected_schema_version == 2
-            else POST_ABORT_V12_RETRY_OPERATION_KEYS
+            else (
+                POST_ABORT_V12_RETRY_OPERATION_KEYS
+                if expected_schema_version == 3
+                else POST_ABORT_V13_RETRY_OPERATION_KEYS
+            )
         )
     )
     for item_value in operations_value:
@@ -4239,6 +4567,24 @@ def _verified_post_abort_retry_recovery(
             retry_recovery_value["recovery_epoch_ceiling"],
             "post-abort recovery epoch ceiling",
         ),
+        **(
+            {}
+            if expected_schema_version != 4
+            else {
+                "reconciliation_cycle_before": _integer(
+                    retry_recovery_value["reconciliation_cycle_before"],
+                    "post-terminal reconciliation cycle before",
+                ),
+                "reconciliation_cycle_after": _integer(
+                    retry_recovery_value["reconciliation_cycle_after"],
+                    "post-terminal reconciliation cycle after",
+                ),
+                "reconciliation_cycle_ceiling": _integer(
+                    retry_recovery_value["reconciliation_cycle_ceiling"],
+                    "post-terminal reconciliation cycle ceiling",
+                ),
+            }
+        ),
         "ordinary_retry_ceiling": _integer(
             retry_recovery_value["ordinary_retry_ceiling"],
             "post-abort ordinary retry ceiling",
@@ -4281,8 +4627,6 @@ def _verified_post_abort_retry_recovery(
     }
     invalid = (
         body["schema_version"] != expected_schema_version
-        or body["kind"]
-        != "operation-recovery-post-abort-retry-recovery"
         or body["operation_count"] != len(operations)
         or body["failed_reset_count"]
         != sum(item["reset_applied"] for item in operations)
@@ -4290,9 +4634,24 @@ def _verified_post_abort_retry_recovery(
         != len(operations)
         or body["operation_set_digest"] != digest(operations)
     )
-    if expected_schema_version in {2, 3}:
+    if expected_schema_version in {2, 3, 4}:
         invalid = invalid or body["prior_retry_recovery_digest"] != digest(
             body["prior_retry_recovery"]
+        )
+    if expected_schema_version == 4:
+        invalid = invalid or (
+            body["kind"]
+            != "operation-recovery-post-terminal-reconciliation-retry-recovery"
+            or body["recovery_epoch_before"] != 3
+            or body["recovery_epoch_after"] != 3
+            or body["recovery_epoch_ceiling"] != 3
+            or body["reconciliation_cycle_before"] != 0
+            or body["reconciliation_cycle_after"] != 1
+            or body["reconciliation_cycle_ceiling"] != 1
+        )
+    else:
+        invalid = invalid or body["kind"] != (
+            "operation-recovery-post-abort-retry-recovery"
         )
     if invalid:
         raise OperationRecoveryError(
@@ -4479,6 +4838,156 @@ def _post_abort_v11_retry_recovery(
     }
 
 
+def _retry_lineage_operation(
+    retry_recovery: Mapping[str, Any],
+    operation_id: str,
+) -> Mapping[str, Any] | None:
+    """Return the newest recorded attempt ledger entry for one operation."""
+    match = next(
+        (
+            item
+            for item in retry_recovery["operations"]
+            if item["operation_id"] == operation_id
+        ),
+        None,
+    )
+    if match is not None:
+        return match
+    prior = retry_recovery.get("prior_retry_recovery")
+    return (
+        _retry_lineage_operation(prior, operation_id)
+        if isinstance(prior, Mapping)
+        else None
+    )
+
+
+def _post_terminal_reconciliation_retry_recovery(
+    reference_plan: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    current: Mapping[str, Mapping[str, Any]],
+    prior_retry_recovery_value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Authorize one bounded cycle without inventing recovery epoch four."""
+    context = reference_plan.get("recovery_context")
+    if (
+        reference_plan.get("schema_version") != 12
+        or not isinstance(context, Mapping)
+        or context.get("schema_version") != 3
+        or context.get("origin") != "post-abort"
+        or context.get("recovery_epoch") != 3
+        or prior_retry_recovery_value is None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-terminal reconciliation is invalid"
+        )
+    prior = _verified_post_abort_retry_recovery(
+        prior_retry_recovery_value,
+        expected_schema_version=3,
+    )
+    prior_digest = digest(prior)
+    reference_selected = {
+        item["operation_id"]: item
+        for item in reference_plan["selected_operations"]
+    }
+    reference_snapshot = {
+        item["operation_id"]: item
+        for item in reference_plan["live_snapshot"]["operations"]
+    }
+    selected_ids = {item["operation_id"] for item in selected}
+    ordinary_retry_ceiling = reference_plan["worker_max_retries"]
+    ordinary_attempt_ceiling = reference_plan["worker_max_attempts"]
+    maximum_cumulative_attempts = ordinary_attempt_ceiling * 5
+    if (
+        context.get("retry_recovery_digest") != prior_digest
+        or prior["recovery_epoch_before"] != 2
+        or prior["recovery_epoch_after"] != 3
+        or prior["recovery_epoch_ceiling"] != 3
+        or prior["ordinary_retry_ceiling"] != ordinary_retry_ceiling
+        or prior["ordinary_attempt_ceiling"] != ordinary_attempt_ceiling
+        or prior["maximum_cumulative_attempts"]
+        != ordinary_attempt_ceiling * 4
+        or selected_ids != set(reference_selected)
+        or any(item["expected_status"] != "failed" for item in selected)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-terminal reconciliation is invalid"
+        )
+    operations = []
+    for item in selected:
+        operation_id = item["operation_id"]
+        row = current[operation_id]
+        reference_retry_count = reference_snapshot[operation_id][
+            "retry_count"
+        ]
+        retry_count_before = row["retry_count"]
+        lineage = _retry_lineage_operation(prior, operation_id)
+        prior_attempts_consumed = reference_retry_count
+        if lineage is not None:
+            prior_attempts_consumed = lineage["attempts_consumed_before"] + (
+                reference_retry_count - lineage["retry_count_after"]
+            )
+        attempts_consumed_during_reference = (
+            retry_count_before - reference_retry_count + 1
+        )
+        attempts_consumed_before = (
+            prior_attempts_consumed + attempts_consumed_during_reference
+        )
+        attempts_available_after = ordinary_attempt_ceiling
+        cumulative_attempt_ceiling = (
+            attempts_consumed_before + attempts_available_after
+        )
+        if (
+            not 0
+            <= reference_retry_count
+            <= retry_count_before
+            <= ordinary_retry_ceiling
+            or prior_attempts_consumed < 0
+            or attempts_consumed_during_reference < 1
+            or cumulative_attempt_ceiling > maximum_cumulative_attempts
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-terminal reconciliation is invalid"
+            )
+        operations.append(
+            {
+                "operation_id": operation_id,
+                "expected_status": "failed",
+                "reference_retry_count": reference_retry_count,
+                "retry_count_before": retry_count_before,
+                "retry_count_after": 0,
+                "prior_attempts_consumed": prior_attempts_consumed,
+                "attempts_consumed_during_reference": (
+                    attempts_consumed_during_reference
+                ),
+                "attempts_consumed_before": attempts_consumed_before,
+                "attempts_available_after": attempts_available_after,
+                "cumulative_attempt_ceiling": cumulative_attempt_ceiling,
+                "reset_applied": True,
+            }
+        )
+    return {
+        "schema_version": 4,
+        "kind": (
+            "operation-recovery-post-terminal-reconciliation-retry-recovery"
+        ),
+        "recovery_epoch_before": 3,
+        "recovery_epoch_after": 3,
+        "recovery_epoch_ceiling": 3,
+        "reconciliation_cycle_before": 0,
+        "reconciliation_cycle_after": 1,
+        "reconciliation_cycle_ceiling": 1,
+        "ordinary_retry_ceiling": ordinary_retry_ceiling,
+        "ordinary_attempt_ceiling": ordinary_attempt_ceiling,
+        "maximum_cumulative_attempts": maximum_cumulative_attempts,
+        "operation_count": len(operations),
+        "failed_reset_count": len(operations),
+        "prior_retry_recovery": prior,
+        "prior_retry_recovery_digest": prior_digest,
+        "operations": operations,
+        "operation_set_digest": digest(operations),
+    }
+
+
 def _post_abort_timestamp(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -4519,7 +5028,7 @@ def _post_abort_v10_contract(
         item["operation_id"]: item for item in snapshot["operations"]
     }
     if (
-        schema_version in {11, 12}
+        schema_version in {11, 12, 13}
         and snapshot["installation_authority"].get("schema_version") != 2
     ):
         raise OperationRecoveryError(
@@ -4701,7 +5210,14 @@ def _post_abort_v10_contract(
         if count
     }
     retry_recovery = (
-        _post_abort_v10_retry_recovery(
+        _post_terminal_reconciliation_retry_recovery(
+            reference_plan,
+            selected,
+            current,
+            prior_retry_recovery,
+        )
+        if schema_version == 13
+        else _post_abort_v10_retry_recovery(
             reference_plan,
             selected,
             current,
@@ -4777,6 +5293,15 @@ def _post_abort_contract(
         else None
     )
     if (
+        schema_version == 13
+        and (
+            prior_retry_recovery is None
+            or reference_plan.get("schema_version") != 12
+            or recovery_context_schema != 3
+            or recovery_epoch != 3
+            or recovery_context.get("origin") != "post-abort"
+        )
+    ) or (
         schema_version == 12
         and (
             prior_retry_recovery is None
@@ -4792,14 +5317,14 @@ def _post_abort_contract(
             "operation-recovery post-abort schema does not match recovery epoch"
         )
     if (
-        schema_version not in {10, 11, 12}
-        and reference_plan["schema_version"] in {10, 11, 12}
+        schema_version not in {10, 11, 12, 13}
+        and reference_plan["schema_version"] in {10, 11, 12, 13}
     ):
         raise OperationRecoveryError(
             "operation-recovery legacy post-abort schema cannot reference "
             "schema 10 or later"
         )
-    if schema_version in {10, 11, 12}:
+    if schema_version in {10, 11, 12, 13}:
         if schema_version == 10 and (
             prior_retry_recovery is not None
             or reference_plan["schema_version"] in {11, 12}
@@ -5122,6 +5647,64 @@ def _post_abort_contract(
     )
 
 
+def _post_terminal_worker_exit(
+    value: Any,
+    *,
+    journal: Mapping[str, Any],
+) -> dict[str, Any]:
+    exit_value = _closed(
+        _normalized(value),
+        POST_ABORT_REFERENCE_WORKER_EXIT_KEYS,
+        "post-terminal reference worker exit",
+    )
+    body = {
+        "schema_version": _integer(
+            exit_value["schema_version"],
+            "post-terminal worker-exit schema version",
+        ),
+        "kind": _text(
+            exit_value["kind"],
+            "post-terminal worker-exit kind",
+        ),
+        "worker_pid": _integer(
+            exit_value["worker_pid"],
+            "post-terminal worker PID",
+            minimum=1,
+        ),
+        "worker_start_time": _text(
+            exit_value["worker_start_time"],
+            "post-terminal worker start time",
+            maximum=128,
+        ),
+        "observed_at": _integer(
+            exit_value["observed_at"],
+            "post-terminal worker-exit observed-at",
+        ),
+        "state": _text(
+            exit_value["state"],
+            "post-terminal worker-exit state",
+            maximum=32,
+        ),
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-worker-exit-evidence"
+        or body["worker_pid"] != journal["worker_pid"]
+        or body["worker_start_time"] != journal["worker_start_time"]
+        or body["state"] != "inactive"
+        or _sha(
+            exit_value["evidence_digest"],
+            "post-terminal worker-exit digest",
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-terminal worker exit is invalid"
+        )
+    return {**body, "evidence_digest": exit_value["evidence_digest"]}
+
+
 def create_post_abort_recovery_plan(
     reference_plan_value: Mapping[str, Any],
     live_snapshot_value: Mapping[str, Any],
@@ -5139,6 +5722,9 @@ def create_post_abort_recovery_plan(
     reference_application_journal: Mapping[str, Any],
     reference_application_progress_digest: str,
     prior_retry_recovery: Mapping[str, Any] | None = None,
+    reference_application_receipt_digest: str | None = None,
+    reference_terminal_status: Mapping[str, Any] | None = None,
+    reference_worker_exit: Mapping[str, Any] | None = None,
     schema_version: int = 10,
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
@@ -5161,7 +5747,7 @@ def create_post_abort_recovery_plan(
         reference_application_progress_digest,
         "post-abort reference application progress digest",
     )
-    if schema_version not in {4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if schema_version not in {4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
         raise OperationRecoveryError(
             "operation-recovery post-abort creation schema is invalid"
         )
@@ -5251,10 +5837,73 @@ def create_post_abort_recovery_plan(
         raise OperationRecoveryError(
             "operation-recovery post-abort evidence is stale"
         )
+    terminal_fields = {}
+    if schema_version == 13:
+        if (
+            reference_terminal_status is None
+            or reference_worker_exit is None
+            or reference_application_receipt_digest is None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-terminal evidence is required"
+            )
+        terminal_status = verify_exact_drain_status(
+            reference_terminal_status,
+            plan=reference,
+        )
+        worker_exit = _post_terminal_worker_exit(
+            reference_worker_exit,
+            journal=reference_journal,
+        )
+        application_receipt_digest = _sha(
+            reference_application_receipt_digest,
+            "post-terminal reference application receipt digest",
+        )
+        if (
+            terminal_status["generation_before"]
+            != snapshot["generation_before"]
+            or terminal_status["selected_status_counts"]
+            != {"failed": reference["selected_operation_count"]}
+            or terminal_status["preserved_status_counts"]
+            != {"completed": snapshot["status_counts"].get("completed", 0)}
+            or terminal_status["status_digest"]
+            != digest(
+                {
+                    key: value
+                    for key, value in terminal_status.items()
+                    if key != "status_digest"
+                }
+            )
+            or worker_exit["observed_at"] > planned_at
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-terminal evidence is invalid"
+            )
+        terminal_fields = {
+            "reference_application_receipt_digest": (
+                application_receipt_digest
+            ),
+            "reference_terminal_status": terminal_status,
+            "reference_terminal_status_digest": terminal_status[
+                "status_digest"
+            ],
+            "reference_worker_exit": worker_exit,
+            "reference_worker_exit_digest": worker_exit[
+                "evidence_digest"
+            ],
+        }
     body = {
         "schema_version": schema_version,
-        "kind": "operation-recovery-exact-drain-post-abort-plan",
-        "action": "recover-exact-drain-post-abort",
+        "kind": (
+            "operation-recovery-exact-drain-post-terminal-reconciliation-plan"
+            if schema_version == 13
+            else "operation-recovery-exact-drain-post-abort-plan"
+        ),
+        "action": (
+            "reconcile-exact-drain-post-terminal"
+            if schema_version == 13
+            else "recover-exact-drain-post-abort"
+        ),
         "authority": "unapproved-plan",
         "mutation_authorized": False,
         "candidate_release": _candidate_release(candidate_release),
@@ -5271,6 +5920,7 @@ def create_post_abort_recovery_plan(
             "receipt_digest"
         ],
         "reference_application_progress_digest": reference_progress_digest,
+        **terminal_fields,
         "live_snapshot": snapshot,
         "cohort_digest": snapshot["cohort_digest"],
         "snapshot_digest": snapshot["snapshot_digest"],
@@ -5319,6 +5969,7 @@ def verify_post_abort_recovery_plan(
         10,
         11,
         12,
+        13,
     }:
         raise OperationRecoveryError(
             "operation-recovery post-abort plan is invalid"
@@ -5338,6 +5989,7 @@ def verify_post_abort_recovery_plan(
             10: POST_ABORT_PLAN_V10_KEYS,
             11: POST_ABORT_PLAN_V11_KEYS,
             12: POST_ABORT_PLAN_V12_KEYS,
+            13: POST_ABORT_PLAN_V13_KEYS,
         }[schema_version],
         "operation-recovery post-abort plan",
     )
@@ -5346,8 +5998,8 @@ def verify_post_abort_recovery_plan(
         allow_expired=True,
     )
     if (
-        schema_version not in {10, 11, 12}
-        and reference["schema_version"] in {10, 11, 12}
+        schema_version not in {10, 11, 12, 13}
+        and reference["schema_version"] in {10, 11, 12, 13}
     ):
         raise OperationRecoveryError(
             "operation-recovery legacy post-abort schema cannot reference "
@@ -5377,7 +6029,7 @@ def verify_post_abort_recovery_plan(
     )
     reference_progress_digest = (
         None
-        if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+        if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
         else _sha(
             plan["reference_application_progress_digest"],
             "post-abort reference application progress digest",
@@ -5396,7 +6048,7 @@ def verify_post_abort_recovery_plan(
         schema_version=schema_version,
         prior_retry_recovery=(
             plan["retry_recovery"].get("prior_retry_recovery")
-            if schema_version in {11, 12}
+            if schema_version in {11, 12, 13}
             and isinstance(plan["retry_recovery"], Mapping)
             else None
         ),
@@ -5446,7 +6098,7 @@ def verify_post_abort_recovery_plan(
         "post-abort preserved status counts",
     )
     derived_fields = {}
-    if schema_version in {10, 11, 12}:
+    if schema_version in {10, 11, 12, 13}:
         try:
             retry_recovery = _verified_post_abort_retry_recovery(
                 plan["retry_recovery"],
@@ -5454,9 +6106,13 @@ def verify_post_abort_recovery_plan(
                     1
                     if schema_version == 10
                     else (
+                        4
+                        if schema_version == 13
+                        else (
                         plan["retry_recovery"].get("schema_version")
                         if isinstance(plan["retry_recovery"], Mapping)
                         else -1
+                        )
                     )
                 ),
             )
@@ -5487,6 +6143,32 @@ def verify_post_abort_recovery_plan(
             ),
             "retry_recovery": retry_recovery,
             "retry_recovery_digest": retry_recovery_digest,
+        }
+    terminal_fields = {}
+    if schema_version == 13:
+        terminal_status = verify_exact_drain_status(
+            plan["reference_terminal_status"],
+            plan=reference,
+        )
+        worker_exit = _post_terminal_worker_exit(
+            plan["reference_worker_exit"],
+            journal=reference_journal,
+        )
+        terminal_fields = {
+            "reference_application_receipt_digest": _sha(
+                plan["reference_application_receipt_digest"],
+                "post-terminal reference application receipt digest",
+            ),
+            "reference_terminal_status": terminal_status,
+            "reference_terminal_status_digest": _sha(
+                plan["reference_terminal_status_digest"],
+                "post-terminal reference status digest",
+            ),
+            "reference_worker_exit": worker_exit,
+            "reference_worker_exit_digest": _sha(
+                plan["reference_worker_exit_digest"],
+                "post-terminal reference worker-exit digest",
+            ),
         }
     authority = _installation_authority(plan["installation_authority"])
     backup = _backup(
@@ -5525,8 +6207,17 @@ def verify_post_abort_recovery_plan(
     if (
         plan["schema_version"] != schema_version
         or plan["kind"]
-        != "operation-recovery-exact-drain-post-abort-plan"
-        or plan["action"] != "recover-exact-drain-post-abort"
+        != (
+            "operation-recovery-exact-drain-post-terminal-reconciliation-plan"
+            if schema_version == 13
+            else "operation-recovery-exact-drain-post-abort-plan"
+        )
+        or plan["action"]
+        != (
+            "reconcile-exact-drain-post-terminal"
+            if schema_version == 13
+            else "recover-exact-drain-post-abort"
+        )
         or plan["authority"] != "unapproved-plan"
         or plan["mutation_authorized"] is not False
         or plan["candidate_release"]
@@ -5562,6 +6253,29 @@ def verify_post_abort_recovery_plan(
         or type_counts != expected_type_counts
         or preserved != expected_preserved_status_counts
         or derived_fields != expected_derived_fields
+        or (
+            schema_version == 13
+            and (
+                terminal_fields["reference_terminal_status_digest"]
+                != terminal_fields["reference_terminal_status"][
+                    "status_digest"
+                ]
+                or terminal_fields["reference_worker_exit_digest"]
+                != terminal_fields["reference_worker_exit"][
+                    "evidence_digest"
+                ]
+                or terminal_fields["reference_terminal_status"][
+                    "generation_before"
+                ]
+                != snapshot["generation_before"]
+                or terminal_fields["reference_terminal_status"][
+                    "selected_status_counts"
+                ]
+                != {"failed": reference["selected_operation_count"]}
+                or terminal_fields["reference_worker_exit"]["observed_at"]
+                > created_at
+            )
+        )
         or plan["selected_row_set_digest"]
         != _exact_drain_row_set_digest(selected)
         or backup["postgres_system_identifier"]
@@ -5584,8 +6298,16 @@ def verify_post_abort_recovery_plan(
         )
     body = {
         "schema_version": schema_version,
-        "kind": "operation-recovery-exact-drain-post-abort-plan",
-        "action": "recover-exact-drain-post-abort",
+        "kind": (
+            "operation-recovery-exact-drain-post-terminal-reconciliation-plan"
+            if schema_version == 13
+            else "operation-recovery-exact-drain-post-abort-plan"
+        ),
+        "action": (
+            "reconcile-exact-drain-post-terminal"
+            if schema_version == 13
+            else "recover-exact-drain-post-abort"
+        ),
         "authority": "unapproved-plan",
         "mutation_authorized": False,
         "candidate_release": _candidate_release(plan["candidate_release"]),
@@ -5612,7 +6334,7 @@ def verify_post_abort_recovery_plan(
                 **(
                     {}
                     if schema_version not in {
-                        3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+                        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
                     }
                     else {
                         "reference_application_progress_digest": (
@@ -5622,6 +6344,7 @@ def verify_post_abort_recovery_plan(
                 ),
             }
         ),
+        **terminal_fields,
         "live_snapshot": snapshot,
         "cohort_digest": snapshot["cohort_digest"],
         "snapshot_digest": snapshot["snapshot_digest"],
@@ -5712,6 +6435,12 @@ def verify_exact_drain_authorization_receipt(
         != verified_plan["worker_runtime_digest"]
         or authorized_at < verified_plan["created_at"]
         or authorized_at >= verified_plan["expires_at"]
+        or (
+            verified_plan["schema_version"] == 13
+            and authorized_at
+            - verified_plan["hatchery_capability_receipt"]["observed_at"]
+            > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+        )
         or _sha(
             receipt["receipt_digest"],
             "exact drain authorization receipt digest",
@@ -5865,7 +6594,7 @@ def verify_exact_drain_status(
     }
     if (
         status_schema_version
-        != (2 if verified_plan["schema_version"] == 12 else 1)
+        != (2 if verified_plan["schema_version"] in {12, 13} else 1)
         or body["plan_digest"] != verified_plan["plan_digest"]
         or generation_before != generation_after
         or body["selected_operation_count"]

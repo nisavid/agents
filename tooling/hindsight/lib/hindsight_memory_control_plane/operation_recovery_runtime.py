@@ -458,7 +458,7 @@ def validate_exact_drain_provider_policy(
     if (
         policy.schema_version not in {1, 2}
         or (
-            plan_schema_version in {11, 12}
+            plan_schema_version in {11, 12, 13}
             and policy.schema_version != 2
         )
         or (
@@ -1586,7 +1586,7 @@ def _exact_drain_status_body(
     observed_at: int,
 ) -> dict[str, Any]:
     """Build the one canonical payload-free exact-drain status body."""
-    schema_twelve = plan.get("schema_version") == 12
+    schema_twelve = plan.get("schema_version") in {12, 13}
     return {
         "schema_version": 2 if schema_twelve else 1,
         "kind": "operation-recovery-exact-drain-status",
@@ -5244,7 +5244,7 @@ class ExactDrainClaimAdapter:
         self._clock = clock
         self._maximum_retry_delay_seconds = (
             verified["execution_window"]["maximum_retry_delay_seconds"]
-            if verified.get("schema_version") in {10, 11, 12}
+            if verified.get("schema_version") in {10, 11, 12, 13}
             else None
         )
         if verified.get("schema_version") in {
@@ -5288,17 +5288,17 @@ class ExactDrainClaimAdapter:
         )
         self.operation_attempt_timeout_seconds = (
             verified["operation_attempt_timeout_seconds"]
-            if verified.get("schema_version") in {11, 12}
+            if verified.get("schema_version") in {11, 12, 13}
             else None
         )
         self.phase_one_nested_stage_prefixes = (
             tuple(verified["phase_one_nested_stage_prefixes"])
-            if verified.get("schema_version") in {11, 12}
+            if verified.get("schema_version") in {11, 12, 13}
             else ()
         )
         self.operation_attempt_timeout_disposition = (
             verified["operation_attempt_timeout_disposition"]
-            if verified.get("schema_version") == 12
+            if verified.get("schema_version") in {12, 13}
             else "worker-fail-stop"
         )
         self._cleanup_deadline: float | None = None
@@ -6021,7 +6021,7 @@ class ExactDrainClaimAdapter:
                     schema="public",
                     operation_ids=list(self._selected),
                 )
-                if self._plan.get("schema_version") == 12
+                if self._plan.get("schema_version") in {12, 13}
                 else []
             )
             selected_status_counts = {
@@ -7049,7 +7049,7 @@ async def read_exact_drain_status(
                 schema=schema,
                 operation_ids=selected_ids,
             )
-            if verified["schema_version"] == 12
+            if verified["schema_version"] in {12, 13}
             else []
         )
         outside_rows = await connection.fetch(
@@ -7804,7 +7804,7 @@ async def apply_post_abort_recovery_transaction(
             item["operation_id"]: item
             for item in verified["retry_recovery"]["operations"]
         }
-        if verified["schema_version"] in {10, 11, 12}
+        if verified["schema_version"] in {10, 11, 12, 13}
         else {}
     )
     if retry_by_id and set(retry_by_id) != set(selected):
@@ -7907,7 +7907,7 @@ async def apply_post_abort_recovery_transaction(
             "worker_id IS NOT NULL "
             "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
             "AND claimed_at IS NOT NULL"
-            if verified["schema_version"] in {5, 6, 7, 8, 9, 10, 11, 12}
+            if verified["schema_version"] in {5, 6, 7, 8, 9, 10, 11, 12, 13}
             else "worker_id IS NULL AND claimed_at IS NULL"
         )
         result = await connection.execute(
@@ -8100,7 +8100,7 @@ async def rollback_post_abort_recovery_transaction(
             item = selected[operation_id]
             row = preimage_by_id[operation_id]
             allowed_preimage_statuses = {"processing", "failed"}
-            if verified["schema_version"] in {7, 9, 10, 11, 12}:
+            if verified["schema_version"] in {7, 9, 10, 11, 12, 13}:
                 allowed_preimage_statuses.add("pending")
             if (
                 row.get("status") != item["expected_status"]

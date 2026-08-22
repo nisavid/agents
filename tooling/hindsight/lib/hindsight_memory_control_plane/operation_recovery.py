@@ -793,6 +793,103 @@ EXACT_DRAIN_RECOVERY_CONTEXT_V4_KEYS = frozenset(
         "preserved_row_set_digest",
     }
 )
+# A checkpoint-continuation handoff is deliberately separate from the exact
+# drain plan schemas above.  It is a read-only, payload-free proof that a
+# pending operation already has committed retain side effects and may be
+# resumed idempotently by a future plan implementation.  Keeping this
+# contract separate prevents callers from treating a candidate-repair handoff
+# (which is valid only before provider work starts) as permission to retry a
+# partially executed task.
+CHECKPOINT_CONTINUATION_CHECKPOINT_KEYS = frozenset(
+    {
+        "facts_committed",
+        "committed_document_count",
+        "unit_ids_count",
+        "stage",
+        "processed",
+        "total",
+    }
+)
+CHECKPOINT_CONTINUATION_OPERATION_KEYS = frozenset(
+    {
+        "operation_id",
+        "operation_type",
+        "current_status",
+        "row_digest",
+        "task_payload_digest",
+        "result_metadata_digest",
+        "checkpoint",
+        "retry_count",
+        "attempts_consumed",
+        "attempts_remaining",
+        "worker_id_present",
+        "worker_id_digest",
+        "claimed_at",
+        "next_retry_at",
+        "error_category",
+        "error_digest",
+    }
+)
+CHECKPOINT_CONTINUATION_AUDIT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "operation_id",
+        "generation",
+        "row_digest",
+        "result_metadata_digest",
+        "checkpoint",
+        "document_count",
+        "unit_count",
+        "document_set_digest",
+        "unit_set_digest",
+        "idempotent_resume",
+        "audit_digest",
+    }
+)
+CHECKPOINT_CONTINUATION_CONTEXT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "origin",
+        "generation",
+        "recovery_epoch",
+        "reconciliation_cycle",
+        "source_plan_digest",
+        "source_recovery_context_digest",
+        "source_reconciliation_plan_digest",
+        "source_terminal_status_digest",
+        "source_candidate_release_digest",
+        "candidate_release_digest",
+        "selected_operation_ids_digest",
+        "selected_checkpoint_set_digest",
+        "side_effect_audit_digest",
+        "context_digest",
+    }
+)
+CHECKPOINT_CONTINUATION_HANDOFF_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "action",
+        "authority",
+        "mutation_authorized",
+        "continuation_context",
+        "continuation_context_digest",
+        "source_candidate_release",
+        "candidate_release",
+        "operations",
+        "operation_count",
+        "side_effect_audit",
+        "side_effect_audit_digest",
+        "attempt_ledger_digest",
+        "created_at",
+        "expires_at",
+        "handoff_digest",
+    }
+)
+CHECKPOINT_CONTINUATION_LIFETIME_SECONDS = 3_600
+CHECKPOINT_CONTINUATION_MAX_CUMULATIVE_ATTEMPTS = 20
 EXACT_DRAIN_PLAN_V10_KEYS = (
     EXACT_DRAIN_PLAN_V9_KEYS - frozenset({"execution_lease_seconds"})
 ) | frozenset(
@@ -2219,6 +2316,694 @@ def _candidate_release(value: Any) -> dict[str, str]:
             "candidate release digest",
         ),
     }
+
+
+def _checkpoint_continuation_checkpoint(value: Any) -> dict[str, Any]:
+    checkpoint = _closed(
+        _normalized(value),
+        CHECKPOINT_CONTINUATION_CHECKPOINT_KEYS,
+        "checkpoint continuation checkpoint",
+    )
+    facts_committed = checkpoint["facts_committed"]
+    if type(facts_committed) is not bool or not facts_committed:
+        raise OperationRecoveryError(
+            "checkpoint continuation requires committed facts"
+        )
+    body = {
+        "facts_committed": facts_committed,
+        "committed_document_count": _integer(
+            checkpoint["committed_document_count"],
+            "checkpoint continuation committed document count",
+            minimum=1,
+        ),
+        "unit_ids_count": _integer(
+            checkpoint["unit_ids_count"],
+            "checkpoint continuation unit count",
+            minimum=1,
+        ),
+        "stage": _text(
+            checkpoint["stage"],
+            "checkpoint continuation stage",
+            maximum=128,
+        ),
+        "processed": _integer(
+            checkpoint["processed"],
+            "checkpoint continuation processed count",
+        ),
+        "total": _integer(
+            checkpoint["total"],
+            "checkpoint continuation total count",
+            minimum=1,
+        ),
+    }
+    if body["processed"] > body["total"]:
+        raise OperationRecoveryError(
+            "checkpoint continuation progress is invalid"
+        )
+    return body
+
+
+def _checkpoint_continuation_operation(value: Any) -> dict[str, Any]:
+    operation = _closed(
+        _normalized(value),
+        CHECKPOINT_CONTINUATION_OPERATION_KEYS,
+        "checkpoint continuation operation",
+    )
+    body = {
+        "operation_id": _operation_id(operation["operation_id"]),
+        "operation_type": _text(
+            operation["operation_type"],
+            "checkpoint continuation operation type",
+            maximum=128,
+        ),
+        "current_status": _text(
+            operation["current_status"],
+            "checkpoint continuation operation status",
+            maximum=32,
+        ),
+        "row_digest": _sha(
+            operation["row_digest"],
+            "checkpoint continuation row digest",
+        ),
+        "task_payload_digest": _sha(
+            operation["task_payload_digest"],
+            "checkpoint continuation payload digest",
+        ),
+        "result_metadata_digest": _sha(
+            operation["result_metadata_digest"],
+            "checkpoint continuation metadata digest",
+        ),
+        "checkpoint": _checkpoint_continuation_checkpoint(
+            operation["checkpoint"]
+        ),
+        "retry_count": _integer(
+            operation["retry_count"],
+            "checkpoint continuation retry count",
+        ),
+        "attempts_consumed": _integer(
+            operation["attempts_consumed"],
+            "checkpoint continuation consumed attempts",
+            minimum=1,
+        ),
+        "attempts_remaining": _integer(
+            operation["attempts_remaining"],
+            "checkpoint continuation remaining attempts",
+            minimum=1,
+        ),
+        "worker_id_present": operation["worker_id_present"],
+        "worker_id_digest": operation["worker_id_digest"],
+        "claimed_at": _optional_text(
+            operation["claimed_at"],
+            "checkpoint continuation claimed-at",
+        ),
+        "next_retry_at": _optional_text(
+            operation["next_retry_at"],
+            "checkpoint continuation next-retry-at",
+        ),
+        "error_category": _text(
+            operation["error_category"],
+            "checkpoint continuation error category",
+            maximum=64,
+        ),
+        "error_digest": operation["error_digest"],
+    }
+    if (
+        body["operation_type"] != "retain"
+        or body["current_status"] != "pending"
+        or body["retry_count"] > EXACT_DRAIN_WORKER_MAX_RETRIES
+        or type(body["worker_id_present"]) is not bool
+        or body["worker_id_present"]
+        or body["worker_id_digest"] is not None
+        or body["claimed_at"] is not None
+        or body["next_retry_at"] is not None
+        or body["error_category"] != "none"
+        or body["error_digest"] is not None
+        or body["attempts_consumed"] + body["attempts_remaining"]
+        > CHECKPOINT_CONTINUATION_MAX_CUMULATIVE_ATTEMPTS
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation operation state is invalid"
+        )
+    return body
+
+
+def _checkpoint_continuation_audit(value: Any) -> dict[str, Any]:
+    audit = _closed(
+        _normalized(value),
+        CHECKPOINT_CONTINUATION_AUDIT_KEYS,
+        "checkpoint continuation side-effect audit",
+    )
+    body = {
+        "schema_version": _integer(
+            audit["schema_version"],
+            "checkpoint continuation audit schema version",
+        ),
+        "kind": _text(
+            audit["kind"],
+            "checkpoint continuation audit kind",
+        ),
+        "operation_id": _operation_id(audit["operation_id"]),
+        "generation": _text(
+            audit["generation"],
+            "checkpoint continuation audit generation",
+        ),
+        "row_digest": _sha(
+            audit["row_digest"],
+            "checkpoint continuation audit row digest",
+        ),
+        "result_metadata_digest": _sha(
+            audit["result_metadata_digest"],
+            "checkpoint continuation audit metadata digest",
+        ),
+        "checkpoint": _checkpoint_continuation_checkpoint(
+            audit["checkpoint"]
+        ),
+        "document_count": _integer(
+            audit["document_count"],
+            "checkpoint continuation audit document count",
+            minimum=1,
+        ),
+        "unit_count": _integer(
+            audit["unit_count"],
+            "checkpoint continuation audit unit count",
+            minimum=1,
+        ),
+        "document_set_digest": _sha(
+            audit["document_set_digest"],
+            "checkpoint continuation document set digest",
+        ),
+        "unit_set_digest": _sha(
+            audit["unit_set_digest"],
+            "checkpoint continuation unit set digest",
+        ),
+        "idempotent_resume": audit["idempotent_resume"],
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-checkpoint-continuation-side-effect-audit"
+        or type(body["idempotent_resume"]) is not bool
+        or not body["idempotent_resume"]
+        or body["document_count"]
+        != body["checkpoint"]["committed_document_count"]
+        or body["unit_count"] != body["checkpoint"]["unit_ids_count"]
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation side-effect audit is invalid"
+        )
+    audit_digest = _sha(
+        audit["audit_digest"],
+        "checkpoint continuation audit digest",
+    )
+    if audit_digest != digest(body):
+        raise OperationRecoveryError(
+            "checkpoint continuation audit digest differs"
+        )
+    return {**body, "audit_digest": audit_digest}
+
+
+def _checkpoint_continuation_context(value: Any) -> dict[str, Any]:
+    context = _closed(
+        _normalized(value),
+        CHECKPOINT_CONTINUATION_CONTEXT_KEYS,
+        "checkpoint continuation context",
+    )
+    body = {
+        "schema_version": _integer(
+            context["schema_version"],
+            "checkpoint continuation context schema version",
+        ),
+        "kind": _text(
+            context["kind"],
+            "checkpoint continuation context kind",
+        ),
+        "origin": _text(
+            context["origin"],
+            "checkpoint continuation context origin",
+        ),
+        "generation": _text(
+            context["generation"],
+            "checkpoint continuation context generation",
+        ),
+        "recovery_epoch": _integer(
+            context["recovery_epoch"],
+            "checkpoint continuation context recovery epoch",
+        ),
+        "reconciliation_cycle": _integer(
+            context["reconciliation_cycle"],
+            "checkpoint continuation context reconciliation cycle",
+        ),
+        "source_plan_digest": _sha(
+            context["source_plan_digest"],
+            "checkpoint continuation source plan digest",
+        ),
+        "source_recovery_context_digest": _sha(
+            context["source_recovery_context_digest"],
+            "checkpoint continuation source recovery context digest",
+        ),
+        "source_reconciliation_plan_digest": _sha(
+            context["source_reconciliation_plan_digest"],
+            "checkpoint continuation source reconciliation plan digest",
+        ),
+        "source_terminal_status_digest": _sha(
+            context["source_terminal_status_digest"],
+            "checkpoint continuation source terminal status digest",
+        ),
+        "source_candidate_release_digest": _sha(
+            context["source_candidate_release_digest"],
+            "checkpoint continuation source candidate release digest",
+        ),
+        "candidate_release_digest": _sha(
+            context["candidate_release_digest"],
+            "checkpoint continuation candidate release digest",
+        ),
+        "selected_operation_ids_digest": _sha(
+            context["selected_operation_ids_digest"],
+            "checkpoint continuation operation IDs digest",
+        ),
+        "selected_checkpoint_set_digest": _sha(
+            context["selected_checkpoint_set_digest"],
+            "checkpoint continuation checkpoint set digest",
+        ),
+        "side_effect_audit_digest": _sha(
+            context["side_effect_audit_digest"],
+            "checkpoint continuation side-effect digest",
+        ),
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-checkpoint-continuation-context"
+        or body["origin"] != "committed-checkpoint"
+        or body["recovery_epoch"] != 3
+        or body["reconciliation_cycle"] != 1
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation context is invalid"
+        )
+    context_digest = _sha(
+        context["context_digest"],
+        "checkpoint continuation context digest",
+    )
+    if context_digest != digest(body):
+        raise OperationRecoveryError(
+            "checkpoint continuation context digest differs"
+        )
+    return {**body, "context_digest": context_digest}
+
+
+def _checkpoint_continuation_selected_checkpoint_digest(
+    operations: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(
+        [
+            {
+                "operation_id": operation["operation_id"],
+                "row_digest": operation["row_digest"],
+                "result_metadata_digest": operation[
+                    "result_metadata_digest"
+                ],
+                "checkpoint_digest": digest(operation["checkpoint"]),
+            }
+            for operation in operations
+        ]
+    )
+
+
+def _checkpoint_continuation_attempt_ledger_digest(
+    operations: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(
+        [
+            {
+                "operation_id": operation["operation_id"],
+                "attempts_consumed": operation["attempts_consumed"],
+                "attempts_remaining": operation["attempts_remaining"],
+            }
+            for operation in operations
+        ]
+    )
+
+
+def _checkpoint_continuation_audit_digest(
+    audits: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(list(audits))
+
+
+def create_checkpoint_continuation_handoff(
+    live_snapshot_value: Mapping[str, Any],
+    *,
+    continuation_operations: Sequence[Mapping[str, Any]],
+    side_effect_audits: Sequence[Mapping[str, Any]],
+    source_plan_digest: str,
+    source_recovery_context_digest: str,
+    source_reconciliation_plan_digest: str,
+    source_terminal_status_digest: str,
+    source_candidate_release: Mapping[str, Any],
+    candidate_release: Mapping[str, Any],
+    generation: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Build a payload-free proof for a future checkpoint continuation.
+
+    This function only validates supplied snapshots and digest projections.  It
+    never changes operation rows, claims work, resets retry state, or starts a
+    worker.  A future executable schema must separately consume this handoff
+    and implement the idempotent runtime path.
+    """
+    snapshot = verify_live_snapshot(live_snapshot_value)
+    source_release = _candidate_release(source_candidate_release)
+    release = _candidate_release(candidate_release)
+    generation_value = _text(
+        generation,
+        "checkpoint continuation generation",
+    )
+    if (
+        generation_value != snapshot["generation_before"]
+        or generation_value != snapshot["generation_after"]
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation generation differs"
+        )
+    if isinstance(continuation_operations, (str, bytes)) or not isinstance(
+        continuation_operations, Sequence
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation operations are invalid"
+        )
+    if isinstance(side_effect_audits, (str, bytes)) or not isinstance(
+        side_effect_audits, Sequence
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation audits are invalid"
+        )
+    operations = [
+        _checkpoint_continuation_operation(item)
+        for item in continuation_operations
+    ]
+    audits = [
+        _checkpoint_continuation_audit(item)
+        for item in side_effect_audits
+    ]
+    operations.sort(key=lambda item: item["operation_id"])
+    audits.sort(key=lambda item: item["operation_id"])
+    operation_ids = [item["operation_id"] for item in operations]
+    audit_ids = [item["operation_id"] for item in audits]
+    if (
+        not operations
+        or len(operations) > sum(EXPECTED_OPERATION_COUNTS.values())
+        or len(operation_ids) != len(set(operation_ids))
+        or audit_ids != operation_ids
+        or len(audit_ids) != len(set(audit_ids))
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation operation set is invalid"
+        )
+    snapshot_by_id = {
+        item["operation_id"]: item for item in snapshot["operations"]
+    }
+    for operation in operations:
+        row = snapshot_by_id.get(operation["operation_id"])
+        if row is None:
+            raise OperationRecoveryError(
+                "checkpoint continuation operation is outside snapshot"
+            )
+        if any(
+            operation[key] != row[row_key]
+            for key, row_key in (
+                ("operation_type", "operation_type"),
+                ("current_status", "current_status"),
+                ("row_digest", "row_digest"),
+                ("task_payload_digest", "task_payload_digest"),
+                ("result_metadata_digest", "result_metadata_digest"),
+                ("retry_count", "retry_count"),
+                ("worker_id_present", "worker_id_present"),
+                ("worker_id_digest", "worker_id_digest"),
+                ("claimed_at", "claimed_at"),
+                ("next_retry_at", "next_retry_at"),
+                ("error_category", "error_category"),
+                ("error_digest", "error_digest"),
+            )
+        ):
+            raise OperationRecoveryError(
+                "checkpoint continuation operation differs from snapshot"
+            )
+    audits_by_id = {item["operation_id"]: item for item in audits}
+    for operation in operations:
+        audit = audits_by_id[operation["operation_id"]]
+        if (
+            audit["generation"] != generation_value
+            or audit["row_digest"] != operation["row_digest"]
+            or audit["result_metadata_digest"]
+            != operation["result_metadata_digest"]
+            or audit["checkpoint"] != operation["checkpoint"]
+        ):
+            raise OperationRecoveryError(
+                "checkpoint continuation audit differs from operation"
+            )
+    source_digests = {
+        "source_plan_digest": _sha(
+            source_plan_digest,
+            "checkpoint continuation source plan digest",
+        ),
+        "source_recovery_context_digest": _sha(
+            source_recovery_context_digest,
+            "checkpoint continuation source recovery context digest",
+        ),
+        "source_reconciliation_plan_digest": _sha(
+            source_reconciliation_plan_digest,
+            "checkpoint continuation source reconciliation plan digest",
+        ),
+        "source_terminal_status_digest": _sha(
+            source_terminal_status_digest,
+            "checkpoint continuation source terminal status digest",
+        ),
+    }
+    selected_operation_ids_digest = digest(operation_ids)
+    selected_checkpoint_set_digest = (
+        _checkpoint_continuation_selected_checkpoint_digest(operations)
+    )
+    side_effect_audit_digest = _checkpoint_continuation_audit_digest(audits)
+    context_body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-checkpoint-continuation-context",
+        "origin": "committed-checkpoint",
+        "generation": generation_value,
+        "recovery_epoch": 3,
+        "reconciliation_cycle": 1,
+        **source_digests,
+        "source_candidate_release_digest": source_release["release_digest"],
+        "candidate_release_digest": release["release_digest"],
+        "selected_operation_ids_digest": selected_operation_ids_digest,
+        "selected_checkpoint_set_digest": selected_checkpoint_set_digest,
+        "side_effect_audit_digest": side_effect_audit_digest,
+    }
+    context = {**context_body, "context_digest": digest(context_body)}
+    planned_at = (
+        int(time.time())
+        if created_at is None
+        else _integer(
+            created_at,
+            "checkpoint continuation handoff created-at",
+        )
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-checkpoint-continuation-handoff",
+        "action": "resume-committed-checkpointed-operations",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "continuation_context": context,
+        "continuation_context_digest": context["context_digest"],
+        "source_candidate_release": source_release,
+        "candidate_release": release,
+        "operations": operations,
+        "operation_count": len(operations),
+        "side_effect_audit": audits,
+        "side_effect_audit_digest": side_effect_audit_digest,
+        "attempt_ledger_digest": _checkpoint_continuation_attempt_ledger_digest(
+            operations
+        ),
+        "created_at": planned_at,
+        "expires_at": planned_at + CHECKPOINT_CONTINUATION_LIFETIME_SECONDS,
+    }
+    return {**body, "handoff_digest": digest(body)}
+
+
+def verify_checkpoint_continuation_handoff(
+    value: Any,
+    *,
+    live_snapshot: Mapping[str, Any] | None = None,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    """Verify a checkpoint handoff without applying it or touching the DB."""
+    handoff = _closed(
+        _normalized(value),
+        CHECKPOINT_CONTINUATION_HANDOFF_KEYS,
+        "checkpoint continuation handoff",
+    )
+    context = _checkpoint_continuation_context(handoff["continuation_context"])
+    source_release = _candidate_release(handoff["source_candidate_release"])
+    release = _candidate_release(handoff["candidate_release"])
+    if (
+        _sha(
+            handoff["continuation_context_digest"],
+            "checkpoint continuation context digest",
+        )
+        != context["context_digest"]
+        or context["source_candidate_release_digest"]
+        != source_release["release_digest"]
+        or context["candidate_release_digest"] != release["release_digest"]
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation context binding differs"
+        )
+    operations_value = handoff["operations"]
+    audits_value = handoff["side_effect_audit"]
+    if not isinstance(operations_value, list) or not isinstance(
+        audits_value, list
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation handoff entries are invalid"
+        )
+    operations = [
+        _checkpoint_continuation_operation(item) for item in operations_value
+    ]
+    audits = [_checkpoint_continuation_audit(item) for item in audits_value]
+    operation_ids = [item["operation_id"] for item in operations]
+    audit_ids = [item["operation_id"] for item in audits]
+    if (
+        not operations
+        or len(operations) > sum(EXPECTED_OPERATION_COUNTS.values())
+        or operations != sorted(operations, key=lambda item: item["operation_id"])
+        or audits != sorted(audits, key=lambda item: item["operation_id"])
+        or len(operation_ids) != len(set(operation_ids))
+        or audit_ids != operation_ids
+        or len(audit_ids) != len(set(audit_ids))
+        or _integer(
+            handoff["operation_count"],
+            "checkpoint continuation operation count",
+        )
+        != len(operations)
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation handoff operation set is invalid"
+        )
+    audits_by_id = {item["operation_id"]: item for item in audits}
+    for operation in operations:
+        audit = audits_by_id[operation["operation_id"]]
+        if (
+            audit["generation"] != context["generation"]
+            or audit["row_digest"] != operation["row_digest"]
+            or audit["result_metadata_digest"]
+            != operation["result_metadata_digest"]
+            or audit["checkpoint"] != operation["checkpoint"]
+        ):
+            raise OperationRecoveryError(
+                "checkpoint continuation handoff audit differs"
+            )
+    side_effect_audit_digest = _checkpoint_continuation_audit_digest(audits)
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-checkpoint-continuation-handoff",
+        "action": "resume-committed-checkpointed-operations",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "continuation_context": context,
+        "continuation_context_digest": context["context_digest"],
+        "source_candidate_release": source_release,
+        "candidate_release": release,
+        "operations": operations,
+        "operation_count": len(operations),
+        "side_effect_audit": audits,
+        "side_effect_audit_digest": side_effect_audit_digest,
+        "attempt_ledger_digest": _checkpoint_continuation_attempt_ledger_digest(
+            operations
+        ),
+        "created_at": _integer(
+            handoff["created_at"],
+            "checkpoint continuation handoff created-at",
+        ),
+        "expires_at": _integer(
+            handoff["expires_at"],
+            "checkpoint continuation handoff expires-at",
+        ),
+    }
+    if (
+        handoff["schema_version"] != 1
+        or body["authority"] != handoff["authority"]
+        or handoff["action"] != body["action"]
+        or handoff["kind"] != body["kind"]
+        or type(handoff["mutation_authorized"]) is not bool
+        or handoff["mutation_authorized"]
+        or body["expires_at"]
+        != body["created_at"] + CHECKPOINT_CONTINUATION_LIFETIME_SECONDS
+        or context["selected_operation_ids_digest"] != digest(operation_ids)
+        or context["selected_checkpoint_set_digest"]
+        != _checkpoint_continuation_selected_checkpoint_digest(operations)
+        or context["side_effect_audit_digest"] != side_effect_audit_digest
+        or _sha(
+            handoff["side_effect_audit_digest"],
+            "checkpoint continuation side-effect digest",
+        )
+        != side_effect_audit_digest
+        or _sha(
+            handoff["attempt_ledger_digest"],
+            "checkpoint continuation attempt ledger digest",
+        )
+        != body["attempt_ledger_digest"]
+        or _sha(
+            handoff["handoff_digest"],
+            "checkpoint continuation handoff digest",
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "checkpoint continuation handoff digest or policy differs"
+        )
+    observed_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "checkpoint continuation verification time")
+    )
+    if not allow_expired and observed_at >= body["expires_at"]:
+        raise OperationRecoveryError(
+            "checkpoint continuation handoff expired"
+        )
+    if live_snapshot is not None:
+        snapshot = verify_live_snapshot(live_snapshot)
+        if snapshot["generation_before"] != context["generation"]:
+            raise OperationRecoveryError(
+                "checkpoint continuation live generation differs"
+            )
+        snapshot_by_id = {
+            item["operation_id"]: item for item in snapshot["operations"]
+        }
+        for operation in operations:
+            row = snapshot_by_id.get(operation["operation_id"])
+            if row is None or any(
+                operation[key] != row[row_key]
+                for key, row_key in (
+                    ("operation_type", "operation_type"),
+                    ("current_status", "current_status"),
+                    ("row_digest", "row_digest"),
+                    ("task_payload_digest", "task_payload_digest"),
+                    ("result_metadata_digest", "result_metadata_digest"),
+                    ("retry_count", "retry_count"),
+                    ("worker_id_present", "worker_id_present"),
+                    ("worker_id_digest", "worker_id_digest"),
+                    ("claimed_at", "claimed_at"),
+                    ("next_retry_at", "next_retry_at"),
+                    ("error_category", "error_category"),
+                    ("error_digest", "error_digest"),
+                )
+            ):
+                raise OperationRecoveryError(
+                    "checkpoint continuation live snapshot differs"
+                )
+    return {**body, "handoff_digest": handoff["handoff_digest"]}
 
 
 def create_requeue_plan(

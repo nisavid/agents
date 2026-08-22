@@ -17,6 +17,7 @@ import hindsight_memory_control_plane.operation_recovery as recovery_contract  #
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
+    create_checkpoint_continuation_handoff,
     create_cohort_manifest,
     create_global_queue_blocker_classification,
     create_live_snapshot,
@@ -25,6 +26,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     normalize_pg0_binding,
     verify_cohort_manifest,
     verify_claim_release_plan,
+    verify_checkpoint_continuation_handoff,
     verify_exact_drain_authorization_receipt,
     verify_global_queue_blocker_classification,
     verify_live_snapshot,
@@ -7524,6 +7526,203 @@ class OperationRecoveryContractTest(unittest.TestCase):
         permitted_tampered["plan_digest"] = digest(permitted_body)
         with self.assertRaisesRegex(OperationRecoveryError, "plan is invalid"):
             verify_claim_release_plan(permitted_tampered, now=planned_at)
+
+    def _checkpoint_continuation_handoff(self, *, snapshot=None):
+        snapshot = self.drain_snapshot() if snapshot is None else snapshot
+        row = next(
+            item
+            for item in snapshot["operations"]
+            if item["current_status"] == "pending"
+            and item["operation_type"] == "retain"
+        )
+        checkpoint = {
+            "facts_committed": True,
+            "committed_document_count": 1,
+            "unit_ids_count": 21,
+            "stage": "storing",
+            "processed": 3,
+            "total": 10,
+        }
+        operation = {
+            "operation_id": row["operation_id"],
+            "operation_type": row["operation_type"],
+            "current_status": row["current_status"],
+            "row_digest": row["row_digest"],
+            "task_payload_digest": row["task_payload_digest"],
+            "result_metadata_digest": row["result_metadata_digest"],
+            "checkpoint": checkpoint,
+            "retry_count": row["retry_count"],
+            "attempts_consumed": 1,
+            "attempts_remaining": 19,
+            "worker_id_present": row["worker_id_present"],
+            "worker_id_digest": row["worker_id_digest"],
+            "claimed_at": row["claimed_at"],
+            "next_retry_at": row["next_retry_at"],
+            "error_category": row["error_category"],
+            "error_digest": row["error_digest"],
+        }
+        audit_body = {
+            "schema_version": 1,
+            "kind": (
+                "operation-recovery-checkpoint-continuation-"
+                "side-effect-audit"
+            ),
+            "operation_id": row["operation_id"],
+            "generation": snapshot["generation_before"],
+            "row_digest": row["row_digest"],
+            "result_metadata_digest": row["result_metadata_digest"],
+            "checkpoint": checkpoint,
+            "document_count": 1,
+            "unit_count": 21,
+            "document_set_digest": "a" * 64,
+            "unit_set_digest": "b" * 64,
+            "idempotent_resume": True,
+        }
+        audit = {
+            **audit_body,
+            "audit_digest": digest(audit_body),
+        }
+        target_release = {
+            "source_commit": "4" * 40,
+            "version": "2026.08.22+4444444",
+            "release_digest": "f" * 64,
+        }
+        return dict(
+            create_checkpoint_continuation_handoff(
+                snapshot,
+                continuation_operations=[operation],
+                side_effect_audits=[audit],
+                source_plan_digest="1" * 64,
+                source_recovery_context_digest="2" * 64,
+                source_reconciliation_plan_digest="3" * 64,
+                source_terminal_status_digest="4" * 64,
+                source_candidate_release=release_identity(),
+                candidate_release=target_release,
+                generation=snapshot["generation_before"],
+                created_at=1_785_402_000,
+            )
+        )
+
+    def test_checkpoint_continuation_handoff_is_payload_free_and_bound(self):
+        snapshot = self.drain_snapshot()
+        handoff = self._checkpoint_continuation_handoff(snapshot=snapshot)
+
+        self.assertEqual(
+            handoff["kind"],
+            "operation-recovery-checkpoint-continuation-handoff",
+        )
+        self.assertEqual(
+            handoff["continuation_context"]["origin"],
+            "committed-checkpoint",
+        )
+        self.assertEqual(
+            handoff["continuation_context"]["recovery_epoch"],
+            3,
+        )
+        self.assertEqual(
+            handoff["continuation_context"]["reconciliation_cycle"],
+            1,
+        )
+        self.assertNotIn("content", handoff)
+        self.assertEqual(
+            verify_checkpoint_continuation_handoff(
+                handoff,
+                live_snapshot=snapshot,
+                now=1_785_402_000,
+            ),
+            handoff,
+        )
+
+    def test_checkpoint_continuation_rejects_uncommitted_or_tampered_audit(self):
+        snapshot = self.drain_snapshot()
+        handoff = self._checkpoint_continuation_handoff(snapshot=snapshot)
+
+        uncommitted = deepcopy(handoff)
+        uncommitted["operations"][0]["checkpoint"]["facts_committed"] = False
+        with self.assertRaisesRegex(OperationRecoveryError, "committed facts"):
+            verify_checkpoint_continuation_handoff(
+                uncommitted,
+                now=1_785_402_000,
+            )
+
+        tampered_audit = deepcopy(handoff)
+        tampered_audit["side_effect_audit"][0]["unit_set_digest"] = "c" * 64
+        with self.assertRaisesRegex(OperationRecoveryError, "audit digest"):
+            verify_checkpoint_continuation_handoff(
+                tampered_audit,
+                now=1_785_402_000,
+            )
+
+    def test_checkpoint_continuation_rejects_snapshot_claim_or_metadata_drift(self):
+        snapshot = self.drain_snapshot()
+        handoff = self._checkpoint_continuation_handoff(snapshot=snapshot)
+
+        claimed_snapshot = deepcopy(snapshot)
+        claimed_snapshot["operations"][2]["worker_id_present"] = True
+        claimed_row = claimed_snapshot["operations"][2]
+        claimed_row["worker_id_digest"] = "e" * 64
+        claimed_row_body = {
+            key: value
+            for key, value in claimed_row.items()
+            if key != "row_digest"
+        }
+        claimed_row["row_digest"] = digest(claimed_row_body)
+        claimed_snapshot_body = {
+            key: value
+            for key, value in claimed_snapshot.items()
+            if key != "snapshot_digest"
+        }
+        claimed_snapshot["snapshot_digest"] = digest(claimed_snapshot_body)
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "live snapshot differs",
+        ):
+            verify_checkpoint_continuation_handoff(
+                handoff,
+                live_snapshot=claimed_snapshot,
+                now=1_785_402_000,
+            )
+
+        stale_snapshot = deepcopy(snapshot)
+        stale_snapshot["operations"][2]["result_metadata_digest"] = "d" * 64
+        stale_row = stale_snapshot["operations"][2]
+        stale_row_body = {
+            key: value
+            for key, value in stale_row.items()
+            if key != "row_digest"
+        }
+        stale_row["row_digest"] = digest(stale_row_body)
+        stale_snapshot_body = {
+            key: value
+            for key, value in stale_snapshot.items()
+            if key != "snapshot_digest"
+        }
+        stale_snapshot["snapshot_digest"] = digest(stale_snapshot_body)
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "live snapshot differs",
+        ):
+            verify_checkpoint_continuation_handoff(
+                handoff,
+                live_snapshot=stale_snapshot,
+                now=1_785_402_000,
+            )
+
+    def test_checkpoint_continuation_expires_without_renewal(self):
+        handoff = self._checkpoint_continuation_handoff()
+        with self.assertRaisesRegex(OperationRecoveryError, "expired"):
+            verify_checkpoint_continuation_handoff(
+                handoff,
+                now=handoff["expires_at"],
+            )
+        self.assertEqual(
+            verify_checkpoint_continuation_handoff(
+                handoff,
+                now=handoff["expires_at"],
+                allow_expired=True,
+            ),
+            handoff,
+        )
 
 
 if __name__ == "__main__":

@@ -189,8 +189,9 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     exact_drain_execution_deadline,
     exact_drain_execution_window_seconds,
     normalize_pg0_binding,
-    verify_cohort_manifest,
+    verify_checkpoint_continuation_handoff,
     verify_claim_release_plan,
+    verify_cohort_manifest,
     verify_exact_drain_authorization_receipt,
     verify_exact_drain_plan,
     verify_exact_drain_status,
@@ -8661,7 +8662,7 @@ def _operation_recovery_exact_phase_repair_snapshot(
     schema_version: int = 12,
 ) -> str:
     snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
-    expected_snapshot_schema = 8 if schema_version == 13 else 7
+    expected_snapshot_schema = 8 if schema_version in {13, 14} else 7
     if snapshot.get("schema_version") != expected_snapshot_schema:
         raise OperationRecoveryError(
             "exact drain full-query repair snapshot is required"
@@ -8949,19 +8950,55 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         args.rollback_backup_evidence,
         "exact drain rollback backup evidence",
     )
-    recovery_context = _operation_recovery_exact_recovery_context(
+    checkpoint_continuation_handoff = None
+    checkpoint_continuation_handoff_path = getattr(
         args,
-        snapshot=snapshot,
-        candidate_release=candidate_before,
+        "checkpoint_continuation_handoff",
+        None,
     )
-    plan_schema_version = (
-        13
-        if isinstance(recovery_context, Mapping)
-        and recovery_context.get("origin")
-        == "post-terminal-reconciliation"
-        else 12
-    )
-    if plan_schema_version == 13:
+    recovery_plan_path = getattr(args, "recovery_plan", None)
+    if (
+        checkpoint_continuation_handoff_path is not None
+        and recovery_plan_path is not None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain handoff sources are ambiguous"
+        )
+    if checkpoint_continuation_handoff_path is not None:
+        checkpoint_continuation_handoff = (
+            verify_checkpoint_continuation_handoff(
+                _operation_recovery_read_private_json(
+                    checkpoint_continuation_handoff_path,
+                    "checkpoint continuation handoff",
+                ),
+                live_snapshot=snapshot,
+            )
+        )
+        if (
+            checkpoint_continuation_handoff["candidate_release"]
+            != candidate_before
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation candidate differs"
+            )
+        recovery_context = checkpoint_continuation_handoff[
+            "continuation_context"
+        ]
+        plan_schema_version = 14
+    else:
+        recovery_context = _operation_recovery_exact_recovery_context(
+            args,
+            snapshot=snapshot,
+            candidate_release=candidate_before,
+        )
+        plan_schema_version = (
+            13
+            if isinstance(recovery_context, Mapping)
+            and recovery_context.get("origin")
+            == "post-terminal-reconciliation"
+            else 12
+        )
+    if plan_schema_version in {13, 14}:
         _operation_recovery_exact_phase_repair_snapshot(
             schema_version=plan_schema_version
         )
@@ -8980,7 +9017,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         provider_policy,
         _operation_recovery_profile_environment(),
     )
-    if plan_schema_version == 13:
+    if plan_schema_version in {13, 14}:
         _operation_recovery_validate_exact_provider_policy(
             provider_policy,
             schema_version=plan_schema_version,
@@ -8994,12 +9031,24 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
             provider_policy,
             provider_policy_digest=provider_policy_digest,
         )
-        if plan_schema_version == 13
+        if plan_schema_version in {13, 14}
         else None
     )
 
     def authenticated_recovery_source_paths() -> tuple[str, ...]:
-        recovery_plan_path = getattr(args, "recovery_plan", None)
+        if checkpoint_continuation_handoff_path is not None:
+            current_handoff = verify_checkpoint_continuation_handoff(
+                _operation_recovery_read_private_json(
+                    checkpoint_continuation_handoff_path,
+                    "checkpoint continuation handoff",
+                ),
+                live_snapshot=snapshot,
+            )
+            if current_handoff != checkpoint_continuation_handoff:
+                raise OperationRecoveryError(
+                    "operation-recovery checkpoint continuation handoff differs"
+                )
+            return (str(checkpoint_continuation_handoff_path),)
         if recovery_plan_path is None:
             return ()
         recovery_plan = verify_post_abort_recovery_plan(
@@ -9104,6 +9153,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         verification_receipt_path=args.verification_receipt,
         recovery_context=recovery_context,
         hatchery_capability_receipt=hatchery_capability_receipt,
+        checkpoint_continuation_handoff=checkpoint_continuation_handoff,
         schema_version=plan_schema_version,
     )
     normalized_output = normalized_path(output_path)
@@ -9133,7 +9183,22 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         raise OperationRecoveryError(
             "operation-recovery exact drain recovery handoff drifted during planning"
         )
-    if (
+    if checkpoint_continuation_handoff_path is not None:
+        current_handoff = verify_checkpoint_continuation_handoff(
+            _operation_recovery_read_private_json(
+                checkpoint_continuation_handoff_path,
+                "checkpoint continuation handoff",
+            ),
+            live_snapshot=snapshot,
+        )
+        if (
+            current_handoff != checkpoint_continuation_handoff
+            or current_handoff["continuation_context"] != recovery_context
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation handoff drifted during planning"
+            )
+    elif (
         _operation_recovery_exact_recovery_context(
             args,
             snapshot=snapshot,
@@ -9611,7 +9676,7 @@ def _operation_recovery_exact_execution_lease_projection(
     now: int | None = None,
 ) -> Mapping[str, Any]:
     if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
     }:
         return {}
     window_seconds = exact_drain_execution_window_seconds(plan)
@@ -9639,7 +9704,7 @@ def _operation_recovery_exact_execution_lease_projection(
     }
 
 
-EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 14))
+EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 15))
 
 
 def _operation_recovery_assert_exact_execution_lease(
@@ -9650,10 +9715,15 @@ def _operation_recovery_assert_exact_execution_lease(
 ) -> int | None:
     if plan.get("schema_version") not in EXECUTION_LEASE_SCHEMA_VERSIONS:
         return None
+    observed_at = int(time.time()) if now is None else now
+    if plan.get("schema_version") == 14:
+        verify_checkpoint_continuation_handoff(
+            plan["checkpoint_continuation_handoff"],
+            now=observed_at,
+        )
     execution_deadline = exact_drain_execution_deadline(plan, authorization)
     if execution_deadline is None:
         return None
-    observed_at = int(time.time()) if now is None else now
     if observed_at >= execution_deadline:
         raise OperationRecoveryError("exact drain execution lease expired")
     return execution_deadline
@@ -10295,6 +10365,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 journal_resume
                 and _operation_recovery_exact_status_is_terminal(before)
             )
+            if terminal_reconciliation and plan["schema_version"] == 14:
+                raise OperationRecoveryError(
+                    "schema-14 interrupted exact drain cannot resume after a terminal state"
+                )
             if (
                 journal_resume
                 and plan["schema_version"] == 11
@@ -10319,7 +10393,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         args.provider_policy
                     )
                 )
-                if plan["schema_version"] == 13:
+                if plan["schema_version"] in {13, 14}:
                     _operation_recovery_validate_exact_provider_policy(
                         provider_policy,
                         schema_version=plan["schema_version"],
@@ -10865,7 +10939,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         monitor_status = "terminal"
     if (
         monitor_status == "interrupted"
-        and plan.get("schema_version") in {12, 13}
+        and plan.get("schema_version") in {12, 13, 14}
     ):
         frozen = _operation_recovery_read_monitor_progress(
             plan,
@@ -14348,7 +14422,11 @@ def parser() -> argparse.ArgumentParser:
     recovery_drain_plan.add_argument("--application-receipt", required=True)
     recovery_drain_plan.add_argument("--status-artifact", required=True)
     recovery_drain_plan.add_argument("--verification-receipt", required=True)
-    recovery_drain_plan.add_argument("--recovery-plan")
+    recovery_drain_handoff = recovery_drain_plan.add_mutually_exclusive_group()
+    recovery_drain_handoff.add_argument("--recovery-plan")
+    recovery_drain_handoff.add_argument(
+        "--checkpoint-continuation-handoff"
+    )
     recovery_drain_plan.add_argument("--output", required=True)
     recovery_drain_plan.set_defaults(
         run=operation_recovery_drain_plan_command

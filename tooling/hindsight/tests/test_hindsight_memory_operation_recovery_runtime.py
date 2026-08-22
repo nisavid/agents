@@ -65,6 +65,25 @@ from hindsight_memory_control_plane.operation_recovery_progress import (
 )
 
 
+# Several runtime tests intentionally import the real upstream Hindsight
+# worker into this interpreter. Keep that test-only import state from leaking
+# into a later module in a combined unittest discovery run: the exact-drain
+# bootstrap must reject any preloaded Hindsight package, and later candidate
+# import tests must start from the same clean boundary as a fresh worker.
+_INITIAL_HINDSIGHT_MODULES = {
+    name: module
+    for name, module in sys.modules.items()
+    if name == "hindsight_api" or name.startswith("hindsight_api.")
+}
+
+
+def tearDownModule() -> None:
+    for name in tuple(sys.modules):
+        if name == "hindsight_api" or name.startswith("hindsight_api."):
+            sys.modules.pop(name, None)
+    sys.modules.update(_INITIAL_HINDSIGHT_MODULES)
+
+
 class _RunCapableWorkerPoller:
     async def run(self):
         raise AssertionError("test worker poller run seam was not configured")
@@ -298,7 +317,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             authorization_bytes,
         )
 
-    def test_schema_thirteen_initializes_lease_for_retry_persistence(self):
+    def test_schema_thirteen_and_fourteen_initialize_lease_for_retry_persistence(
+        self,
+    ):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         planned_at = int(time.time())
         schema_twelve = fixtures.drain_plan(
@@ -306,13 +327,129 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             created_at=planned_at,
             schema_version=12,
         )
-        plan = dict(schema_twelve)
-        plan["schema_version"] = 13
-        authorization = recovery_fixtures.exact_drain_authorization(
-            plan,
-            authorized_at=planned_at,
+        for schema_version in (13, 14):
+            with self.subTest(schema_version=schema_version):
+                plan = dict(schema_twelve)
+                plan["schema_version"] = schema_version
+                if schema_version == 14:
+                    plan["checkpoint_continuation_handoff"] = (
+                        fixtures._checkpoint_continuation_handoff(
+                            snapshot=plan["live_snapshot"],
+                            created_at=planned_at,
+                        )
+                    )
+                authorization = recovery_fixtures.exact_drain_authorization(
+                    plan,
+                    authorized_at=planned_at,
+                )
+
+                with (
+                    patch(
+                        "hindsight_memory_control_plane.operation_recovery_runtime."
+                        "verify_exact_drain_plan",
+                        return_value=plan,
+                    ),
+                    patch(
+                        "hindsight_memory_control_plane.operation_recovery_runtime."
+                        "verify_exact_drain_authorization_receipt",
+                        return_value=authorization,
+                    ),
+                ):
+                    adapter = ExactDrainClaimAdapter(
+                        plan,
+                        authorization=authorization,
+                        clock=lambda: planned_at,
+                    )
+
+                self.assertEqual(
+                    adapter._execution_deadline,
+                    planned_at + plan["execution_window"]["calculated_seconds"],
+                )
+                self.assertEqual(
+                    adapter._transaction_timeout_seconds,
+                    plan["transaction_timeout_seconds"],
+                )
+                self.assertEqual(
+                    adapter._assert_claim_capable_mutation(), planned_at
+                )
+                retry_at = datetime.fromtimestamp(
+                    planned_at + 1,
+                    timezone.utc,
+                )
+                self.assertEqual(
+                    adapter._validated_reschedule_time(
+                        retry_at,
+                        observed_at=planned_at,
+                    ),
+                    retry_at,
+                )
+
+    def test_schema_fourteen_status_keeps_failure_evidence_payload_free(self):
+        body = operation_recovery_runtime._exact_drain_status_body(
+            plan={
+                "schema_version": 14,
+                "plan_digest": "a" * 64,
+            },
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            selected_operation_count=1,
+            selected_status_counts={"failed": 1},
+            preserved_status_counts={},
+            outside_nonterminal_counts=[],
+            failure_classifications=[
+                {
+                    "cause_family": "provider_execution",
+                    "error_digest": "b" * 64,
+                    "occurrence_count": 1,
+                }
+            ],
+            observed_at=1_785_462_000,
         )
 
+        self.assertEqual(body["schema_version"], 2)
+        self.assertEqual(
+            body["failure_classifications"][0]["cause_family"],
+            "provider_execution",
+        )
+        self.assertNotIn("error_message", body)
+
+    def test_schema_fourteen_adapter_rejects_expired_handoff_at_current_time(
+        self,
+    ):
+        now = int(time.time())
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        snapshot = fixtures.drain_snapshot(observed_at=now - 100)
+        continuation_handoff = fixtures._checkpoint_continuation_handoff(
+            snapshot=snapshot,
+            created_at=now - 7_200,
+        )
+        plan = fixtures.drain_plan(
+            snapshot=snapshot,
+            created_at=now,
+            schema_version=12,
+        )
+        # Preserve a complete plan shape while presenting a checkpoint that
+        # expired after authorization but before worker admission.
+        plan["schema_version"] = 14
+        plan["created_at"] = now - 7_200
+        plan["expires_at"] = now + 10_000
+        plan["checkpoint_continuation_handoff"] = continuation_handoff
+        plan["recovery_context"] = continuation_handoff[
+            "continuation_context"
+        ]
+        authorized_at = now - 5_000
+        capability = recovery_fixtures.recovery_contract.create_hatchery_capability_receipt(
+            provider_policy_digest="9" * 64,
+            provider_identity_digest="a" * 64,
+            model_digest="b" * 64,
+            observed_at=authorized_at,
+            successful=True,
+        )
+        plan["hatchery_capability_receipt"] = capability
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=authorized_at,
+        )
         with (
             patch(
                 "hindsight_memory_control_plane.operation_recovery_runtime."
@@ -322,32 +459,112 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             patch(
                 "hindsight_memory_control_plane.operation_recovery_runtime."
                 "verify_exact_drain_authorization_receipt",
-                return_value=authorization,
+                side_effect=lambda value, **kwargs: (
+                    recovery_fixtures.recovery_contract.verify_exact_drain_authorization_receipt(
+                        value,
+                        **kwargs,
+                    )
+                ),
+            ),
+            patch.object(
+                recovery_fixtures.recovery_contract,
+                "verify_exact_drain_plan",
+                return_value=plan,
             ),
         ):
-            adapter = ExactDrainClaimAdapter(
-                plan,
-                authorization=authorization,
-                clock=lambda: planned_at,
-            )
+            with self.assertRaisesRegex(OperationRecoveryError, "handoff|expired"):
+                ExactDrainClaimAdapter(
+                    plan,
+                    authorization=authorization,
+                    clock=lambda: now,
+                )
 
-        self.assertEqual(
-            adapter._execution_deadline,
-            planned_at + plan["execution_window"]["calculated_seconds"],
+    def test_schema_fourteen_checkpoint_helper_rejects_omitted_committed_row(
+        self,
+    ):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        snapshot = fixtures.drain_snapshot()
+        handoff = fixtures._checkpoint_continuation_handoff(
+            snapshot=snapshot,
         )
-        self.assertEqual(
-            adapter._transaction_timeout_seconds,
-            plan["transaction_timeout_seconds"],
+        continued = handoff["operations"][0]
+        omitted = next(
+            row
+            for row in snapshot["operations"]
+            if row["current_status"] == "pending"
+            and row["operation_type"] == "retain"
+            and row["operation_id"] != continued["operation_id"]
         )
-        self.assertEqual(adapter._assert_claim_capable_mutation(), planned_at)
-        retry_at = datetime.fromtimestamp(planned_at + 1, timezone.utc)
-        self.assertEqual(
-            adapter._validated_reschedule_time(
-                retry_at,
-                observed_at=planned_at,
-            ),
-            retry_at,
-        )
+
+        def database_row(source, checkpoint):
+            return {
+                "operation_id": source["operation_id"],
+                "operation_type": source["operation_type"],
+                "status": source["current_status"],
+                "retry_count": source["retry_count"],
+                "task_payload_digest": source["task_payload_digest"],
+                "result_metadata_digest": source["result_metadata_digest"],
+                "checkpoint_facts_committed": checkpoint["facts_committed"],
+                "checkpoint_committed_document_count": checkpoint[
+                    "committed_document_count"
+                ],
+                "checkpoint_unit_ids_count": checkpoint["unit_ids_count"],
+                "checkpoint_stage": checkpoint["stage"],
+                "checkpoint_processed": checkpoint["processed"],
+                "checkpoint_total": checkpoint["total"],
+            }
+
+        omitted_checkpoint = {
+            "facts_committed": True,
+            "committed_document_count": 1,
+            "unit_ids_count": 21,
+            "stage": "storing",
+            "processed": 3,
+            "total": 10,
+        }
+        rows = [
+            database_row(continued, continued["checkpoint"]),
+            database_row(omitted, omitted_checkpoint),
+        ]
+
+        class Connection:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch(self, _query, _identifiers):
+                self.calls += 1
+                if self.calls == 1:
+                    return rows
+                return [
+                    {
+                        "operation_id": continued["operation_id"],
+                        "metadata_document_count": 1,
+                        "document_count": 1,
+                        "unit_count": 21,
+                    }
+                ]
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {
+            "schema_version": 14,
+            "checkpoint_continuation_handoff": handoff,
+        }
+        adapter._selected = {
+            continued["operation_id"]: continued,
+            omitted["operation_id"]: omitted,
+        }
+        adapter._identifiers = [
+            uuid.UUID(continued["operation_id"]),
+            uuid.UUID(omitted["operation_id"]),
+        ]
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "omits committed row",
+        ):
+            asyncio.run(
+                adapter._verify_checkpoint_continuation_state(Connection())
+            )
 
     def test_legacy_v1_unresumed_adapter_still_rejects_expired_approval(self):
         fixture = json.loads(

@@ -848,6 +848,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 "/private/tmp/status.json",
                 "--verification-receipt",
                 "/private/tmp/verification.json",
+                "--checkpoint-continuation-handoff",
+                "/private/tmp/checkpoint-continuation.json",
                 "--output",
                 "/private/tmp/plan.json",
             ]
@@ -856,6 +858,47 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan.run,
             self.controller["operation_recovery_drain_plan_command"],
         )
+        self.assertEqual(
+            plan.checkpoint_continuation_handoff,
+            "/private/tmp/checkpoint-continuation.json",
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "operation-recovery",
+                    "drain",
+                    "plan",
+                    *authority,
+                    "--cohort",
+                    "/private/tmp/cohort.json",
+                    "--snapshot",
+                    "/private/tmp/snapshot.json",
+                    "--rollback-backup-evidence",
+                    "/private/tmp/backup.json",
+                    "--rollback-backup",
+                    "/private/tmp/backup.dump.age",
+                    "--provider-policy",
+                    "/private/tmp/providers.json",
+                    "--provider-runtime-root",
+                    "/private/tmp/provider-runtime",
+                    "--worker-runtime",
+                    "/private/tmp/hindsight-worker",
+                    "--authorization-receipt",
+                    "/private/tmp/authorization.json",
+                    "--application-receipt",
+                    "/private/tmp/application.json",
+                    "--status-artifact",
+                    "/private/tmp/status.json",
+                    "--verification-receipt",
+                    "/private/tmp/verification.json",
+                    "--recovery-plan",
+                    "/private/tmp/recovery-plan.json",
+                    "--checkpoint-continuation-handoff",
+                    "/private/tmp/checkpoint-continuation.json",
+                    "--output",
+                    "/private/tmp/plan.json",
+                ]
+            )
         for command, extra, function in (
             (
                 "apply",
@@ -887,6 +930,156 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 ]
             )
             self.assertIs(parsed.run, self.controller[function])
+
+    def test_exact_drain_plan_command_builds_schema14_from_checkpoint_handoff(
+        self,
+    ):
+        command = self.controller["operation_recovery_drain_plan_command"]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-checkpoint-plan-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            now = int(time.time())
+            snapshot = fixtures.drain_snapshot(observed_at=now - 10)
+            cohort = fixtures.cohort()
+            handoff = fixtures._checkpoint_continuation_handoff(
+                snapshot=snapshot
+            )
+            candidate = handoff["candidate_release"]
+            handoff_path = root / "checkpoint-continuation.json"
+            handoff_path.write_text(
+                json.dumps(handoff) + "\n",
+                encoding="utf-8",
+            )
+            handoff_path.chmod(0o600)
+            rollback_path = root / "rollback.age"
+            rollback_bytes = b"synthetic-backup"
+            rollback_path.write_bytes(rollback_bytes)
+            rollback_path.chmod(0o600)
+            backup = recovery_fixtures.drain_backup_evidence()
+            backup["artifact_sha256"] = hashlib.sha256(
+                rollback_bytes
+            ).hexdigest()
+            backup["source_authority"]["generation_before"] = snapshot[
+                "generation_before"
+            ]
+            backup["source_authority"]["generation_after"] = snapshot[
+                "generation_after"
+            ]
+            backup["source_authority_digest"] = self.controller["digest"](
+                backup["source_authority"]
+            )
+            documents = {
+                "cohort": cohort,
+                "snapshot": snapshot,
+                "backup": backup,
+                str(handoff_path): handoff,
+            }
+            captured = {}
+            written = {}
+            plan = {
+                "authority": {"installation": "test"},
+                "plan_digest": "c" * 64,
+                "expires_at": now + 300,
+                "selected_operation_count": 1,
+                "selected_type_counts": {"retain": 1},
+                "execution_window": {
+                    "calculated_seconds": 60,
+                    "maximum_seconds": 60,
+                },
+                "recovery_context": handoff["continuation_context"],
+                "progress_artifact_path": str(root / "progress.json"),
+                "status_artifact_path": str(root / "status.json"),
+                "worker_max_attempts": 1,
+            }
+            replacements = {
+                "_operation_recovery_candidate": lambda _args: candidate,
+                "verify_cohort_manifest": lambda _value: cohort,
+                "verify_live_snapshot": lambda _value: snapshot,
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "verify_checkpoint_continuation_handoff": (
+                    lambda _value, **_kwargs: handoff
+                ),
+                "_operation_recovery_exact_phase_repair_snapshot": (
+                    lambda **_kwargs: "7" * 64
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: ("9" * 64, object())
+                ),
+                "_operation_recovery_validate_exact_worker_provider_runtime": (
+                    lambda _policy, _worker_runtime: None
+                ),
+                "_operation_recovery_profile_environment": dict,
+                "exact_drain_effective_profile_digest": (
+                    lambda _policy, _environment: "8" * 64
+                ),
+                "_operation_recovery_validate_exact_provider_policy": (
+                    lambda _policy, **_kwargs: None
+                ),
+                "_operation_recovery_hatchery_capability_receipt": (
+                    lambda _policy, **_kwargs: {
+                        "schema_version": 1,
+                        "kind": "operation-recovery-hatchery-capability-receipt",
+                        "provider_id": "hatchery",
+                        "provider_policy_digest": "9" * 64,
+                        "provider_identity_digest": "1" * 64,
+                        "model_digest": "2" * 64,
+                        "observed_at": now,
+                        "successful": True,
+                        "receipt_digest": "3" * 64,
+                    }
+                ),
+                "_operation_recovery_exact_runtime_digest": (
+                    lambda _args, **_kwargs: "a" * 64
+                ),
+                "create_exact_drain_plan": (
+                    lambda *_args, **kwargs: captured.update(kwargs) or plan
+                ),
+                "write_private": (
+                    lambda path, value, **kwargs: written.update(
+                        {str(path): (value, kwargs)}
+                    )
+                ),
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                cohort="cohort",
+                snapshot="snapshot",
+                rollback_backup_evidence="backup",
+                rollback_backup=str(rollback_path),
+                provider_policy=str(root / "providers.json"),
+                provider_runtime_root=str(root / "provider-runtime"),
+                worker_runtime=str(root / "worker-runtime"),
+                authorization_receipt=str(root / "authorization.json"),
+                application_receipt=str(root / "application.json"),
+                status_artifact=str(root / "status.json"),
+                verification_receipt=str(root / "verification.json"),
+                recovery_plan=None,
+                checkpoint_continuation_handoff=str(handoff_path),
+                output=str(root / "plan.json"),
+            )
+            try:
+                result = command(args)
+            finally:
+                globals_.update(originals)
+
+            self.assertEqual(result["status"], "planned")
+            self.assertEqual(captured["schema_version"], 14)
+            self.assertEqual(
+                captured["checkpoint_continuation_handoff"], handoff
+            )
+            self.assertEqual(
+                captured["recovery_context"], handoff["continuation_context"]
+            )
+            self.assertIs(written[args.output][1]["create_only"], True)
 
     def test_post_abort_cli_exposes_plan_apply_status_verify_and_rollback(self):
         parser = self.controller["parser"]()

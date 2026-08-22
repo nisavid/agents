@@ -51,6 +51,7 @@ from .operation_recovery import (
     FAILURE_CAUSE_FAMILIES,
     OperationRecoveryError,
     exact_drain_execution_deadline,
+    verify_checkpoint_continuation_handoff,
     verify_exact_drain_authorization_receipt,
     verify_exact_drain_plan,
     verify_exact_drain_status,
@@ -458,7 +459,7 @@ def validate_exact_drain_provider_policy(
     if (
         policy.schema_version not in {1, 2}
         or (
-            plan_schema_version in {11, 12, 13}
+            plan_schema_version in {11, 12, 13, 14}
             and policy.schema_version != 2
         )
         or (
@@ -1586,9 +1587,13 @@ def _exact_drain_status_body(
     observed_at: int,
 ) -> dict[str, Any]:
     """Build the one canonical payload-free exact-drain status body."""
-    schema_twelve = plan.get("schema_version") in {12, 13}
+    schema_with_failure_classifications = plan.get("schema_version") in {
+        12,
+        13,
+        14,
+    }
     return {
-        "schema_version": 2 if schema_twelve else 1,
+        "schema_version": 2 if schema_with_failure_classifications else 1,
         "kind": "operation-recovery-exact-drain-status",
         "plan_digest": plan["plan_digest"],
         "generation_before": generation_before,
@@ -1605,7 +1610,7 @@ def _exact_drain_status_body(
                     dict(item) for item in failure_classifications
                 ]
             }
-            if schema_twelve
+            if schema_with_failure_classifications
             else {}
         ),
         "observed_at": observed_at,
@@ -4977,7 +4982,7 @@ def exact_drain_runtime_evidence(
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
     }:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
@@ -5100,7 +5105,7 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
             )
-        elif schema_version == 13:
+        elif schema_version in {13, 14}:
             if snapshot["schema_version"] != 8:
                 raise OperationRecoveryError(
                     "exact drain idempotent-refresh repair snapshot is required"
@@ -5235,7 +5240,7 @@ class ExactDrainClaimAdapter:
         if (
             terminal_reconciliation
             and verified.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
@@ -5244,11 +5249,11 @@ class ExactDrainClaimAdapter:
         self._clock = clock
         self._maximum_retry_delay_seconds = (
             verified["execution_window"]["maximum_retry_delay_seconds"]
-            if verified.get("schema_version") in {10, 11, 12, 13}
+            if verified.get("schema_version") in {10, 11, 12, 13, 14}
             else None
         )
         if verified.get("schema_version") in {
-            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
         }:
             if authorization is None:
                 raise OperationRecoveryError(
@@ -5277,33 +5282,38 @@ class ExactDrainClaimAdapter:
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
             else None
         )
         self.operation_attempt_timeout_seconds = (
             verified["operation_attempt_timeout_seconds"]
-            if verified.get("schema_version") in {11, 12, 13}
+            if verified.get("schema_version") in {11, 12, 13, 14}
             else None
         )
         self.phase_one_nested_stage_prefixes = (
             tuple(verified["phase_one_nested_stage_prefixes"])
-            if verified.get("schema_version") in {11, 12, 13}
+            if verified.get("schema_version") in {11, 12, 13, 14}
             else ()
         )
         self.operation_attempt_timeout_disposition = (
             verified["operation_attempt_timeout_disposition"]
-            if verified.get("schema_version") in {12, 13}
+            if verified.get("schema_version") in {12, 13, 14}
             else "worker-fail-stop"
         )
         self._cleanup_deadline: float | None = None
         self._terminal_reconciliation_deadline: float | None = None
         self._plan = verified
+        if verified.get("schema_version") == 14:
+            verify_checkpoint_continuation_handoff(
+                verified["checkpoint_continuation_handoff"],
+                now=int(self._clock()),
+            )
         self._selected = {
             item["operation_id"]: item
             for item in verified["selected_operations"]
@@ -5884,6 +5894,206 @@ class ExactDrainClaimAdapter:
                 stage=stage,
             )
 
+    async def _verify_checkpoint_continuation_state(
+        self,
+        connection: Any,
+    ) -> None:
+        """Re-verify committed retain side effects before skipping extraction.
+
+        The handoff is an authenticated, payload-free claim, but its JSON file
+        is not itself a database proof.  Before the worker can let the upstream
+        retain orchestrator take its idempotent recovery branch, bind each
+        handoff row to the live queue row and check the checkpoint counts
+        against the durable documents and memory_units tables.  No protected
+        text or identifiers leave PostgreSQL.
+        """
+        if self._plan.get("schema_version") != 14:
+            return
+        handoff = self._plan.get("checkpoint_continuation_handoff")
+        if not isinstance(handoff, Mapping):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation handoff is unavailable"
+            )
+        handoff_operations = handoff.get("operations")
+        audits = handoff.get("side_effect_audit")
+        if (
+            not isinstance(handoff_operations, list)
+            or not handoff_operations
+            or not isinstance(audits, list)
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation evidence is invalid"
+            )
+        expected = {
+            item["operation_id"]: item for item in handoff_operations
+        }
+        expected_audits = {item["operation_id"]: item for item in audits}
+        if set(expected) != set(expected_audits):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation audit set differs"
+            )
+        identifiers = []
+        try:
+            identifiers = [uuid.UUID(value) for value in expected]
+        except (AttributeError, TypeError, ValueError) as error:
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation IDs are invalid"
+            ) from error
+        rows = [
+            _mapping(row)
+            for row in await connection.fetch(
+                f"""
+                SELECT operation_id::text AS operation_id,
+                       operation_type,
+                       status,
+                       retry_count,
+                       encode(
+                           sha256(convert_to(task_payload::text, 'UTF8')),
+                           'hex'
+                       ) AS task_payload_digest,
+                       encode(
+                           sha256(
+                               convert_to(
+                                   COALESCE(result_metadata, '{{}}'::jsonb)::text,
+                                   'UTF8'
+                               )
+                           ),
+                           'hex'
+                       ) AS result_metadata_digest,
+                       {EXACT_DRAIN_CHECKPOINT_PROJECTION}
+                FROM public.async_operations
+                WHERE operation_id = ANY($1::uuid[])
+                  AND bank_id = 'engineering'
+                  AND status = 'pending'
+                  AND task_payload IS NOT NULL
+                ORDER BY operation_id
+                FOR SHARE
+                """,
+                self._identifiers,
+            )
+        ]
+        if len(rows) != len(self._selected) or {
+            row["operation_id"] for row in rows
+        } != set(self._selected):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation queue set differs"
+            )
+        # Resolve the document IDs inside PostgreSQL.  Only counts cross the
+        # privileged seam; the actual IDs and content remain server-side.
+        side_effect_rows = [
+            _mapping(row)
+            for row in await connection.fetch(
+                """
+                WITH selected AS (
+                    SELECT operation_id,
+                           CASE
+                               WHEN jsonb_typeof(
+                                   result_metadata->'facts_committed_document_ids'
+                               ) = 'array'
+                               AND jsonb_array_length(
+                                   result_metadata->'facts_committed_document_ids'
+                               ) > 0
+                               THEN result_metadata->'facts_committed_document_ids'
+                               ELSE COALESCE(
+                                   CASE
+                                       WHEN jsonb_typeof(
+                                           result_metadata->'document_ids'
+                                       ) = 'array'
+                                       THEN result_metadata->'document_ids'
+                                       ELSE '[]'::jsonb
+                                   END,
+                                   '[]'::jsonb
+                               )
+                           END AS document_ids
+                    FROM public.async_operations
+                    WHERE operation_id = ANY($1::uuid[])
+                      AND bank_id = 'engineering'
+                )
+                SELECT operation_id::text AS operation_id,
+                       jsonb_array_length(document_ids)::integer
+                           AS metadata_document_count,
+                       (
+                           SELECT count(*)::integer
+                           FROM public.documents AS d
+                           WHERE d.bank_id = 'engineering'
+                             AND d.id = ANY(
+                                 ARRAY(
+                                     SELECT jsonb_array_elements_text(
+                                         selected.document_ids
+                                     )
+                                 )
+                             )
+                       ) AS document_count,
+                       (
+                           SELECT count(*)::integer
+                           FROM public.memory_units AS u
+                           WHERE u.bank_id = 'engineering'
+                             AND u.document_id = ANY(
+                                 ARRAY(
+                                     SELECT jsonb_array_elements_text(
+                                         selected.document_ids
+                                     )
+                                 )
+                             )
+                       ) AS unit_count
+                FROM selected
+                ORDER BY operation_id
+                """,
+                identifiers,
+            )
+        ]
+        if len(side_effect_rows) != len(expected):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation side-effect set differs"
+            )
+        side_effect_by_id = {
+            row["operation_id"]: row for row in side_effect_rows
+        }
+        for row in rows:
+            operation_id = row["operation_id"]
+            if operation_id not in expected:
+                checkpoint = _exact_drain_checkpoint_evidence(row)
+                if checkpoint is not None and (
+                    checkpoint["facts_committed"]
+                    or checkpoint["committed_document_count"]
+                    or checkpoint["unit_ids_count"]
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery checkpoint continuation handoff omits committed row"
+                    )
+                continue
+            operation = expected[operation_id]
+            checkpoint = operation["checkpoint"]
+            audit = expected_audits[operation_id]
+            if (
+                row["operation_type"] != "retain"
+                or row["status"] != "pending"
+                or row["retry_count"] != operation["retry_count"]
+                or row["task_payload_digest"]
+                != operation["task_payload_digest"]
+                or row["result_metadata_digest"]
+                != operation["result_metadata_digest"]
+                or _exact_drain_checkpoint_evidence(row)
+                != checkpoint
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery checkpoint continuation row differs"
+                )
+            observed = side_effect_by_id.get(operation_id)
+            if (
+                observed is None
+                or observed["metadata_document_count"]
+                != checkpoint["committed_document_count"]
+                or observed["document_count"]
+                != checkpoint["committed_document_count"]
+                or observed["unit_count"] != checkpoint["unit_ids_count"]
+                or audit["document_count"] != observed["document_count"]
+                or audit["unit_count"] != observed["unit_count"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery checkpoint continuation side effects differ"
+                )
+
     async def _verify_initial_state(self, connection: Any) -> None:
         self._pending_progress_stages = {}
         identity = _mapping(
@@ -5952,6 +6162,7 @@ class ExactDrainClaimAdapter:
             raise OperationRecoveryError(
                 "operation-recovery exact drain cohort row set changed"
             )
+        await self._verify_checkpoint_continuation_state(connection)
         for row in rows:
             preserved = self._preserved.get(row["operation_id"])
             if preserved is not None:
@@ -6021,7 +6232,7 @@ class ExactDrainClaimAdapter:
                     schema="public",
                     operation_ids=list(self._selected),
                 )
-                if self._plan.get("schema_version") in {12, 13}
+                if self._plan.get("schema_version") in {12, 13, 14}
                 else []
             )
             selected_status_counts = {
@@ -7049,7 +7260,7 @@ async def read_exact_drain_status(
                 schema=schema,
                 operation_ids=selected_ids,
             )
-            if verified["schema_version"] in {12, 13}
+            if verified["schema_version"] in {12, 13, 14}
             else []
         )
         outside_rows = await connection.fetch(

@@ -913,6 +913,12 @@ EXACT_DRAIN_PLAN_V12_KEYS = EXACT_DRAIN_PLAN_V11_KEYS | frozenset(
 EXACT_DRAIN_PLAN_V13_KEYS = EXACT_DRAIN_PLAN_V12_KEYS | frozenset(
     {"hatchery_capability_receipt", "hatchery_capability_receipt_digest"}
 )
+EXACT_DRAIN_PLAN_V14_KEYS = EXACT_DRAIN_PLAN_V13_KEYS | frozenset(
+    {
+        "checkpoint_continuation_handoff",
+        "checkpoint_continuation_handoff_digest",
+    }
+)
 HATCHERY_CAPABILITY_RECEIPT_KEYS = frozenset(
     {
         "schema_version",
@@ -2053,7 +2059,7 @@ def _assert_installation_authority_schema(
     *,
     plan_schema_version: int,
 ) -> None:
-    if "schema_version" in authority and plan_schema_version not in {11, 12, 13}:
+    if "schema_version" in authority and plan_schema_version not in {11, 12, 13, 14}:
         raise OperationRecoveryError(
             "operation-recovery verified rebind authority requires "
             "schema 11"
@@ -2440,6 +2446,7 @@ def _checkpoint_continuation_operation(value: Any) -> dict[str, Any]:
         or body["error_digest"] is not None
         or body["attempts_consumed"] + body["attempts_remaining"]
         > CHECKPOINT_CONTINUATION_MAX_CUMULATIVE_ATTEMPTS
+        or body["attempts_remaining"] < EXACT_DRAIN_WORKER_MAX_ATTEMPTS
     ):
         raise OperationRecoveryError(
             "checkpoint continuation operation state is invalid"
@@ -2669,8 +2676,10 @@ def create_checkpoint_continuation_handoff(
 
     This function only validates supplied snapshots and digest projections.  It
     never changes operation rows, claims work, resets retry state, or starts a
-    worker.  A future executable schema must separately consume this handoff
-    and implement the idempotent runtime path.
+    worker.  Callers must source the checkpoint and side-effect projections
+    from an authenticated payload-free verifier; this constructor does not
+    infer them from arbitrary metadata.  A future executable schema must
+    separately consume this handoff and implement the idempotent runtime path.
     """
     snapshot = verify_live_snapshot(live_snapshot_value)
     source_release = _candidate_release(source_candidate_release)
@@ -3469,7 +3478,7 @@ def _exact_drain_execution_window(
     )
     attempt_timeout_seconds = (
         EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
-        if schema_version in {11, 12, 13}
+        if schema_version in {11, 12, 13, 14}
         else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
     )
     calculated_seconds = (
@@ -3484,7 +3493,7 @@ def _exact_drain_execution_window(
             "operation-recovery exact drain execution window exceeds maximum"
         )
     return {
-        "schema_version": 2 if schema_version in {11, 12, 13} else 1,
+        "schema_version": 2 if schema_version in {11, 12, 13, 14} else 1,
         "kind": "operation-recovery-exact-drain-execution-window",
         "anchor": "authorization-receipt-authorized-at",
         "renewable": False,
@@ -3500,7 +3509,7 @@ def _exact_drain_execution_window(
                     EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
                 )
             }
-            if schema_version in {11, 12, 13}
+            if schema_version in {11, 12, 13, 14}
             else {
                 "phase_one_timeout_seconds": (
                     EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
@@ -3800,6 +3809,17 @@ def _exact_drain_recovery_context(
     snapshot_rows = {
         item["operation_id"]: item for item in snapshot["operations"]
     }
+    if plan_schema_version == 14:
+        context = _checkpoint_continuation_context(value)
+        if (
+            context["generation"] != snapshot["generation_before"]
+            or context["candidate_release_digest"]
+            != candidate_release["release_digest"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation context differs"
+            )
+        return context
     initial_projection = [
         {
             key: item[key]
@@ -4081,7 +4101,7 @@ def exact_drain_execution_window_seconds(
             plan.get("execution_lease_seconds"),
             "exact drain legacy execution lease",
         )
-    if schema_version in {10, 11, 12, 13}:
+    if schema_version in {10, 11, 12, 13, 14}:
         return _verified_exact_drain_execution_window(
             plan.get("execution_window")
         )["calculated_seconds"]
@@ -4120,11 +4140,18 @@ def create_exact_drain_plan(
     verification_receipt_path: str,
     recovery_context: Mapping[str, Any] | None = None,
     hatchery_capability_receipt: Mapping[str, Any] | None = None,
+    checkpoint_continuation_handoff: Mapping[str, Any] | None = None,
     created_at: int | None = None,
     schema_version: int = 12,
 ) -> Mapping[str, Any]:
     """Plan an exact-ID worker drain without starting a worker."""
-    if type(schema_version) is not int or schema_version not in {10, 11, 12, 13}:
+    if type(schema_version) is not int or schema_version not in {
+        10,
+        11,
+        12,
+        13,
+        14,
+    }:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan schema is invalid"
         )
@@ -4241,6 +4268,34 @@ def create_exact_drain_plan(
         if created_at is None
         else _integer(created_at, "exact drain plan created-at")
     )
+    checked_continuation_handoff = None
+    if schema_version == 14:
+        if checkpoint_continuation_handoff is None:
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation handoff is required"
+            )
+        checked_continuation_handoff = verify_checkpoint_continuation_handoff(
+            checkpoint_continuation_handoff,
+            live_snapshot=snapshot,
+            now=planned_at,
+        )
+        if (
+            checked_continuation_handoff["candidate_release"]
+            != _candidate_release(candidate_release)
+            or checked_continuation_handoff["continuation_context"]
+            != recovery_context
+            or not {
+                item["operation_id"]
+                for item in checked_continuation_handoff["operations"]
+            }.issubset({item["operation_id"] for item in selected})
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery checkpoint continuation handoff differs"
+            )
+    elif checkpoint_continuation_handoff is not None:
+        raise OperationRecoveryError(
+            "operation-recovery checkpoint continuation handoff is unsupported"
+        )
     evidence_observed_at = snapshot["observed_at"]
     if (
         evidence_observed_at > planned_at
@@ -4265,7 +4320,7 @@ def create_exact_drain_plan(
         plan_schema_version=schema_version,
     )
     capability_fields = {}
-    if schema_version == 13:
+    if schema_version in {13, 14}:
         if hatchery_capability_receipt is None:
             raise OperationRecoveryError(
                 "operation-recovery Hatchery capability receipt is required"
@@ -4333,6 +4388,18 @@ def create_exact_drain_plan(
         "execution_window": execution_window,
         "recovery_context": checked_recovery_context,
         "recovery_context_digest": digest(checked_recovery_context),
+        **(
+            {
+                "checkpoint_continuation_handoff": (
+                    checked_continuation_handoff
+                ),
+                "checkpoint_continuation_handoff_digest": digest(
+                    checked_continuation_handoff
+                ),
+            }
+            if schema_version == 14
+            else {}
+        ),
         **capability_fields,
         "phase_one_statement_timeout_seconds": (
             EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
@@ -4359,14 +4426,14 @@ def create_exact_drain_plan(
                             "task-retry-after-quiescence"
                         )
                     }
-                    if schema_version in {12, 13}
+                    if schema_version in {12, 13, 14}
                     else {}
                 ),
             }
         ),
         "phase_repair_contract_digest": (
             EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
-            if schema_version == 13
+            if schema_version in {13, 14}
             else (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
                 if schema_version == 12
@@ -4379,12 +4446,12 @@ def create_exact_drain_plan(
         ),
         "progress_schema_version": (
             5
-            if schema_version in {12, 13}
+            if schema_version in {12, 13, 14}
             else (4 if schema_version == 11 else 3)
         ),
         "failure_evidence_contract_digest": (
             EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
-            if schema_version in {12, 13}
+            if schema_version in {12, 13, 14}
             else (
                 EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
                 if schema_version == 11
@@ -4410,7 +4477,7 @@ def verify_exact_drain_plan(
         )
     schema_version = normalized.get("schema_version")
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
     }:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
@@ -4431,6 +4498,7 @@ def verify_exact_drain_plan(
             11: EXACT_DRAIN_PLAN_V11_KEYS,
             12: EXACT_DRAIN_PLAN_V12_KEYS,
             13: EXACT_DRAIN_PLAN_V13_KEYS,
+            14: EXACT_DRAIN_PLAN_V14_KEYS,
         }[schema_version],
         "operation-recovery exact drain plan",
     )
@@ -4495,7 +4563,7 @@ def verify_exact_drain_plan(
     )
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery exact drain plan expired")
-    if schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
+    if schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
         evidence_observed_at = _integer(
             plan["evidence_observed_at"],
             "exact drain evidence observed-at",
@@ -4521,7 +4589,7 @@ def verify_exact_drain_plan(
         evidence_max_age_seconds = None
         transaction_timeout_seconds = None
         execution_lease_seconds = None
-    if schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
+    if schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
         phase_one_statement_timeout_seconds = _integer(
             plan["phase_one_statement_timeout_seconds"],
             "exact drain phase-one statement timeout",
@@ -4538,7 +4606,7 @@ def verify_exact_drain_plan(
         phase_one_statement_timeout_seconds = None
         phase_one_timeout_seconds = None
         phase_repair_contract_digest = None
-    if schema_version in {6, 7, 8, 9, 10, 11, 12, 13}:
+    if schema_version in {6, 7, 8, 9, 10, 11, 12, 13, 14}:
         phase_one_client_timeout_seconds = _integer(
             plan["phase_one_client_timeout_seconds"],
             "exact drain phase-one client timeout",
@@ -4556,7 +4624,7 @@ def verify_exact_drain_plan(
         progress_schema_version = None
         failure_evidence_contract_digest = None
     release = _candidate_release(plan["candidate_release"])
-    if schema_version in {10, 11, 12, 13}:
+    if schema_version in {10, 11, 12, 13, 14}:
         execution_window = _verified_exact_drain_execution_window(
             plan["execution_window"]
         )
@@ -4577,12 +4645,30 @@ def verify_exact_drain_plan(
             plan["recovery_context_digest"],
             "exact drain recovery context digest",
         )
+        if schema_version == 14:
+            checkpoint_continuation_handoff = (
+                verify_checkpoint_continuation_handoff(
+                    plan["checkpoint_continuation_handoff"],
+                    live_snapshot=snapshot,
+                    now=created_at,
+                    allow_expired=True,
+                )
+            )
+            checkpoint_continuation_handoff_digest = _sha(
+                plan["checkpoint_continuation_handoff_digest"],
+                "checkpoint continuation handoff digest",
+            )
+        else:
+            checkpoint_continuation_handoff = None
+            checkpoint_continuation_handoff_digest = None
     else:
         execution_window = None
         expected_execution_window = None
         recovery_context = None
         recovery_context_digest = None
-    if schema_version in {11, 12, 13}:
+        checkpoint_continuation_handoff = None
+        checkpoint_continuation_handoff_digest = None
+    if schema_version in {11, 12, 13, 14}:
         operation_attempt_timeout_seconds = _integer(
             plan["operation_attempt_timeout_seconds"],
             "exact drain operation-attempt timeout",
@@ -4604,7 +4690,7 @@ def verify_exact_drain_plan(
                 "exact drain operation-attempt timeout disposition",
                 maximum=128,
             )
-            if schema_version in {12, 13}
+            if schema_version in {12, 13, 14}
             else None
         )
     else:
@@ -4614,7 +4700,7 @@ def verify_exact_drain_plan(
         provider_timeout_contract = None
         operation_attempt_timeout_disposition = None
     capability_fields = {}
-    if schema_version == 13:
+    if schema_version in {13, 14}:
         capability = verify_hatchery_capability_receipt(
             plan["hatchery_capability_receipt"]
         )
@@ -4674,7 +4760,8 @@ def verify_exact_drain_plan(
         )
     )
     if (
-        schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+        schema_version
+        not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
         or plan.get("action") != "drain-exact-operation-cohort"
         or plan.get("authority") != "unapproved-plan"
@@ -4727,7 +4814,21 @@ def verify_exact_drain_plan(
             else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
         )
         or (
-            schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+            schema_version in {
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+            }
             and (
                 evidence_observed_at != snapshot["observed_at"]
                 or evidence_max_age_seconds
@@ -4745,14 +4846,33 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {10, 11, 12, 13}
+            schema_version in {10, 11, 12, 13, 14}
             and (
                 execution_window != expected_execution_window
                 or recovery_context_digest != digest(recovery_context)
             )
         )
         or (
-            schema_version in {11, 12, 13}
+            schema_version == 14
+            and (
+                checkpoint_continuation_handoff_digest
+                != digest(checkpoint_continuation_handoff)
+                or checkpoint_continuation_handoff["candidate_release"]
+                != release
+                or checkpoint_continuation_handoff["continuation_context"]
+                != recovery_context
+                or not {
+                    item["operation_id"]
+                    for item in checkpoint_continuation_handoff["operations"]
+                }.issubset(
+                    {item["operation_id"] for item in selected}
+                )
+                or checkpoint_continuation_handoff["created_at"] > created_at
+                or checkpoint_continuation_handoff["expires_at"] <= created_at
+            )
+        )
+        or (
+            schema_version in {11, 12, 13, 14}
             and (
                 operation_attempt_timeout_seconds
                 != EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
@@ -4761,14 +4881,27 @@ def verify_exact_drain_plan(
                 or provider_timeout_contract
                 != EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
                 or (
-                    schema_version in {12, 13}
+                    schema_version in {12, 13, 14}
                     and operation_attempt_timeout_disposition
                     != "task-retry-after-quiescence"
                 )
             )
         )
         or (
-            schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+            schema_version in {
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+            }
             and (
                 phase_one_statement_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
@@ -4788,12 +4921,23 @@ def verify_exact_drain_plan(
                         11: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
                         12: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST,
                         13: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
+                        14: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
                     }[schema_version]
                 )
             )
         )
         or (
-            schema_version in {6, 7, 8, 9, 10, 11, 12, 13}
+            schema_version in {
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+            }
             and (
                 phase_one_client_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS
@@ -4802,7 +4946,7 @@ def verify_exact_drain_plan(
                 or progress_schema_version
                 != (
                     5
-                    if schema_version in {12, 13}
+                    if schema_version in {12, 13, 14}
                     else (
                         4
                         if schema_version == 11
@@ -4812,7 +4956,7 @@ def verify_exact_drain_plan(
                 or failure_evidence_contract_digest
                 != (
                     EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
-                    if schema_version in {12, 13}
+                    if schema_version in {12, 13, 14}
                     else (
                         EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
                         if schema_version == 11
@@ -4826,7 +4970,7 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version == 13
+            schema_version in {13, 14}
             and (
                 capability_fields["hatchery_capability_receipt_digest"]
                 != capability_fields["hatchery_capability_receipt"][
@@ -4925,13 +5069,31 @@ def verify_exact_drain_plan(
                         "recovery_context_digest": (
                             recovery_context_digest
                         ),
+                        **(
+                            {
+                                "checkpoint_continuation_handoff": (
+                                    plan["checkpoint_continuation_handoff"]
+                                ),
+                                "checkpoint_continuation_handoff_digest": (
+                                    _sha(
+                                        plan[
+                                            "checkpoint_continuation_handoff_digest"
+                                        ],
+                                        "checkpoint continuation handoff digest",
+                                    )
+                                ),
+                            }
+                            if schema_version == 14
+                            else {}
+                        ),
                     }
                 ),
             }
         ),
         **(
             {}
-            if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+            if schema_version
+            not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
             else {
                 "phase_one_statement_timeout_seconds": (
                     phase_one_statement_timeout_seconds
@@ -4944,7 +5106,8 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {6, 7, 8, 9, 10, 11, 12, 13}
+            if schema_version
+            not in {6, 7, 8, 9, 10, 11, 12, 13, 14}
             else {
                 "phase_one_client_timeout_seconds": (
                     phase_one_client_timeout_seconds
@@ -4957,7 +5120,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {11, 12, 13}
+            if schema_version not in {11, 12, 13, 14}
             else {
                 "operation_attempt_timeout_seconds": (
                     operation_attempt_timeout_seconds
@@ -4973,7 +5136,7 @@ def verify_exact_drain_plan(
                             operation_attempt_timeout_disposition
                         )
                     }
-                    if schema_version in {12, 13}
+                    if schema_version in {12, 13, 14}
                     else {}
                 ),
             }
@@ -7221,10 +7384,15 @@ def verify_exact_drain_authorization_receipt(
         or authorized_at < verified_plan["created_at"]
         or authorized_at >= verified_plan["expires_at"]
         or (
-            verified_plan["schema_version"] == 13
+            verified_plan["schema_version"] in {13, 14}
             and authorized_at
             - verified_plan["hatchery_capability_receipt"]["observed_at"]
             > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+        )
+        or (
+            verified_plan["schema_version"] == 14
+            and authorized_at
+            >= verified_plan["checkpoint_continuation_handoff"]["expires_at"]
         )
         or _sha(
             receipt["receipt_digest"],
@@ -7379,7 +7547,7 @@ def verify_exact_drain_status(
     }
     if (
         status_schema_version
-        != (2 if verified_plan["schema_version"] in {12, 13} else 1)
+        != (2 if verified_plan["schema_version"] in {12, 13, 14} else 1)
         or body["plan_digest"] != verified_plan["plan_digest"]
         or generation_before != generation_after
         or body["selected_operation_count"]

@@ -7527,7 +7527,14 @@ class OperationRecoveryContractTest(unittest.TestCase):
         with self.assertRaisesRegex(OperationRecoveryError, "plan is invalid"):
             verify_claim_release_plan(permitted_tampered, now=planned_at)
 
-    def _checkpoint_continuation_handoff(self, *, snapshot=None):
+    def _checkpoint_continuation_handoff(
+        self,
+        *,
+        snapshot=None,
+        attempts_consumed=1,
+        attempts_remaining=19,
+        created_at=1_785_402_000,
+    ):
         snapshot = self.drain_snapshot() if snapshot is None else snapshot
         row = next(
             item
@@ -7552,8 +7559,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
             "result_metadata_digest": row["result_metadata_digest"],
             "checkpoint": checkpoint,
             "retry_count": row["retry_count"],
-            "attempts_consumed": 1,
-            "attempts_remaining": 19,
+            "attempts_consumed": attempts_consumed,
+            "attempts_remaining": attempts_remaining,
             "worker_id_present": row["worker_id_present"],
             "worker_id_digest": row["worker_id_digest"],
             "claimed_at": row["claimed_at"],
@@ -7599,7 +7606,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 source_candidate_release=release_identity(),
                 candidate_release=target_release,
                 generation=snapshot["generation_before"],
-                created_at=1_785_402_000,
+                created_at=created_at,
             )
         )
 
@@ -7723,6 +7730,18 @@ class OperationRecoveryContractTest(unittest.TestCase):
             ),
             handoff,
         )
+
+    def test_checkpoint_continuation_rejects_less_than_worker_attempt_budget(
+        self,
+    ):
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "attempt|state is invalid",
+        ):
+            self._checkpoint_continuation_handoff(
+                attempts_consumed=19,
+                attempts_remaining=1,
+            )
 
 
 if __name__ == "__main__":

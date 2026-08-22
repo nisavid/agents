@@ -8787,8 +8787,19 @@ def _operation_recovery_exact_recovery_context(
             for operation_id in sorted(set(live_rows) - selected_id_set)
         ]
     )
+    candidate_release_matches = (
+        recovery_plan["candidate_release"] == candidate_release
+    )
+    # Schema 13 has already consumed the only row-reconciliation cycle. A
+    # newly approved immutable candidate may reuse that verified row-state
+    # handoff because the context binds both the reconciliation-plan digest
+    # and the replacement candidate digest; earlier recovery schemas still
+    # require one candidate throughout their state-mutating lineage.
     if (
-        recovery_plan["candidate_release"] != candidate_release
+        (
+            not candidate_release_matches
+            and recovery_plan["schema_version"] != 13
+        )
         or recovery_plan["cohort_digest"] != snapshot["cohort_digest"]
         or recovery_plan["installation_authority"]
         != snapshot["installation_authority"]

@@ -3071,6 +3071,83 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 recovery["plan_digest"],
             )
 
+    def test_post_terminal_handoff_allows_approved_candidate_repair(self):
+        helper = self.controller[
+            "_operation_recovery_exact_recovery_context"
+        ]
+        globals_ = helper.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-candidate-repair-handoff-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            recovery, snapshot, documents, recovery_path = (
+                self._schema_10_recovery_handoff(root)
+            )
+            recovery = deepcopy(recovery)
+            recovery.update(
+                schema_version=13,
+                reference_application_receipt_digest="1" * 64,
+                reference_terminal_status_digest="2" * 64,
+            )
+            application = documents[recovery["application_receipt_path"]]
+            verification = documents[
+                recovery["verification_receipt_path"]
+            ]
+            repaired_candidate = {
+                **recovery["candidate_release"],
+                "source_commit": "6" * 40,
+                "version": "2026.08.21+6666666.operation-recovery.55",
+                "release_digest": "7" * 64,
+            }
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, *, allow_expired: recovery
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_operation_recovery_post_abort_validate_verification": (
+                    lambda _value, *, plan, application, authority: verification
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                context = helper(
+                    SimpleNamespace(recovery_plan=str(recovery_path)),
+                    snapshot=snapshot,
+                    candidate_release=repaired_candidate,
+                )
+                recovery["schema_version"] = 12
+                with self.assertRaisesRegex(
+                    Exception,
+                    "recovery handoff differs",
+                ):
+                    helper(
+                        SimpleNamespace(recovery_plan=str(recovery_path)),
+                        snapshot=snapshot,
+                        candidate_release=repaired_candidate,
+                    )
+            finally:
+                globals_.update(originals)
+
+            self.assertEqual(context["schema_version"], 4)
+            self.assertEqual(context["recovery_epoch"], 3)
+            self.assertEqual(context["reconciliation_cycle"], 1)
+            self.assertEqual(
+                context["candidate_release_digest"],
+                repaired_candidate["release_digest"],
+            )
+            self.assertEqual(
+                context["post_terminal_reconciliation_plan_digest"],
+                recovery["plan_digest"],
+            )
+
     def test_exact_drain_plan_command_hands_off_verified_recovery_sources(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__

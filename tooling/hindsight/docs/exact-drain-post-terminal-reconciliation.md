@@ -118,6 +118,20 @@ The controller launches one one-shot worker. A second worker cannot claim the
 plan. Terminal reconciliation closes the run as soon as every selected row is
 completed, failed, or cancelled; it does not wait for a later empty claim.
 
+### Pre-execution candidate repair
+
+If that one-shot worker closes during initialization before any selected row
+or provider request begins, the failed candidate remains immutable. A repaired
+candidate may reuse the verified post-terminal row-state handoff under a new
+exact-drain plan and a new approval digest. The new recovery context binds the
+existing reconciliation-plan digest and the repaired candidate release digest.
+
+This handoff does not update rows, consume recovery epoch four, or create a
+second reconciliation cycle. The planner still proves that the reconciled rows,
+checkpoint set, preserved rows, database generation, and installation authority
+match the verified reconciliation receipt. Candidate replacement remains
+forbidden for the state-mutating recovery schemas before schema 13.
+
 ## Failure handling
 
 The reconciliation cycle is the last automatic attempt represented by this

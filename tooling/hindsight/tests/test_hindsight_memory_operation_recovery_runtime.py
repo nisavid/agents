@@ -298,6 +298,57 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             authorization_bytes,
         )
 
+    def test_schema_thirteen_initializes_lease_for_retry_persistence(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        schema_twelve = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+            schema_version=12,
+        )
+        plan = dict(schema_twelve)
+        plan["schema_version"] = 13
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_plan",
+                return_value=plan,
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_authorization_receipt",
+                return_value=authorization,
+            ),
+        ):
+            adapter = ExactDrainClaimAdapter(
+                plan,
+                authorization=authorization,
+                clock=lambda: planned_at,
+            )
+
+        self.assertEqual(
+            adapter._execution_deadline,
+            planned_at + plan["execution_window"]["calculated_seconds"],
+        )
+        self.assertEqual(
+            adapter._transaction_timeout_seconds,
+            plan["transaction_timeout_seconds"],
+        )
+        self.assertEqual(adapter._assert_claim_capable_mutation(), planned_at)
+        retry_at = datetime.fromtimestamp(planned_at + 1, timezone.utc)
+        self.assertEqual(
+            adapter._validated_reschedule_time(
+                retry_at,
+                observed_at=planned_at,
+            ),
+            retry_at,
+        )
+
     def test_legacy_v1_unresumed_adapter_still_rejects_expired_approval(self):
         fixture = json.loads(
             (

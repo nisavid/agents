@@ -5235,7 +5235,7 @@ class ExactDrainClaimAdapter:
         if (
             terminal_reconciliation
             and verified.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
@@ -5248,7 +5248,7 @@ class ExactDrainClaimAdapter:
             else None
         )
         if verified.get("schema_version") in {
-            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
         }:
             if authorization is None:
                 raise OperationRecoveryError(
@@ -5277,13 +5277,13 @@ class ExactDrainClaimAdapter:
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
             else None
         )
         self.operation_attempt_timeout_seconds = (
@@ -7947,7 +7947,7 @@ async def apply_post_abort_recovery_transaction(
             selected_identifiers,
             bank_id,
             verified["reference_worker_id_digest"],
-            verified["schema_version"] in {7, 9, 10, 11, 12},
+            verified["schema_version"] in {7, 9, 10, 11, 12, 13},
         )
         if result != f"UPDATE {len(selected)}":
             raise OperationRecoveryError(

@@ -71,13 +71,19 @@ def commit(repo: Path, name: str) -> str:
 
 TEST_CREDENTIAL_USERNAME_ENV = "VERSIONKEEPING_TEST_CREDENTIAL_USERNAME"
 TEST_CREDENTIAL_SECRET_ENV = "VERSIONKEEPING_TEST_CREDENTIAL_SECRET"
+TEST_CREDENTIAL_PATH_ENV = "VERSIONKEEPING_TEST_CREDENTIAL_PATH"
 TEST_CREDENTIAL_HELPER = Path(__file__).with_name("credential-helper.sh").resolve()
 
 
-def credential_helper_environment(username: str, secret: str) -> dict[str, str]:
+def credential_helper_environment(
+    username: str,
+    secret: str,
+    endpoint: str,
+) -> dict[str, str]:
     return {
         TEST_CREDENTIAL_USERNAME_ENV: username,
         TEST_CREDENTIAL_SECRET_ENV: secret,
+        TEST_CREDENTIAL_PATH_ENV: urllib.parse.urlsplit(endpoint).path.lstrip("/"),
     }
 
 
@@ -345,6 +351,14 @@ class PublicationExecutionTests(unittest.TestCase):
         self.assertEqual(
             [value for key, value in closed_config if key == "credential.helper"],
             ["", trusted_helper],
+        )
+        self.assertEqual(
+            [
+                value
+                for key, value in closed_config
+                if key == "credential.useHttpPath"
+            ],
+            ["true"],
         )
         self.assertNotIn("credential.credentialStore", dict(closed_config))
 
@@ -979,7 +993,15 @@ class PublicationExecutionTests(unittest.TestCase):
                 lookup = (
                     "protocol=https\n"
                     f"host={endpoint_parts.netloc}\n"
+                    f"path={endpoint_parts.path.lstrip('/')}\n"
                     f"username={username}\n\n"
+                )
+                unrelated_endpoint = endpoint.removesuffix("repository.git") + (
+                    "unrelated.git"
+                )
+                unrelated_lookup = lookup.replace(
+                    f"path={endpoint_parts.path.lstrip('/')}\n",
+                    "path=unrelated.git\n",
                 )
                 credential = lookup.removesuffix("\n") + f"password={secret}\n\n"
                 erased = None
@@ -1027,9 +1049,30 @@ class PublicationExecutionTests(unittest.TestCase):
                         ),
                         "native credential did not round-trip",
                     )
+                    unrelated_retrieved = run_credential_helper(
+                        helper,
+                        "get",
+                        unrelated_lookup,
+                        repository.env,
+                    )
+                    unrelated_fields = credential_protocol_fields(
+                        unrelated_retrieved.stdout
+                    )
+                    self.assertFalse(
+                        secrets.compare_digest(
+                            unrelated_fields.get("password", ""),
+                            secret,
+                        ),
+                        "native credential escaped its HTTPS repository path",
+                    )
                     result = adapter._run_endpoint(
                         repository,
                         endpoint,
+                        ["ls-remote", "--heads"],
+                    )
+                    unrelated_result = adapter._run_endpoint(
+                        repository,
+                        unrelated_endpoint,
                         ["ls-remote", "--heads"],
                     )
                 except BaseException:
@@ -1068,6 +1111,7 @@ class PublicationExecutionTests(unittest.TestCase):
             0,
             result.stderr.replace(secret, "<redacted>"),
         )
+        self.assertNotEqual(unrelated_result.returncode, 0)
         self.assertTrue(authorized.is_set())
         self.assertNotIn(secret, result.stdout)
         self.assertNotIn(secret, result.stderr)
@@ -1089,7 +1133,7 @@ class PublicationExecutionTests(unittest.TestCase):
         ) as (endpoint, certificate, authorized):
             with adapter.GitRepository(self.repo) as repository:
                 repository.env.update(
-                    credential_helper_environment(username, secret)
+                    credential_helper_environment(username, secret, endpoint)
                 )
                 repository._append_command_config(
                     "http.sslCAInfo",
@@ -1107,6 +1151,11 @@ class PublicationExecutionTests(unittest.TestCase):
                     endpoint,
                     ["ls-remote", "--heads"],
                 )
+                unrelated = adapter._run_endpoint(
+                    repository,
+                    endpoint.removesuffix("repository.git") + "unrelated.git",
+                    ["ls-remote", "--heads"],
+                )
                 config = {
                     key: value
                     for key, value in repository.env.items()
@@ -1119,6 +1168,7 @@ class PublicationExecutionTests(unittest.TestCase):
             result.stderr.replace(secret, "<redacted>"),
         )
         self.assertTrue(authorized.is_set())
+        self.assertNotEqual(unrelated.returncode, 0)
         self.assertNotIn(secret, result.stdout)
         self.assertNotIn(secret, result.stderr)
         self.assertNotIn(secret, json.dumps(config))
@@ -1137,7 +1187,7 @@ class PublicationExecutionTests(unittest.TestCase):
         ) as (endpoint, certificate, authorized):
             with adapter.GitRepository(self.repo) as repository:
                 repository.env.update(
-                    credential_helper_environment(username, secret)
+                    credential_helper_environment(username, secret, endpoint)
                 )
                 repository._append_command_config(
                     "http.sslCAInfo",
@@ -1310,7 +1360,7 @@ class PublicationExecutionTests(unittest.TestCase):
 
         def enable_credentials(repository, endpoint, certificate):
             repository.env.update(
-                credential_helper_environment(username, secret)
+                credential_helper_environment(username, secret, endpoint)
             )
             repository._append_command_config(
                 "http.sslCAInfo",

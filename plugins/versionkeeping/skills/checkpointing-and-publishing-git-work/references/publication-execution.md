@@ -116,7 +116,9 @@ closed.
 The executor first installs an empty command-scope `credential.helper` to clear
 all ambient helpers, rejects every repository or worktree `credential.*`
 setting for HTTPS execution, and then appends only the validated platform
-helper. A closed askpass command,
+helper. Command-scoped `credential.useHttpPath=true` binds credential lookup to
+the reviewed repository path instead of sharing credentials with other paths
+on the same HTTPS authority. A closed askpass command,
 `GIT_TERMINAL_PROMPT=0`, and `GCM_INTERACTIVE=never` remain in force. Before
 helper activation, any
 repository or worktree `http.*.sslVerify`, `http.*.sslCAInfo`, or

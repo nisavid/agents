@@ -3091,6 +3091,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 reference_application_receipt_digest="1" * 64,
                 reference_terminal_status_digest="2" * 64,
             )
+            snapshot = deepcopy(snapshot)
+            snapshot["generation_before"] = "systalyze:public:999"
+            snapshot["generation_after"] = "systalyze:public:999"
             application = documents[recovery["application_receipt_path"]]
             verification = documents[
                 recovery["verification_receipt_path"]
@@ -3123,6 +3126,25 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     snapshot=snapshot,
                     candidate_release=repaired_candidate,
                 )
+                drifted_snapshot = deepcopy(snapshot)
+                selected_id = recovery["selected_operations"][0][
+                    "operation_id"
+                ]
+                selected_row = next(
+                    item
+                    for item in drifted_snapshot["operations"]
+                    if item["operation_id"] == selected_id
+                )
+                selected_row["task_payload_digest"] = "8" * 64
+                with self.assertRaisesRegex(
+                    Exception,
+                    "recovery handoff differs",
+                ):
+                    helper(
+                        SimpleNamespace(recovery_plan=str(recovery_path)),
+                        snapshot=drifted_snapshot,
+                        candidate_release=repaired_candidate,
+                    )
                 recovery["schema_version"] = 12
                 with self.assertRaisesRegex(
                     Exception,

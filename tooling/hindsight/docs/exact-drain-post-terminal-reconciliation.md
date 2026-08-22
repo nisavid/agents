@@ -127,10 +127,12 @@ exact-drain plan and a new approval digest. The new recovery context binds the
 existing reconciliation-plan digest and the repaired candidate release digest.
 
 This handoff does not update rows, consume recovery epoch four, or create a
-second reconciliation cycle. The planner still proves that the reconciled rows,
-checkpoint set, preserved rows, database generation, and installation authority
-match the verified reconciliation receipt. Candidate replacement remains
-forbidden for the state-mutating recovery schemas before schema 13.
+second reconciliation cycle. The planner still proves that the reconciled row
+states, task-payload digests, result-metadata digests, checkpoint set, preserved
+rows, and installation authority match the verified reconciliation receipt. A
+stable generation advance is accepted only with that complete durable-row
+continuity, and the new plan binds the current generation. Candidate replacement
+remains forbidden for the state-mutating recovery schemas before schema 13.
 
 ## Failure handling
 

@@ -9600,15 +9600,16 @@ def _operation_recovery_exact_execution_lease_projection(
     }
 
 
+EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 14))
+
+
 def _operation_recovery_assert_exact_execution_lease(
     plan: Mapping[str, Any],
     authorization: Mapping[str, Any],
     *,
     now: int | None = None,
 ) -> int | None:
-    if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
-    }:
+    if plan.get("schema_version") not in EXECUTION_LEASE_SCHEMA_VERSIONS:
         return None
     execution_deadline = exact_drain_execution_deadline(plan, authorization)
     if execution_deadline is None:
@@ -9633,7 +9634,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             authorization = (
                 _operation_recovery_exact_authorization(plan)
                 if plan.get("schema_version")
-                in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+                in EXECUTION_LEASE_SCHEMA_VERSIONS
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -9644,7 +9645,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 "status": (
                     "authorization-only"
                     if plan.get("schema_version")
-                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+                    in EXECUTION_LEASE_SCHEMA_VERSIONS
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -10609,7 +10610,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
                                     if plan.get("schema_version")
-                                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+                                    in EXECUTION_LEASE_SCHEMA_VERSIONS
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -10711,7 +10712,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         or application_path.exists()
         or (
             plan.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+            in EXECUTION_LEASE_SCHEMA_VERSIONS
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -10722,7 +10723,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                 "status": (
                     "authorization-only"
                     if plan.get("schema_version")
-                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+                    in EXECUTION_LEASE_SCHEMA_VERSIONS
                     and authorization is not None
                     else "not-started"
                 ),
@@ -10823,7 +10824,10 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                 "exact drain terminal progress differs"
             )
         monitor_status = "terminal"
-    if monitor_status == "interrupted" and plan.get("schema_version") == 12:
+    if (
+        monitor_status == "interrupted"
+        and plan.get("schema_version") in {12, 13}
+    ):
         frozen = _operation_recovery_read_monitor_progress(
             plan,
             freeze_ages_at_observed_at=True,

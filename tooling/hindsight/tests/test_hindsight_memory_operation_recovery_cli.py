@@ -7048,6 +7048,19 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertFalse(active_sentinel.exists())
             self.assertFalse(resolver_sentinel.exists())
 
+    def test_schema_thirteen_keeps_schema_twelve_runtime_safety_gates(self):
+        worker = runpy.run_path(
+            str(ROOT / "bin" / "hindsight-exact-drain-worker")
+        )
+
+        self.assertIn(13, worker["EXECUTION_LEASE_SCHEMA_VERSIONS"])
+        self.assertIn(13, worker["DETACHED_RUNTIME_SCHEMA_VERSIONS"])
+        self.assertIn(13, worker["UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS"])
+        self.assertIn(
+            13,
+            self.controller["EXECUTION_LEASE_SCHEMA_VERSIONS"],
+        )
+
     def test_terminal_reconciliation_worker_interface_is_unavailable(self):
         worker = runpy.run_path(
             str(ROOT / "bin" / "hindsight-exact-drain-worker")

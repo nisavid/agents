@@ -63,6 +63,9 @@ from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa
 
 _WORKER_PROGRESS_RECORDER = None
 _WORKER_STAGE = "worker.bootstrap"
+EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 14))
+DETACHED_RUNTIME_SCHEMA_VERSIONS = EXECUTION_LEASE_SCHEMA_VERSIONS
+UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS = frozenset(range(9, 14))
 
 
 def _record_worker_stage(recorder, *, status: str, stage: str) -> None:
@@ -246,7 +249,7 @@ def main() -> int:
     if plan["schema_version"] == 1 and not args.resume:
         plan = verify_exact_drain_plan(plan_value)
     if (
-        plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+        plan["schema_version"] in EXECUTION_LEASE_SCHEMA_VERSIONS
         and time.time()
         >= exact_drain_execution_deadline(plan, authorization)
     ):
@@ -348,12 +351,12 @@ def main() -> int:
     set_exact_drain_progress_recorder(progress_recorder)
 
     install_exact_drain_candidate_imports(args.worker_runtime, LIB)
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
         validate_exact_drain_dependency_spec(
             "asyncpg",
             args.worker_runtime,
         )
-    if plan["schema_version"] in {9, 10, 11, 12}:
+    if plan["schema_version"] in UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS:
         validate_exact_drain_dependency_spec(
             "uvicorn",
             args.worker_runtime,
@@ -412,7 +415,7 @@ def main() -> int:
         return candidate_release_root
 
     provider_globals["_resolve_active_release"] = resolve_detached_candidate
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
     original_protected_reader = provider_globals.get(
         "_read_protected_file"
@@ -441,7 +444,7 @@ def main() -> int:
         ),
         provider_globals,
     )
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     def complete() -> None:
@@ -465,12 +468,12 @@ def main() -> int:
     from hindsight_api.worker.poller import WorkerPoller
     from uvicorn import Server as UvicornServer
 
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     signal_guard = (
         ExactDrainUvicornSignalGuard(UvicornServer)
-        if plan["schema_version"] in {9, 10, 11, 12}
+        if plan["schema_version"] in UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS
         else nullcontext()
     )
     with (

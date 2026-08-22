@@ -9273,6 +9273,83 @@ def _operation_recovery_exact_application(
     return dict(value)
 
 
+def _operation_recovery_terminal_application_evidence(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    terminal_status: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Authenticate or derive immutable terminal application evidence."""
+    if (
+        isinstance(value, Mapping)
+        and value.get("kind")
+        == "operation-recovery-exact-drain-application-receipt"
+    ):
+        return _operation_recovery_exact_application(
+            value,
+            plan=plan,
+            authorization=authorization,
+            terminal_status=terminal_status,
+        )
+    journal = _operation_recovery_exact_journal(
+        value,
+        plan=plan,
+        authorization=authorization,
+    )
+    if _operation_recovery_exact_journal_worker_active(journal):
+        raise OperationRecoveryError(
+            "exact drain application journal worker remains active"
+        )
+    if not _operation_recovery_exact_status_is_terminal(terminal_status):
+        raise OperationRecoveryError(
+            "exact drain worker stopped before terminal state"
+        )
+    progress = _operation_recovery_assert_terminal_progress(
+        plan=plan,
+        journal=journal,
+        terminal=terminal_status,
+    )
+    completed_at = max(
+        journal["started_at"],
+        terminal_status["observed_at"],
+        progress["observed_at"],
+    )
+    derived = _operation_recovery_exact_receipt(
+        {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-application-receipt",
+            "plan_digest": plan["plan_digest"],
+            "candidate_release": plan["candidate_release"],
+            "authorization_receipt_digest": authorization[
+                "receipt_digest"
+            ],
+            "application_journal_digest": journal["receipt_digest"],
+            "worker_runtime_digest": plan["worker_runtime_digest"],
+            "provider_policy_digest": plan["provider_policy_digest"],
+            "terminal_status_digest": terminal_status["status_digest"],
+            "terminal_progress_digest": progress["progress_digest"],
+            "selected_status_counts": terminal_status[
+                "selected_status_counts"
+            ],
+            "outside_nonterminal_counts": terminal_status[
+                "outside_nonterminal_counts"
+            ],
+            "worker_pid": journal["worker_pid"],
+            "worker_start_time": journal["worker_start_time"],
+            "worker_attempt": journal["worker_attempt"],
+            "started_at": journal["started_at"],
+            "completed_at": completed_at,
+        }
+    )
+    return _operation_recovery_exact_application(
+        derived,
+        plan=plan,
+        authorization=authorization,
+        terminal_status=terminal_status,
+    )
+
+
 def _operation_recovery_exact_authorization(
     plan: Mapping[str, Any],
 ) -> Mapping[str, Any]:
@@ -11204,14 +11281,16 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             ),
             plan=reference,
         )
-        terminal_application = _operation_recovery_exact_application(
-            _operation_recovery_read_private_json(
-                reference["application_receipt_path"],
-                "reference exact drain application receipt",
-            ),
-            plan=reference,
-            authorization=reference_authorization,
-            terminal_status=terminal_status,
+        terminal_application = (
+            _operation_recovery_terminal_application_evidence(
+                _operation_recovery_read_private_json(
+                    reference["application_receipt_path"],
+                    "reference exact drain application receipt",
+                ),
+                plan=reference,
+                authorization=reference_authorization,
+                terminal_status=terminal_status,
+            )
         )
         worker_exit_body = {
             "schema_version": 1,
@@ -11389,14 +11468,16 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             ),
             plan=current_reference,
         )
-        current_terminal_application = _operation_recovery_exact_application(
-            _operation_recovery_read_private_json(
-                current_reference["application_receipt_path"],
-                "reference exact drain application receipt",
-            ),
-            plan=current_reference,
-            authorization=current_reference_authorization,
-            terminal_status=current_terminal_status,
+        current_terminal_application = (
+            _operation_recovery_terminal_application_evidence(
+                _operation_recovery_read_private_json(
+                    current_reference["application_receipt_path"],
+                    "reference exact drain application receipt",
+                ),
+                plan=current_reference,
+                authorization=current_reference_authorization,
+                terminal_status=current_terminal_status,
+            )
         )
         if (
             current_terminal_status != terminal_status

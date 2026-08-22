@@ -7304,6 +7304,60 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ),
             application,
         )
+        journal = make_receipt(journal_body)
+        terminal_progress = {
+            "plan_digest": plan["plan_digest"],
+            "progress_digest": "d" * 64,
+            "worker_pid": journal["worker_pid"],
+            "worker_start_time": journal["worker_start_time"],
+            "worker_attempt": journal["worker_attempt"],
+            "observed_at": now + 2,
+            "selected_status_counts": {"completed": 43},
+            "active_provider_requests": [],
+            "tasks": [
+                {
+                    "operation_id": item["operation_id"],
+                    "operation_type": item["operation_type"],
+                    "row_digest": item["row_digest"],
+                }
+                for item in plan["selected_operations"]
+            ],
+        }
+        derive_terminal = self.controller[
+            "_operation_recovery_terminal_application_evidence"
+        ]
+        with patch.dict(
+            derive_terminal.__globals__,
+            {
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
+                "read_exact_drain_progress": (
+                    lambda _path, *, plan_digest, progress_schema_version=1: (
+                        dict(terminal_progress)
+                    )
+                ),
+            },
+        ):
+            derived = derive_terminal(
+                journal,
+                plan=plan,
+                authorization=authorization,
+                terminal_status=terminal_status,
+            )
+        self.assertEqual(
+            derived["kind"],
+            "operation-recovery-exact-drain-application-receipt",
+        )
+        self.assertEqual(
+            derived["application_journal_digest"],
+            journal["receipt_digest"],
+        )
+        self.assertEqual(
+            derived["terminal_progress_digest"],
+            terminal_progress["progress_digest"],
+        )
+        self.assertEqual(derived["completed_at"], now + 2)
         forged = dict(application)
         forged["authorization_receipt_digest"] = "0" * 64
         forged["receipt_digest"] = self.controller["digest"](

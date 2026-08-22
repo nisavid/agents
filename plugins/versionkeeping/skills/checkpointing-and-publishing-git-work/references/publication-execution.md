@@ -116,19 +116,16 @@ closed.
 The executor first installs an empty command-scope `credential.helper` to clear
 all ambient helpers, rejects every repository or worktree `credential.*`
 setting for HTTPS execution, and then appends only the validated platform
-helper. Command-scoped `credential.useHttpPath=true` binds credential lookup to
-the reviewed repository path instead of sharing credentials with other paths
-on the same HTTPS authority. A closed askpass command,
+helper. Every repository or worktree `http.*` setting is rejected so transport,
+proxy, redirect, TLS, header, cookie, and client-certificate behavior cannot be
+changed below the reviewed endpoint. Credential lookup retains Git's standard
+authority-level matching so existing host-scoped credentials remain usable. A
+closed askpass command,
 `GIT_TERMINAL_PROMPT=0`, and `GCM_INTERACTIVE=never` remain in force. Before
-helper activation, any
-repository or worktree `http.*.sslVerify`, `http.*.sslCAInfo`, or
-`http.*.sslCAPath` override blocks, including URL-qualified forms; ambient
-`SSL_CERT_FILE`, `SSL_CERT_DIR`, and `GIT_SSL_*` variables are also removed.
-This prevents a narrower Git configuration or process environment from
-weakening TLS beneath the authenticated endpoint. Repository and worktree HTTP
-headers, cookie files, empty-auth or delegation settings, and client-certificate
-settings also block as unsupported credential sources; their values are never
-read into diagnostics.
+helper activation, ambient `SSL_CERT_FILE`, `SSL_CERT_DIR`, and `GIT_SSL_*`
+variables are also removed. This prevents a narrower Git configuration or
+process environment from weakening TLS beneath the authenticated endpoint.
+Rejected setting values are never read into diagnostics.
 
 Credential bytes travel only between Git and the system helper through Git's
 credential protocol: they are never read by the planner or executor and never

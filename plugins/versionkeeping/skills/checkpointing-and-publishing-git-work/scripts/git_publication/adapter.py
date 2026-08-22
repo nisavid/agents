@@ -121,8 +121,11 @@ WINDOWS_NON_ALLOW_ACE_TYPES = frozenset(
 )
 WINDOWS_INHERIT_ONLY_ACE = 0x08
 WINDOWS_WRITE_DATA = 0x00000002
-WINDOWS_REPLACEMENT_MASK = 0x000D0040
-WINDOWS_MUTATION_MASK = 0x000D0156
+WINDOWS_GENERIC_ALL = 0x10000000
+WINDOWS_GENERIC_WRITE = 0x40000000
+WINDOWS_GENERIC_MUTATION_MASK = WINDOWS_GENERIC_ALL | WINDOWS_GENERIC_WRITE
+WINDOWS_REPLACEMENT_MASK = 0x000D0040 | WINDOWS_GENERIC_MUTATION_MASK
+WINDOWS_MUTATION_MASK = 0x000D0156 | WINDOWS_GENERIC_MUTATION_MASK
 TRUSTED_HELPER_PATH_RE = re.compile(r"^/[A-Za-z0-9_./+:-]+$")
 TRUSTED_WINDOWS_BUNDLE_PATH_RE = re.compile(
     r"^(?:[A-Za-z]:[\\/]|/)[A-Za-z0-9_./\\+(): -]*$"
@@ -789,18 +792,8 @@ def _unsafe_https_git_config_class(key: str) -> str | None:
     normalized = key.lower()
     if re.fullmatch(r"credential(?:\..+)?\..+", normalized):
         return "credential.*"
-    if re.fullmatch(
-        r"http(?:\..+)?\.ssl(?:verify|cainfo|capath)",
-        normalized,
-    ):
-        return "http.*.ssl*"
-    if re.fullmatch(
-        r"http(?:\..+)?\."
-        r"(?:extraheader|cookiefile|emptyauth|delegation|"
-        r"sslcert|sslkey|sslcertpasswordprotected)",
-        normalized,
-    ):
-        return "http.*.credentialSource"
+    if normalized.startswith("http."):
+        return "http.*"
     return None
 
 
@@ -1140,7 +1133,6 @@ class GitRepository:
                 "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
                 provider="platform-credential-provider",
             )
-        self._append_command_config("credential.useHttpPath", "true")
         self._append_command_config("credential.helper", helper_config)
         self._https_credentials_enabled = True
 

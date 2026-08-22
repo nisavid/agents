@@ -114,18 +114,26 @@ class RequestTests(unittest.TestCase):
 
     def test_https_credential_configuration_classes_are_closed(self):
         cases = {
-            "http.sslVerify": "http.*.ssl*",
-            "http.https://example.com.sslCAInfo": "http.*.ssl*",
-            "http.https://example.com.sslCAPath": "http.*.ssl*",
-            "http.https://example.com.sslVerify": "http.*.ssl*",
-            "http.extraHeader": "http.*.credentialSource",
-            "http.https://example.com.extraHeader": "http.*.credentialSource",
-            "http.cookieFile": "http.*.credentialSource",
-            "http.emptyAuth": "http.*.credentialSource",
-            "http.delegation": "http.*.credentialSource",
-            "http.sslCert": "http.*.credentialSource",
-            "http.sslKey": "http.*.credentialSource",
-            "http.sslCertPasswordProtected": "http.*.credentialSource",
+            "http.sslVerify": "http.*",
+            "http.https://example.com.sslCAInfo": "http.*",
+            "http.https://example.com.sslCAPath": "http.*",
+            "http.https://example.com.sslVerify": "http.*",
+            "http.extraHeader": "http.*",
+            "http.https://example.com.extraHeader": "http.*",
+            "http.cookieFile": "http.*",
+            "http.emptyAuth": "http.*",
+            "http.delegation": "http.*",
+            "http.sslCert": "http.*",
+            "http.sslKey": "http.*",
+            "http.sslCertPasswordProtected": "http.*",
+            "http.sslVersion": "http.*",
+            "http.sslCipherList": "http.*",
+            "http.sslBackend": "http.*",
+            "http.proxySSLCAInfo": "http.*",
+            "http.proxySSLCert": "http.*",
+            "http.proxySSLKey": "http.*",
+            "http.followRedirects": "http.*",
+            "http.proxy": "http.*",
         }
         for key, config_class in cases.items():
             with self.subTest(key=key):
@@ -134,6 +142,13 @@ class RequestTests(unittest.TestCase):
                     config_class,
                 )
                 self.assertIsNone(adapter._unsafe_git_config_class(key))
+
+        for key in ("credential.username", "credential.example.com.username"):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    adapter._unsafe_https_git_config_class(key),
+                    "credential.*",
+                )
 
     def test_transport_protocol_allowlist_preserves_https_and_ssh(self):
         for endpoint in (

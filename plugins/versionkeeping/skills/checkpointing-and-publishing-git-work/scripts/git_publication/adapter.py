@@ -1140,6 +1140,7 @@ class GitRepository:
                 "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
                 provider="platform-credential-provider",
             )
+        self._append_command_config("credential.useHttpPath", "true")
         self._append_command_config("credential.helper", helper_config)
         self._https_credentials_enabled = True
 

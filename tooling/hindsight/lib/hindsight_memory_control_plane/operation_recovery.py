@@ -2513,7 +2513,10 @@ def _checkpoint_continuation_audit(value: Any) -> dict[str, Any]:
         or not body["idempotent_resume"]
         or body["document_count"]
         != body["checkpoint"]["committed_document_count"]
-        or body["unit_count"] != body["checkpoint"]["unit_ids_count"]
+        # The checkpoint count is per attempt.  A retry can reuse a document
+        # id that already owns facts from an earlier successful attempt, so
+        # the durable count is a lower bound, not an equality requirement.
+        or body["unit_count"] < body["checkpoint"]["unit_ids_count"]
     ):
         raise OperationRecoveryError(
             "checkpoint continuation side-effect audit is invalid"

@@ -566,6 +566,63 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 adapter._verify_checkpoint_continuation_state(Connection())
             )
 
+    def test_schema_fourteen_checkpoint_helper_accepts_reused_document_units(
+        self,
+    ):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        snapshot = fixtures.drain_snapshot()
+        handoff = fixtures._checkpoint_continuation_handoff(
+            snapshot=snapshot,
+            unit_count=42,
+        )
+        continued = handoff["operations"][0]
+
+        class Connection:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch(self, _query, _identifiers):
+                self.calls += 1
+                if self.calls == 1:
+                    return [
+                        {
+                            "operation_id": continued["operation_id"],
+                            "operation_type": "retain",
+                            "status": "pending",
+                            "retry_count": continued["retry_count"],
+                            "task_payload_digest": continued[
+                                "task_payload_digest"
+                            ],
+                            "result_metadata_digest": continued[
+                                "result_metadata_digest"
+                            ],
+                            "checkpoint_facts_committed": True,
+                            "checkpoint_committed_document_count": 1,
+                            "checkpoint_unit_ids_count": 21,
+                            "checkpoint_stage": "storing",
+                            "checkpoint_processed": 3,
+                            "checkpoint_total": 10,
+                        }
+                    ]
+                return [
+                    {
+                        "operation_id": continued["operation_id"],
+                        "metadata_document_count": 1,
+                        "document_count": 1,
+                        "unit_count": 42,
+                    }
+                ]
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {
+            "schema_version": 14,
+            "checkpoint_continuation_handoff": handoff,
+        }
+        adapter._selected = {continued["operation_id"]: continued}
+        adapter._identifiers = [uuid.UUID(continued["operation_id"])]
+
+        asyncio.run(adapter._verify_checkpoint_continuation_state(Connection()))
+
     def test_legacy_v1_unresumed_adapter_still_rejects_expired_approval(self):
         fixture = json.loads(
             (

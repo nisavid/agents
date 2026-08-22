@@ -6086,7 +6086,12 @@ class ExactDrainClaimAdapter:
                 != checkpoint["committed_document_count"]
                 or observed["document_count"]
                 != checkpoint["committed_document_count"]
-                or observed["unit_count"] != checkpoint["unit_ids_count"]
+                # ``unit_ids_count`` is recorded for this attempt.  Retries
+                # may reuse a document id whose durable row contains facts
+                # from an earlier successful attempt, so require at least the
+                # checkpointed count while retaining the exact document
+                # cardinality check above.
+                or observed["unit_count"] < checkpoint["unit_ids_count"]
                 or audit["document_count"] != observed["document_count"]
                 or audit["unit_count"] != observed["unit_count"]
             ):

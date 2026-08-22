@@ -7533,6 +7533,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         snapshot=None,
         attempts_consumed=1,
         attempts_remaining=19,
+        unit_count=21,
         created_at=1_785_402_000,
     ):
         snapshot = self.drain_snapshot() if snapshot is None else snapshot
@@ -7580,7 +7581,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             "result_metadata_digest": row["result_metadata_digest"],
             "checkpoint": checkpoint,
             "document_count": 1,
-            "unit_count": 21,
+            "unit_count": unit_count,
             "document_set_digest": "a" * 64,
             "unit_set_digest": "b" * 64,
             "idempotent_resume": True,
@@ -7639,6 +7640,28 @@ class OperationRecoveryContractTest(unittest.TestCase):
             ),
             handoff,
         )
+
+    def test_checkpoint_continuation_accepts_prior_units_for_reused_document(self):
+        snapshot = self.drain_snapshot()
+        handoff = self._checkpoint_continuation_handoff(
+            snapshot=snapshot,
+            unit_count=42,
+        )
+
+        self.assertEqual(
+            verify_checkpoint_continuation_handoff(
+                handoff,
+                live_snapshot=snapshot,
+                now=1_785_402_000,
+            ),
+            handoff,
+        )
+
+        with self.assertRaisesRegex(OperationRecoveryError, "side-effect audit"):
+            self._checkpoint_continuation_handoff(
+                snapshot=snapshot,
+                unit_count=20,
+            )
 
     def test_checkpoint_continuation_rejects_uncommitted_or_tampered_audit(self):
         snapshot = self.drain_snapshot()

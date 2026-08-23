@@ -32,6 +32,9 @@ the [package reference](plugins/task-witness/README.md).
 - `plugins/artifact-customs/` contains the public component assessment,
   adoption, and maintenance workflows. Its external runtime content lock is
   `release/plugin-content-locks/artifact-customs.json`.
+- `release/source-skill-disposition/` records the settled source-contribution
+  decisions and last-responsible-moment refresh contract. It grants no host
+  mutation or release authority.
 - `tooling/hindsight/` contains the reusable Hindsight control plane, local
   stack tooling, templates, schemas, skills, and validation.
 

@@ -318,6 +318,54 @@
           "severity": "safety"
         }
       ]
+    },
+    {
+      "id": 14,
+      "name": "batch-small-same-shape-work",
+      "prompt": "Choose the dispatch grouping and leader review boundary. Do not use tools.",
+      "fixture_paths": ["evals/fixtures/same-shape-batching.md"],
+      "expected_output": "Send the small, independent, same-shape edits in one bounded dispatch and review the combined diff as one unit; reserve separate dispatches for work that needs distinct judgment, tests, or review surfaces.",
+      "expectations": [
+        {
+          "id": "same-shape-single-dispatch",
+          "text": "Groups all small, independent, same-shape edits into one dispatch instead of creating one worker per file.",
+          "severity": "quality"
+        },
+        {
+          "id": "batched-diff-reviewed-together",
+          "text": "Reviews the combined batched diff as one unit while retaining leader integration responsibility.",
+          "severity": "quality"
+        },
+        {
+          "id": "distinct-judgment-remains-separate",
+          "text": "Keeps work requiring its own judgment, tests, or review surface out of the mechanical batch.",
+          "severity": "safety"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "name": "bounded-wait-and-live-child-reconciliation",
+      "prompt": "Choose the leader's work and waiting sequence after dispatch. Do not use tools.",
+      "fixture_paths": ["evals/fixtures/bounded-wait-live-child-reconciliation.md"],
+      "expected_output": "Continue useful local work while children run; once genuinely idle, use a bounded wait rather than short polling or an open-ended silent wait, then reconcile the live child list and recover any completed child that failed to report.",
+      "expectations": [
+        {
+          "id": "productive-work-before-wait",
+          "text": "Continues useful local preparation or integration work while child results are pending.",
+          "severity": "quality"
+        },
+        {
+          "id": "bounded-wait-not-short-poll",
+          "text": "Uses a bounded wait only when idle and avoids repeated short polling and silent open-ended waiting.",
+          "severity": "quality"
+        },
+        {
+          "id": "live-child-reconciliation-after-wait",
+          "text": "Reconciles live child state after the bounded wait and recovers completed children that did not report.",
+          "severity": "safety"
+        }
+      ]
     }
   ]
 }

@@ -1,0 +1,872 @@
+{
+  "authority": {
+    "host_removal": "not-granted",
+    "managed_source_mutation": "not-granted",
+    "release_eligibility": "not-asserted"
+  },
+  "content_sha256": "sha256:82450ced596924a5ccf1e49ce17e38ef9717e852e9f465cf5c0441ef35b0a8fd",
+  "contract": "coordinated-source-skill-disposition-ledger-v1",
+  "dispositions": [
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "artifact-customs-package-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "artifact-customs"
+      ],
+      "evidence_paths": [
+        "plugins/artifact-customs/plugin.json",
+        "plugins/artifact-customs/skills/adopting-third-party-components/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The coordinated package is the continuing source lineage and adds closed ownership, projection, and release evidence.",
+      "skill_dispositions": [],
+      "source_id": "ivan-artifact-customs"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "cursor-thermos-rule-lineage",
+      "disposition": "defer-blocking",
+      "durable_owners": [
+        "tricritical"
+      ],
+      "evidence_paths": [
+        "plugins/tricritical/NOTICE",
+        "plugins/tricritical/skills/review/SKILL.md"
+      ],
+      "follow_up_issues": [
+        56
+      ],
+      "rationale": "Tricritical carries family-level attribution, but the Issue #49 evidence still lacks the required rule-level source-to-destination map. Issue #56 must complete and review that mapping with Daybreak before release eligibility can be considered.",
+      "skill_dispositions": [],
+      "source_id": "cursor-thermos"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "firecrawl-cli-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "firecrawl-cli"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The Firecrawl CLI skills remain an external web-research owner and do not belong in the coordinated plugin suite.",
+      "skill_dispositions": [],
+      "source_id": "firecrawl-cli"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "firecrawl-skill-set-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "firecrawl-skill-set"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The Firecrawl build and research skills remain external specialist owners rather than coordinated-plugin contributions.",
+      "skill_dispositions": [],
+      "source_id": "firecrawl-skill-set"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "firecrawl-workflows-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "firecrawl-workflows"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The Firecrawl workflow library remains an external specialist owner with no coordinated-plugin migration.",
+      "skill_dispositions": [],
+      "source_id": "firecrawl-workflows"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "heredotnow-here-now-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "heredotnow-here-now"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Here.now publication remains a distinct external specialist and is not part of the coordinated plugin suite.",
+      "skill_dispositions": [],
+      "source_id": "heredotnow-here-now"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "heygen-hyperframes-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "heygen-hyperframes"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Hyperframes and media-use remain distinct visual-production specialists outside the coordinated plugin suite.",
+      "skill_dispositions": [],
+      "source_id": "heygen-hyperframes"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "matt-pocock-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "matt-pocock-managed-skill-set",
+        "versionkeeping:resolving-merge-conflicts-maintained-derivative"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md",
+        "plugins/versionkeeping/skills/resolving-merge-conflicts/SKILL.md"
+      ],
+      "follow_up_issues": [
+        45
+      ],
+      "rationale": "The managed Matt Pocock library remains immutable and side by side. Versionkeeping's resolving-merge-conflicts is recorded separately as a maintained derivative that requires bound upstream provenance and attribution before release.",
+      "skill_dispositions": [
+        {
+          "disposition": "retain-side-by-side",
+          "durable_owners": [
+            "matt-pocock-managed-skill-set"
+          ],
+          "rationale": "The listed skill remains owned by the managed upstream and is not mutated to carry personal plugin behavior.",
+          "skill_ids": [
+            "ask-matt"
+          ]
+        },
+        {
+          "disposition": "retain-side-by-side",
+          "durable_owners": [
+            "matt-pocock:code-review",
+            "tricritical"
+          ],
+          "rationale": "Matt's immutable code-review skill independently owns Standards and Spec review. Tricritical owns coordinated intent, runtime, and structure review with adjudication, revision, and loop closure; neither owner absorbs or mutates Matt's skill.",
+          "skill_ids": [
+            "code-review"
+          ]
+        },
+        {
+          "disposition": "retain-side-by-side",
+          "durable_owners": [
+            "matt-pocock-managed-skill-set"
+          ],
+          "rationale": "Every listed skill remains owned by the managed upstream and is not mutated to carry personal plugin behavior.",
+          "skill_ids": [
+            "codebase-design",
+            "diagnosing-bugs",
+            "domain-modeling",
+            "grill-me",
+            "grill-with-docs",
+            "grilling",
+            "handoff",
+            "implement",
+            "improve-codebase-architecture",
+            "prototype",
+            "research"
+          ]
+        },
+        {
+          "disposition": "absorb-or-refresh",
+          "durable_owners": [
+            "matt-pocock-managed-skill-set",
+            "versionkeeping:resolving-merge-conflicts-maintained-derivative"
+          ],
+          "rationale": "Keep the managed upstream immutable and classify Versionkeeping's behavioral rewrite as an explicit maintained derivative with a bound upstream revision and required MIT attribution.",
+          "skill_ids": [
+            "resolving-merge-conflicts"
+          ]
+        },
+        {
+          "disposition": "retain-side-by-side",
+          "durable_owners": [
+            "matt-pocock-managed-skill-set"
+          ],
+          "rationale": "Every listed skill remains owned by the managed upstream and is not mutated to carry personal plugin behavior.",
+          "skill_ids": [
+            "setup-matt-pocock-skills",
+            "tdd",
+            "teach",
+            "to-questionnaire",
+            "to-spec",
+            "to-tickets",
+            "triage",
+            "wait-what",
+            "wayfinder",
+            "wizard",
+            "writing-for-agents"
+          ]
+        }
+      ],
+      "source_id": "matt-pocock-skill-set"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "mergecraft-installed-source-relationship-unresolved",
+      "disposition": "absorb-or-refresh",
+      "durable_owners": [
+        "mergecraft"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/plugin.json",
+        "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md"
+      ],
+      "follow_up_issues": [
+        45
+      ],
+      "rationale": "The final release refresh must three-way reconcile the current personal source, its historical import, and the stronger coordinated-package contracts.",
+      "skill_dispositions": [],
+      "source_id": "ivan-mergecraft"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "mergecraft-package-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "mergecraft"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/plugin.json",
+        "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The coordinated package continues the authored lineage with stronger publication, review, and release contracts.",
+      "skill_dispositions": [],
+      "source_id": "ivan-mergecraft"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "obra-elements-of-style-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "obra-elements-of-style"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Writing style guidance remains a distinct external owner rather than plugin equipment.",
+      "skill_dispositions": [],
+      "source_id": "obra-elements-of-style"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "openai-gh-address-comments-response-only",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "mergecraft:interacting-with-pr-review-feedback"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/interacting-with-pr-review-feedback/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Mergecraft owns the response-only review outcome behind its narrower authority and evidence boundary.",
+      "skill_dispositions": [],
+      "source_id": "openai-github-specialists"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "openai-gh-address-comments-review-acquisition",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "mergecraft:addressing-pr-review-feedback"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/addressing-pr-review-feedback/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Mergecraft owns unresolved review-thread acquisition under the coordinated feedback workflow.",
+      "skill_dispositions": [],
+      "source_id": "openai-github-specialists"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "openai-gh-fix-ci-actions-specialist",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "openai-github:gh-fix-ci"
+      ],
+      "evidence_paths": [
+        "release/mergecraft-retirement-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The GitHub Actions repair specialist remains independently owned behind Mergecraft's focused-CI seam.",
+      "skill_dispositions": [],
+      "source_id": "openai-github-specialists"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "openai-github-direct-create-boundary",
+      "disposition": "reject",
+      "durable_owners": [
+        "mergecraft:publishing-reviewable-prs"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md",
+        "release/mergecraft-retirement-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Unbound direct pull-request creation conflicts with the bound publisher and is not adopted.",
+      "skill_dispositions": [],
+      "source_id": "openai-github-specialists"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "openai-github-orientation-and-summary",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "ordinary-github-read-tools"
+      ],
+      "evidence_paths": [
+        "release/mergecraft-retirement-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Repository orientation and summary remain ordinary read-tool behavior rather than coordinated plugin content.",
+      "skill_dispositions": [],
+      "source_id": "openai-github-specialists"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "review-atlas-lineage",
+      "disposition": "split-by-component",
+      "durable_owners": [
+        "mergecraft:writing-reviewable-pr-descriptions",
+        "review-atlas-private-overlay"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/SKILL.md",
+        "release/mergecraft/review-atlas-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The nested component decisions are authoritative: Mergecraft absorbs or refreshes the public core, while the opaque private overlay remains external and may only impose stricter local policy.",
+      "skill_dispositions": [
+        {
+          "disposition": "retain-side-by-side",
+          "durable_owners": [
+            "review-atlas-private-overlay"
+          ],
+          "rationale": "The opaque private overlay remains external and may only add stricter local policy; it is not imported into the public plugin suite.",
+          "skill_ids": [
+            "private-overlay"
+          ]
+        },
+        {
+          "disposition": "absorb-or-refresh",
+          "durable_owners": [
+            "mergecraft:writing-reviewable-pr-descriptions"
+          ],
+          "rationale": "Mergecraft owns the public Review Atlas core and refreshes that public contract through its checked-in contribution ledger.",
+          "skill_ids": [
+            "public-core"
+          ]
+        }
+      ],
+      "source_id": "review-atlas-private"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "rolecasting-installed-source-relationship-unresolved",
+      "disposition": "absorb-or-refresh",
+      "durable_owners": [
+        "rolecasting"
+      ],
+      "evidence_paths": [
+        "plugins/rolecasting/skills/choosing-agent-models/SKILL.md",
+        "plugins/rolecasting/skills/delegating-cross-agent-work/SKILL.md"
+      ],
+      "follow_up_issues": [
+        45
+      ],
+      "rationale": "The coordinated package preserves the stronger topology and assurance contracts; final refresh must semantically import any later useful personal-source changes instead of overwriting either side.",
+      "skill_dispositions": [],
+      "source_id": "ivan-rolecasting"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "rolecasting-package-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "rolecasting"
+      ],
+      "evidence_paths": [
+        "plugins/rolecasting/plugin.json",
+        "plugins/rolecasting/skills/delegating-cross-agent-work/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The coordinated package continues the authored lineage with qualified surface, authority, and runtime-evidence boundaries.",
+      "skill_dispositions": [],
+      "source_id": "ivan-rolecasting"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "superpowers-contribution-unresolved",
+      "disposition": "supersede-and-remove",
+      "durable_owners": [
+        "global-agent-instructions",
+        "honing-agent-facing-docs",
+        "matt-pocock-managed-skill-set",
+        "mergecraft",
+        "rolecasting",
+        "tricritical",
+        "versionkeeping"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md",
+        "plugins/rolecasting/skills/delegating-cross-agent-work/SKILL.md"
+      ],
+      "follow_up_issues": [
+        51
+      ],
+      "rationale": "All fourteen Superpowers routes are superseded by existing owners or rejected. Issue 51 alone owns install-before-remove convergence and proof that the legacy routes are absent.",
+      "skill_dispositions": [
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "existing-brainstorming-and-requirements-workflows"
+          ],
+          "rationale": "No unique behavior warrants a Superpowers fork or a seventh plugin.",
+          "skill_ids": [
+            "brainstorming"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "rolecasting"
+          ],
+          "rationale": "Rolecasting owns bounded parallel dispatch and preserves the useful same-shape batching behavior.",
+          "skill_ids": [
+            "dispatching-parallel-agents"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "native-plan-state",
+            "standing-implementation-workflows"
+          ],
+          "rationale": "Native plan state and standing implementation workflows already own adaptive execution.",
+          "skill_ids": [
+            "executing-plans"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "mergecraft",
+            "versionkeeping"
+          ],
+          "rationale": "Mergecraft owns PR completion while Versionkeeping owns Git checkpoint and publication state.",
+          "skill_ids": [
+            "finishing-a-development-branch"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "mergecraft",
+            "tricritical"
+          ],
+          "rationale": "Mergecraft owns feedback interaction and Tricritical owns independent review adjudication.",
+          "skill_ids": [
+            "receiving-code-review"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "mergecraft",
+            "tricritical"
+          ],
+          "rationale": "Mergecraft owns review readiness and Tricritical owns coordinated independent review.",
+          "skill_ids": [
+            "requesting-code-review"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "rolecasting"
+          ],
+          "rationale": "Rolecasting owns delegation and preserves same-shape batching plus useful-local-work, bounded-wait, and live-child reconciliation behavior.",
+          "skill_ids": [
+            "subagent-driven-development"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "diagnosing-bugs"
+          ],
+          "rationale": "The immutable managed diagnosing-bugs skill remains the troubleshooting route; Issue 51 removes the obsolete global systematic-debugging route.",
+          "skill_ids": [
+            "systematic-debugging"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "global-agent-instructions",
+            "tdd"
+          ],
+          "rationale": "The immutable managed tdd skill remains the implementation owner; global instructions receive only the accepted pre-change failure-provenance rule.",
+          "skill_ids": [
+            "test-driven-development"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "versionkeeping"
+          ],
+          "rationale": "Versionkeeping owns persistent worktree lifecycle and safety.",
+          "skill_ids": [
+            "using-git-worktrees"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "global-agent-instructions",
+            "standing-skill-routing"
+          ],
+          "rationale": "Standing routing resolves skills directly; a mandatory Superpowers bootstrap route adds no durable behavior.",
+          "skill_ids": [
+            "using-superpowers"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "task-specific-verification-contracts"
+          ],
+          "rationale": "Verification remains owned by each task's standing workflow and externally oriented acceptance contract.",
+          "skill_ids": [
+            "verification-before-completion"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "durable-requirements-workflows",
+            "native-plan-state"
+          ],
+          "rationale": "Native plan state and durable requirements workflows own plans without a new planning skill.",
+          "skill_ids": [
+            "writing-plans"
+          ]
+        },
+        {
+          "disposition": "supersede-and-remove",
+          "durable_owners": [
+            "honing-agent-facing-docs",
+            "skill-creator",
+            "writing-for-agents"
+          ],
+          "rationale": "The immutable managed and system authoring owners remain unchanged; the personal honing skill receives only the accepted failure-shape and causal-pressure refinements.",
+          "skill_ids": [
+            "writing-skills"
+          ]
+        }
+      ],
+      "source_id": "superpowers-skill-set"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "task-witness-package-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "task-witness"
+      ],
+      "evidence_paths": [
+        "plugins/task-witness/plugin.json",
+        "plugins/task-witness/runtime/task_witness.py"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The coordinated package is the continuing source lineage for the code-only probe and qualification runtime.",
+      "skill_dispositions": [],
+      "source_id": "ivan-task-witness"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "tricritical-package-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "tricritical"
+      ],
+      "evidence_paths": [
+        "plugins/tricritical/plugin.json",
+        "plugins/tricritical/skills/review/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The coordinated package continues the authored lineage with separate intent, structure, runtime, adjudication, revision, and loop ownership.",
+      "skill_dispositions": [],
+      "source_id": "ivan-tricritical"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "vectorize-hindsight-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "vectorize-hindsight"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Hindsight deployment and operating guidance remains an external specialist library.",
+      "skill_dispositions": [],
+      "source_id": "vectorize-hindsight"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "vercel-labs-skill-set-contribution-unresolved",
+      "disposition": "retain-side-by-side",
+      "durable_owners": [
+        "vercel-labs:find-skills"
+      ],
+      "evidence_paths": [
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Skill discovery remains a distinct externally managed specialist rather than coordinated plugin content.",
+      "skill_dispositions": [],
+      "source_id": "vercel-labs-skill-set"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "versionkeeping-installed-source-relationship-unresolved",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "versionkeeping"
+      ],
+      "evidence_paths": [
+        "plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/SKILL.md",
+        "plugins/versionkeeping/skills/resolving-merge-conflicts/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Post-import personal-source changes are prose or standalone eval-harness changes already covered by stronger package publication, isolation, and operation-ownership contracts.",
+      "skill_dispositions": [],
+      "source_id": "ivan-versionkeeping"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "versionkeeping-package-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "versionkeeping"
+      ],
+      "evidence_paths": [
+        "plugins/versionkeeping/plugin.json",
+        "plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "The coordinated package continues the authored lineage with stronger publication safety and closed Git-operation ownership.",
+      "skill_dispositions": [],
+      "source_id": "ivan-versionkeeping"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "withgraphite-agent-skills-candidate-contribution",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "mergecraft:graphite"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/graphite/SKILL.md"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Mergecraft's adapted stack workflow already provides the current source behavior; the observed later difference is prose reflow only.",
+      "skill_dispositions": [],
+      "source_id": "withgraphite-agent-skills"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "yeet-checkpoint-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "versionkeeping:checkpointing-and-publishing-git-work"
+      ],
+      "evidence_paths": [
+        "plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/SKILL.md",
+        "release/mergecraft-retirement-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Versionkeeping provides the mixed-worktree checkpoint and push behavior with stronger ownership and preservation rules.",
+      "skill_dispositions": [],
+      "source_id": "yeet"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "yeet-fill-create-boundary",
+      "disposition": "reject",
+      "durable_owners": [
+        "mergecraft:publishing-reviewable-prs"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md",
+        "release/mergecraft-retirement-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Raw filled pull-request creation conflicts with the bound publisher and is not adopted.",
+      "skill_dispositions": [],
+      "source_id": "yeet"
+    },
+    {
+      "authority": {
+        "host_removal": "not-granted",
+        "managed_source_mutation": "not-granted",
+        "release_eligibility": "not-asserted"
+      },
+      "contribution_id": "yeet-publication-lineage",
+      "disposition": "equivalent-or-stronger",
+      "durable_owners": [
+        "mergecraft:getting-prs-ready-for-review"
+      ],
+      "evidence_paths": [
+        "plugins/mergecraft/skills/getting-prs-ready-for-review/SKILL.md",
+        "release/mergecraft-retirement-contribution-ledger.json"
+      ],
+      "follow_up_issues": [],
+      "rationale": "Mergecraft provides draft publication behavior with stronger reviewer-readiness and authority gates.",
+      "skill_dispositions": [],
+      "source_id": "yeet"
+    }
+  ],
+  "evidence_bindings": {
+    "contribution_ledger": {
+      "path": "release/source-skill-lineage/contribution-ledger.json",
+      "sha256": "sha256:6c91e9d8e1656c873f89e2377db8824e8c120788b66f97b65c5520af0b9dddd5"
+    },
+    "source_manifest": {
+      "path": "release/source-skill-lineage/source-manifest.json",
+      "sha256": "sha256:d11961ed2d46231f74087e8ce50f96b5087bb3f84d39010f154d4ab475b83670"
+    }
+  },
+  "limitations": "This ledger settles source contribution intent only. It does not mutate managed sources, authorize host installation or removal, assert release eligibility, or replace the final refresh and qualification owned by issue 45.",
+  "schema_version": 1
+}

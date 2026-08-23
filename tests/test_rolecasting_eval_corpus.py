@@ -21,7 +21,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             for skill in SKILLS
         }
 
-    def test_rolecasting_has_exactly_twenty_detailed_scenarios(self) -> None:
+    def test_rolecasting_has_exactly_twenty_two_detailed_scenarios(self) -> None:
         observed = {
             item["name"]
             for document in self.documents.values()
@@ -50,8 +50,36 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "assurance-consumer-minima",
                 "chatgpt-codex-native-child-dispatch",
                 "codex-cli-tui-native-child-dispatch",
+                "batch-small-same-shape-work",
+                "bounded-wait-and-live-child-reconciliation",
             },
         )
+
+    def test_delegation_skill_batches_small_same_shape_work(self) -> None:
+        skill = (
+            PLUGIN_ROOT
+            / "skills"
+            / "delegating-cross-agent-work"
+            / "SKILL.md"
+        ).read_text()
+
+        self.assertRegex(skill, r"(?is)same[- ]shape.+one dispatch")
+        self.assertRegex(skill, r"(?is)review.+diff.+one unit")
+        self.assertRegex(skill, r"(?is)own judgment.+own tests.+review surface")
+
+    def test_delegation_skill_uses_bounded_waits_and_reconciles_live_children(
+        self,
+    ) -> None:
+        skill = (
+            PLUGIN_ROOT
+            / "skills"
+            / "delegating-cross-agent-work"
+            / "SKILL.md"
+        ).read_text()
+
+        self.assertRegex(skill, r"(?is)short (?:timeouts|polling).+bounded")
+        self.assertRegex(skill, r"(?is)local work.+wait")
+        self.assertRegex(skill, r"(?is)reconcile.+live children")
 
     def test_delegation_surface_topology_and_assurance_contract_is_explicit(
         self,
@@ -247,6 +275,10 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "native-host-observation-binding",
                 "no-model-text-as-host-evidence",
                 "native-child-truthful-assurance",
+                "same-shape-single-dispatch",
+                "distinct-judgment-remains-separate",
+                "bounded-wait-not-short-poll",
+                "live-child-reconciliation-after-wait",
             }.issubset(expectations)
         )
 

@@ -50,6 +50,12 @@ Ask workers to return one status:
 
 On `NEEDS_CONTEXT` or `BLOCKED`, change the input, authority, boundary, or capability before retrying.
 
+## Batch and Wait
+
+Batch small independent same-shape work into one dispatch; review its diff as one unit. Separate work needing its own judgment, own tests, or review surface.
+
+Do useful local work before waiting. Avoid short polling; use a bounded wait when idle. Then reconcile live children and recover missed terminal results.
+
 ## Leader Integration
 
 - Keep parallel edit scopes disjoint.

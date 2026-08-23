@@ -877,6 +877,94 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan.checkpoint_continuation_handoff,
             "/private/tmp/checkpoint-continuation.json",
         )
+        grant_plan = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "grant",
+                "plan",
+                *authority,
+                "--reference-plan",
+                "/private/tmp/reference.json",
+                "--grant-id",
+                "44444444-4444-4444-8444-444444444444",
+                "--maximum-recovery-epoch",
+                "3",
+                "--maximum-reconciliation-cycle",
+                "1",
+                "--maximum-plan-claims",
+                "3",
+                "--maximum-worker-attempts",
+                "6",
+                "--maximum-execution-seconds",
+                "3000",
+                "--maximum-concurrent-drains",
+                "1",
+                "--expires-at",
+                "1785634800",
+                "--output",
+                "/private/tmp/grant-plan.json",
+            ]
+        )
+        self.assertIs(
+            grant_plan.run,
+            self.controller[
+                "operation_recovery_drain_grant_plan_command"
+            ],
+        )
+        grant_approve = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "grant",
+                "approve",
+                *authority,
+                "--plan",
+                "/private/tmp/grant-plan.json",
+                "--approval-digest",
+                "a" * 64,
+            ]
+        )
+        self.assertIs(
+            grant_approve.run,
+            self.controller[
+                "operation_recovery_drain_grant_approve_command"
+            ],
+        )
+        grant_status = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "grant",
+                "status",
+                "--config",
+                "/private/tmp/config.json",
+            ]
+        )
+        self.assertIs(
+            grant_status.run,
+            self.controller[
+                "operation_recovery_drain_grant_status_command"
+            ],
+        )
+        grant_revoke = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "grant",
+                "revoke",
+                "--config",
+                "/private/tmp/config.json",
+                "--approval-digest",
+                "b" * 64,
+            ]
+        )
+        self.assertIs(
+            grant_revoke.run,
+            self.controller[
+                "operation_recovery_drain_grant_revoke_command"
+            ],
+        )
         with self.assertRaises(SystemExit):
             parser.parse_args(
                 [
@@ -945,6 +1033,23 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 ]
             )
             self.assertIs(parsed.run, self.controller[function])
+        grant_apply = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "apply",
+                *authority,
+                "--plan",
+                "/private/tmp/plan.json",
+                "--provider-policy",
+                "/private/tmp/providers.json",
+                "--provider-runtime-root",
+                "/private/tmp/provider-runtime",
+                "--worker-runtime",
+                "/private/tmp/hindsight-worker",
+            ]
+        )
+        self.assertIsNone(grant_apply.approval_digest)
 
     def test_exact_drain_plan_command_builds_schema14_from_checkpoint_handoff(
         self,
@@ -1095,6 +1200,55 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 captured["recovery_context"], handoff["continuation_context"]
             )
             self.assertIs(written[args.output][1]["create_only"], True)
+
+            state_root = root / "state"
+            ledger_path = (
+                state_root
+                / "operation-recovery"
+                / "exact-drain-grant-ledger.json"
+            )
+            ledger_path.parent.mkdir(parents=True, mode=0o700)
+            ledger_path.write_text("{}\n", encoding="utf-8")
+            ledger_path.chmod(0o600)
+            grant = {
+                "grant_id": "44444444-4444-4444-8444-444444444444",
+                "grant_digest": "4" * 64,
+                "scope": {"initial_reference_plan_digest": "5" * 64},
+            }
+            ledger = {
+                "grant": grant,
+                "grant_id": grant["grant_id"],
+                "grant_digest": grant["grant_digest"],
+                "ledger_digest": "6" * 64,
+                "use_records": [],
+            }
+            manager = SimpleNamespace(
+                config=SimpleNamespace(state_root=state_root)
+            )
+            grant_replacements = {
+                **replacements,
+                "_portable_manager": lambda _args: manager,
+                "_operation_recovery_exact_grant_ledger": (
+                    lambda _manager: ledger
+                ),
+            }
+            grant_originals = {
+                key: globals_[key] for key in grant_replacements
+            }
+            captured.clear()
+            written.clear()
+            grant_args = SimpleNamespace(**vars(args), config="config")
+            globals_.update(grant_replacements)
+            try:
+                command(grant_args)
+            finally:
+                globals_.update(grant_originals)
+            self.assertEqual(captured["schema_version"], 15)
+            self.assertIs(captured["authorization_grant"], grant)
+            self.assertEqual(
+                captured["grant_predecessor_plan_digest"],
+                grant["scope"]["initial_reference_plan_digest"],
+            )
 
     def test_post_abort_cli_exposes_plan_apply_status_verify_and_rollback(self):
         parser = self.controller["parser"]()
@@ -8002,6 +8156,385 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 authorization=authorization,
                 terminal_status=terminal_status,
             )
+
+    def test_schema_fifteen_artifacts_carry_the_standing_grant_chain(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = 1_785_462_000
+        _reference, grant, plan, _create_plan = fixtures.standing_grant_fixture()
+        ledger = self.controller["create_exact_drain_grant_ledger"](
+            grant,
+            ledger_nonce="1" * 64,
+            created_at=now,
+        )
+        _ledger, use = self.controller["claim_exact_drain_grant"](
+            ledger,
+            plan,
+            expected_ledger_digest=ledger["ledger_digest"],
+            claim_nonce="2" * 64,
+            ledger_nonce="3" * 64,
+            claimed_at=now,
+        )
+        authorization = self.controller[
+            "create_exact_drain_grant_authorization_receipt"
+        ](plan, use)
+        make_receipt = self.controller["_operation_recovery_exact_receipt"]
+        journal_body = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-application-journal",
+            "plan_digest": plan["plan_digest"],
+            "authorization_receipt_digest": authorization["receipt_digest"],
+            "grant_id": grant["grant_id"],
+            "grant_digest": grant["grant_digest"],
+            "started_at": authorization["authorized_at"],
+            "worker_pid": 12345,
+            "worker_start_time": "2026-08-23T18:00:00.000000Z",
+            "worker_attempt": 1,
+        }
+        journal = make_receipt(journal_body)
+        self.assertEqual(
+            self.controller["_operation_recovery_exact_journal"](
+                journal,
+                plan=plan,
+                authorization=authorization,
+            ),
+            journal,
+        )
+        terminal_status = {
+            "selected_status_counts": {
+                "completed": plan["selected_operation_count"]
+            },
+            "preserved_status_counts": plan["preserved_status_counts"],
+            "outside_nonterminal_counts": [],
+            "status_digest": "4" * 64,
+        }
+        application = make_receipt(
+            {
+                "schema_version": 2,
+                "kind": "operation-recovery-exact-drain-application-receipt",
+                "plan_digest": plan["plan_digest"],
+                "candidate_release": plan["candidate_release"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "application_journal_digest": journal["receipt_digest"],
+                "worker_runtime_digest": plan["worker_runtime_digest"],
+                "provider_policy_digest": plan["provider_policy_digest"],
+                "grant_id": grant["grant_id"],
+                "grant_digest": grant["grant_digest"],
+                "terminal_status_digest": terminal_status["status_digest"],
+                "terminal_progress_digest": "5" * 64,
+                "selected_status_counts": terminal_status[
+                    "selected_status_counts"
+                ],
+                "outside_nonterminal_counts": [],
+                "worker_pid": journal["worker_pid"],
+                "worker_start_time": journal["worker_start_time"],
+                "worker_attempt": journal["worker_attempt"],
+                "started_at": authorization["authorized_at"],
+                "completed_at": authorization["authorized_at"] + 1,
+            }
+        )
+        checked_application = self.controller[
+            "_operation_recovery_exact_application"
+        ](
+            application,
+            plan=plan,
+            authorization=authorization,
+            terminal_status=terminal_status,
+        )
+        expired_application = dict(application)
+        expired_application["completed_at"] = authorization["expires_at"]
+        expired_application["receipt_digest"] = self.controller["digest"](
+            {
+                key: value
+                for key, value in expired_application.items()
+                if key != "receipt_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            Exception,
+            "exact drain application receipt is invalid",
+        ):
+            self.controller["_operation_recovery_exact_application"](
+                expired_application,
+                plan=plan,
+                authorization=authorization,
+                terminal_status=terminal_status,
+            )
+        live = {
+            "selected_status_counts": terminal_status[
+                "selected_status_counts"
+            ],
+            "preserved_status_counts": plan["preserved_status_counts"],
+            "outside_nonterminal_counts": [],
+        }
+        verification = make_receipt(
+            {
+                "schema_version": 2,
+                "kind": "operation-recovery-exact-drain-verification-receipt",
+                "plan_digest": plan["plan_digest"],
+                "application_receipt_digest": application["receipt_digest"],
+                "grant_id": grant["grant_id"],
+                "grant_digest": grant["grant_digest"],
+                "terminal_status_digest": application[
+                    "terminal_status_digest"
+                ],
+                "terminal_progress_digest": application[
+                    "terminal_progress_digest"
+                ],
+                "selected_status_counts": live["selected_status_counts"],
+                "preserved_status_counts": live["preserved_status_counts"],
+                "outside_nonterminal_counts": [],
+                "successful": True,
+                "verified_at": application["completed_at"],
+            }
+        )
+        self.assertEqual(
+            self.controller["_operation_recovery_exact_verification"](
+                verification,
+                plan=plan,
+                application=checked_application,
+                live=live,
+            ),
+            verification,
+        )
+
+    def test_schema_fifteen_claim_recovers_after_ledger_receipt_crash(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-grant-crash-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            state_root = root / "state"
+            ledger_parent = state_root / "operation-recovery"
+            ledger_parent.mkdir(parents=True, mode=0o700)
+            now = int(time.time()) - 1
+            _reference, grant, plan, _create_plan = (
+                fixtures.standing_grant_fixture(
+                    created_at=now,
+                    artifact_root=str(root),
+                )
+            )
+            manager = SimpleNamespace(
+                config=SimpleNamespace(state_root=state_root)
+            )
+            ledger_path = self.controller[
+                "_operation_recovery_exact_grant_ledger_path"
+            ](manager)
+            ledger = self.controller["create_exact_drain_grant_ledger"](
+                grant,
+                ledger_nonce="1" * 64,
+                created_at=now,
+            )
+            real_write = self.controller["write_private"]
+            real_write(ledger_path, ledger, create_only=True)
+            claim = self.controller[
+                "_operation_recovery_claim_exact_grant"
+            ]
+            globals_ = claim.__globals__
+
+            def crash_before_receipt(path, value, *, create_only=False):
+                if Path(path) == Path(plan["authorization_receipt_path"]):
+                    raise OSError("synthetic receipt crash")
+                return real_write(path, value, create_only=create_only)
+
+            original_write = globals_["write_private"]
+            globals_["write_private"] = crash_before_receipt
+            try:
+                with self.assertRaisesRegex(OSError, "synthetic receipt crash"):
+                    claim(manager, plan)
+            finally:
+                globals_["write_private"] = original_write
+
+            claimed = self.controller["verify_exact_drain_grant_ledger"](
+                self.controller["_operation_recovery_read_private_json"](
+                    ledger_path,
+                    "exact drain authorization grant ledger",
+                )
+            )
+            self.assertEqual(claimed["revision"], 1)
+            self.assertFalse(Path(plan["authorization_receipt_path"]).exists())
+
+            authorization = claim(manager, plan)
+            recovered = self.controller["verify_exact_drain_grant_ledger"](
+                self.controller["_operation_recovery_read_private_json"](
+                    ledger_path,
+                    "exact drain authorization grant ledger",
+                )
+            )
+            self.assertEqual(recovered["revision"], 1)
+            self.assertEqual(
+                authorization["grant_use_record_digest"],
+                recovered["use_records"][0]["record_digest"],
+            )
+            revoked, _revocation = self.controller[
+                "revoke_exact_drain_grant"
+            ](
+                recovered,
+                approval_digest=grant["grant_digest"],
+                expected_ledger_digest=recovered["ledger_digest"],
+                revocation_nonce="4" * 64,
+                ledger_nonce="5" * 64,
+            )
+            real_write(ledger_path, revoked)
+            read_authorization = self.controller[
+                "_operation_recovery_exact_authorization"
+            ]
+            with self.assertRaisesRegex(Exception, "grant revoked"):
+                read_authorization(plan, manager=manager)
+            self.assertEqual(
+                read_authorization(
+                    plan,
+                    manager=manager,
+                    require_active_grant=False,
+                ),
+                authorization,
+            )
+
+    def test_schema_fifteen_replaces_only_the_exact_plan_prompt(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        legacy, _grant, granted, _create_plan = (
+            fixtures.standing_grant_fixture(created_at=now)
+        )
+        command = self.controller["operation_recovery_drain_apply_command"]
+        globals_ = command.__globals__
+        originals = {
+            "_operation_recovery_candidate": globals_[
+                "_operation_recovery_candidate"
+            ],
+            "_operation_recovery_read_private_json": globals_[
+                "_operation_recovery_read_private_json"
+            ],
+        }
+        selected = granted
+        globals_["_operation_recovery_candidate"] = (
+            lambda _args: selected["candidate_release"]
+        )
+        globals_["_operation_recovery_read_private_json"] = (
+            lambda _path, _label: selected
+        )
+        try:
+            with self.assertRaisesRegex(
+                Exception,
+                "schema-15 exact drain uses its standing grant",
+            ):
+                command(
+                    SimpleNamespace(
+                        plan="granted.json",
+                        approval_digest=granted["plan_digest"],
+                    )
+                )
+            selected = legacy
+            with self.assertRaisesRegex(
+                Exception,
+                "exact drain approval differs",
+            ):
+                command(
+                    SimpleNamespace(
+                        plan="legacy.json",
+                        approval_digest=None,
+                    )
+                )
+        finally:
+            globals_.update(originals)
+
+    def test_exact_drain_grant_commands_activate_status_and_revoke(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-grant-commands-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            now = int(time.time())
+            reference, _grant, _plan, _create_plan = (
+                fixtures.standing_grant_fixture(
+                    created_at=now,
+                    artifact_root=str(root),
+                )
+            )
+            reference_path = root / "reference.json"
+            grant_plan_path = root / "grant-plan.json"
+            real_write = self.controller["write_private"]
+            real_write(reference_path, reference, create_only=True)
+
+            class Manager:
+                config = SimpleNamespace(state_root=root / "state")
+
+                def _lock(self):
+                    return nullcontext()
+
+            manager = Manager()
+            candidate = reference["candidate_release"]
+            commands = [
+                self.controller["operation_recovery_drain_grant_plan_command"],
+                self.controller[
+                    "operation_recovery_drain_grant_approve_command"
+                ],
+                self.controller[
+                    "operation_recovery_drain_grant_status_command"
+                ],
+                self.controller[
+                    "operation_recovery_drain_grant_revoke_command"
+                ],
+            ]
+            globals_ = commands[0].__globals__
+            originals = {
+                "_operation_recovery_candidate": globals_[
+                    "_operation_recovery_candidate"
+                ],
+                "_portable_manager": globals_["_portable_manager"],
+                "_print_result": globals_["_print_result"],
+            }
+            globals_["_operation_recovery_candidate"] = lambda _args: candidate
+            globals_["_portable_manager"] = lambda _args: manager
+            globals_["_print_result"] = lambda value: value
+            try:
+                planned = commands[0](
+                    SimpleNamespace(
+                        reference_plan=str(reference_path),
+                        grant_id="77777777-7777-4777-8777-777777777777",
+                        maximum_recovery_epoch=3,
+                        maximum_reconciliation_cycle=1,
+                        maximum_plan_claims=2,
+                        maximum_worker_attempts=(
+                            (reference["worker_max_attempts"] + 1) * 2
+                        ),
+                        maximum_execution_seconds=(
+                            reference["execution_window"][
+                                "calculated_seconds"
+                            ]
+                            * 2
+                        ),
+                        maximum_concurrent_drains=1,
+                        expires_at=now + 3_600,
+                        output=str(grant_plan_path),
+                    )
+                )
+                approved = commands[1](
+                    SimpleNamespace(
+                        plan=str(grant_plan_path),
+                        approval_digest=planned["grant_plan_digest"],
+                    )
+                )
+                active = commands[2](SimpleNamespace())
+                revoked = commands[3](
+                    SimpleNamespace(
+                        approval_digest=approved["grant_digest"]
+                    )
+                )
+                terminal = commands[2](SimpleNamespace())
+            finally:
+                globals_.update(originals)
+
+            ledger_path = Path(approved["ledger"])
+            self.assertEqual(active["status"], "active")
+            self.assertEqual(revoked["status"], "revoked")
+            self.assertEqual(terminal["status"], "revoked")
+            self.assertEqual(stat.S_IMODE(ledger_path.stat().st_mode), 0o600)
 
     def test_exact_drain_status_and_verify_share_the_recovery_lock(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()

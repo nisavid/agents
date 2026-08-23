@@ -234,6 +234,17 @@ EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4 = {
 EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST = digest(
     EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4
 )
+EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V5 = {
+    **EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4,
+    "schema_version": 5,
+    "progress_schema_version": 6,
+    "standing_grant_projection": "grant-id-grant-digest",
+}
+EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V5_DIGEST = digest(
+    EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V5
+)
+
+
 def _exact_drain_provider_timeout_contract(
     *,
     hatchery_execution_timeout_seconds: int,
@@ -939,6 +950,16 @@ EXACT_DRAIN_PLAN_V14_KEYS = EXACT_DRAIN_PLAN_V13_KEYS | frozenset(
         "checkpoint_continuation_handoff_digest",
     }
 )
+EXACT_DRAIN_PLAN_V15_KEYS = EXACT_DRAIN_PLAN_V13_KEYS | frozenset(
+    {
+        "checkpoint_continuation_handoff",
+        "checkpoint_continuation_handoff_digest",
+        "authorization_grant",
+        "grant_id",
+        "grant_digest",
+        "grant_predecessor_plan_digest",
+    }
+)
 HATCHERY_CAPABILITY_RECEIPT_KEYS = frozenset(
     {
         "schema_version",
@@ -952,6 +973,140 @@ HATCHERY_CAPABILITY_RECEIPT_KEYS = frozenset(
         "receipt_digest",
     }
 )
+EXACT_DRAIN_GRANT_SCOPE_KEYS = frozenset(
+    {
+        "operation",
+        "initial_reference_plan_digest",
+        "installation_authority",
+        "installation_authority_digest",
+        "cohort_digest",
+        "operation_ids_digest",
+        "task_payloads_digest",
+        "initial_generation",
+        "minimum_recovery_epoch",
+        "maximum_recovery_epoch",
+        "minimum_reconciliation_cycle",
+        "maximum_reconciliation_cycle",
+        "candidate_release_digest",
+        "provider_policy_digest",
+        "effective_profile_digest",
+        "worker_runtime_digest",
+        "phase_repair_contract_digest",
+    }
+)
+EXACT_DRAIN_GRANT_BUDGET_KEYS = frozenset(
+    {
+        "maximum_plan_claims",
+        "maximum_worker_attempts",
+        "maximum_execution_seconds",
+        "maximum_concurrent_drains",
+    }
+)
+EXACT_DRAIN_GRANT_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "action",
+        "authority",
+        "mutation_authorized",
+        "grant_id",
+        "reference_plan",
+        "scope",
+        "budgets",
+        "revocable",
+        "created_at",
+        "expires_at",
+        "grant_plan_digest",
+    }
+)
+EXACT_DRAIN_GRANT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "authority",
+        "mutation_authorized",
+        "grant_id",
+        "grant_plan",
+        "grant_plan_digest",
+        "approval_digest",
+        "scope",
+        "budgets",
+        "approved_at",
+        "expires_at",
+        "revocable",
+        "grant_digest",
+    }
+)
+EXACT_DRAIN_GRANT_LEDGER_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "grant_id",
+        "grant_digest",
+        "grant",
+        "use_records",
+        "revocation",
+        "revision",
+        "ledger_nonce",
+        "prior_ledger_digest",
+        "created_at",
+        "updated_at",
+        "ledger_digest",
+    }
+)
+EXACT_DRAIN_GRANT_CLAIM_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "sequence",
+        "grant_id",
+        "grant_digest",
+        "plan",
+        "plan_digest",
+        "predecessor_plan_digest",
+        "pre_generation",
+        "recovery_epoch",
+        "reconciliation_cycle",
+        "worker_attempt_budget",
+        "execution_seconds",
+        "authorized_at",
+        "expires_at",
+        "nonce",
+        "prior_record_digest",
+        "record_digest",
+    }
+)
+EXACT_DRAIN_GRANT_CLOSE_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "sequence",
+        "grant_id",
+        "grant_digest",
+        "plan_digest",
+        "claim_record_digest",
+        "application_receipt_digest",
+        "closed_at",
+        "nonce",
+        "prior_record_digest",
+        "record_digest",
+    }
+)
+EXACT_DRAIN_GRANT_REVOCATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "sequence",
+        "grant_id",
+        "grant_digest",
+        "approval_digest",
+        "revoked_at",
+        "nonce",
+        "prior_record_digest",
+        "record_digest",
+    }
+)
+EXACT_DRAIN_GRANT_MAX_LIFETIME_SECONDS = 14 * 24 * 60 * 60
 POST_ABORT_PLAN_V1_KEYS = frozenset(
     {
         "schema_version",
@@ -1115,6 +1270,9 @@ POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
         "worker_attempt",
         "receipt_digest",
     }
+)
+POST_ABORT_REFERENCE_JOURNAL_V2_KEYS = POST_ABORT_REFERENCE_JOURNAL_KEYS.union(
+    {"grant_id", "grant_digest"}
 )
 QUEUE_BLOCKER_INPUT_KEYS = frozenset(
     {
@@ -2079,7 +2237,13 @@ def _assert_installation_authority_schema(
     *,
     plan_schema_version: int,
 ) -> None:
-    if "schema_version" in authority and plan_schema_version not in {11, 12, 13, 14}:
+    if "schema_version" in authority and plan_schema_version not in {
+        11,
+        12,
+        13,
+        14,
+        15,
+    }:
         raise OperationRecoveryError(
             "operation-recovery verified rebind authority requires "
             "schema 11"
@@ -3501,7 +3665,7 @@ def _exact_drain_execution_window(
     )
     attempt_timeout_seconds = (
         EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
-        if schema_version in {11, 12, 13, 14}
+        if schema_version in {11, 12, 13, 14, 15}
         else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
     )
     calculated_seconds = (
@@ -3516,7 +3680,7 @@ def _exact_drain_execution_window(
             "operation-recovery exact drain execution window exceeds maximum"
         )
     return {
-        "schema_version": 2 if schema_version in {11, 12, 13, 14} else 1,
+        "schema_version": 2 if schema_version in {11, 12, 13, 14, 15} else 1,
         "kind": "operation-recovery-exact-drain-execution-window",
         "anchor": "authorization-receipt-authorized-at",
         "renewable": False,
@@ -3532,7 +3696,7 @@ def _exact_drain_execution_window(
                     EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
                 )
             }
-            if schema_version in {11, 12, 13, 14}
+            if schema_version in {11, 12, 13, 14, 15}
             else {
                 "phase_one_timeout_seconds": (
                     EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
@@ -3832,7 +3996,11 @@ def _exact_drain_recovery_context(
     snapshot_rows = {
         item["operation_id"]: item for item in snapshot["operations"]
     }
-    if plan_schema_version == 14:
+    if plan_schema_version == 14 or (
+        plan_schema_version == 15
+        and isinstance(value, Mapping)
+        and "context_digest" in value
+    ):
         context = _checkpoint_continuation_context(value)
         if (
             context["generation"] != snapshot["generation_before"]
@@ -4192,7 +4360,7 @@ def exact_drain_execution_window_seconds(
             plan.get("execution_lease_seconds"),
             "exact drain legacy execution lease",
         )
-    if schema_version in {10, 11, 12, 13, 14}:
+    if schema_version in {10, 11, 12, 13, 14, 15}:
         return _verified_exact_drain_execution_window(
             plan.get("execution_window")
         )["calculated_seconds"]
@@ -4209,10 +4377,82 @@ def exact_drain_execution_deadline(
     window_seconds = exact_drain_execution_window_seconds(plan)
     if window_seconds is None:
         return None
-    return _integer(
+    anchored_deadline = _integer(
         authorization.get("authorized_at"),
         "exact drain authorization time",
     ) + window_seconds
+    if authorization.get("schema_version") == 2:
+        return min(
+            anchored_deadline,
+            _integer(
+                authorization.get("expires_at"),
+                "exact drain authorization expiry",
+            ),
+        )
+    return anchored_deadline
+
+
+def _exact_drain_assert_grant_scope(
+    plan: Mapping[str, Any],
+    grant: Mapping[str, Any],
+    *,
+    predecessor_plan_digest: str,
+) -> None:
+    scope = grant["scope"]
+    cohort_operations = sorted(
+        plan["cohort"]["operations"],
+        key=lambda item: item["operation_id"],
+    )
+    recovery_epoch, reconciliation_cycle = _exact_drain_recovery_position(plan)
+    if (
+        scope["operation"] != "exact-drain"
+        or scope["installation_authority"]
+        != plan["installation_authority"]
+        or scope["installation_authority_digest"]
+        != digest(plan["installation_authority"])
+        or scope["cohort_digest"] != plan["cohort_digest"]
+        or scope["operation_ids_digest"]
+        != digest([item["operation_id"] for item in cohort_operations])
+        or scope["task_payloads_digest"]
+        != digest(
+            [
+                {
+                    "operation_id": item["operation_id"],
+                    "operation_type": item["operation_type"],
+                    "task_payload_digest": item["task_payload_digest"],
+                }
+                for item in cohort_operations
+            ]
+        )
+        or not scope["minimum_recovery_epoch"]
+        <= recovery_epoch
+        <= scope["maximum_recovery_epoch"]
+        or not scope["minimum_reconciliation_cycle"]
+        <= reconciliation_cycle
+        <= scope["maximum_reconciliation_cycle"]
+        or scope["candidate_release_digest"]
+        != plan["candidate_release"]["release_digest"]
+        or scope["provider_policy_digest"]
+        != plan["provider_policy_digest"]
+        or scope["effective_profile_digest"]
+        != plan["effective_profile_digest"]
+        or scope["worker_runtime_digest"] != plan["worker_runtime_digest"]
+        or scope["phase_repair_contract_digest"]
+        != plan["phase_repair_contract_digest"]
+        or (
+            predecessor_plan_digest
+            == scope["initial_reference_plan_digest"]
+            and (
+                plan["pre_generation"] != scope["initial_generation"]
+                or recovery_epoch != scope["minimum_recovery_epoch"]
+                or reconciliation_cycle
+                != scope["minimum_reconciliation_cycle"]
+            )
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant scope differs"
+        )
 
 
 def create_exact_drain_plan(
@@ -4233,6 +4473,8 @@ def create_exact_drain_plan(
     hatchery_capability_receipt: Mapping[str, Any] | None = None,
     checkpoint_continuation_handoff: Mapping[str, Any] | None = None,
     candidate_runtime_snapshot_schema_version: int | None = None,
+    authorization_grant: Mapping[str, Any] | None = None,
+    grant_predecessor_plan_digest: str | None = None,
     created_at: int | None = None,
     schema_version: int = 12,
 ) -> Mapping[str, Any]:
@@ -4243,6 +4485,7 @@ def create_exact_drain_plan(
         12,
         13,
         14,
+        15,
     }:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan schema is invalid"
@@ -4368,7 +4611,10 @@ def create_exact_drain_plan(
         else _integer(created_at, "exact drain plan created-at")
     )
     checked_continuation_handoff = None
-    if schema_version == 14:
+    if schema_version == 14 or (
+        schema_version == 15
+        and checkpoint_continuation_handoff is not None
+    ):
         if checkpoint_continuation_handoff is None:
             raise OperationRecoveryError(
                 "operation-recovery checkpoint continuation handoff is required"
@@ -4419,7 +4665,7 @@ def create_exact_drain_plan(
         plan_schema_version=schema_version,
     )
     capability_fields = {}
-    if schema_version in {13, 14}:
+    if schema_version in {13, 14, 15}:
         if hatchery_capability_receipt is None:
             raise OperationRecoveryError(
                 "operation-recovery Hatchery capability receipt is required"
@@ -4444,6 +4690,30 @@ def create_exact_drain_plan(
                 "receipt_digest"
             ],
         }
+    if schema_version == 15:
+        if authorization_grant is None:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain authorization grant is required"
+            )
+        checked_grant = verify_exact_drain_authorization_grant(
+            authorization_grant,
+            now=planned_at,
+        )
+        predecessor_digest = _sha(
+            (
+                checked_grant["scope"]["initial_reference_plan_digest"]
+                if grant_predecessor_plan_digest is None
+                else grant_predecessor_plan_digest
+            ),
+            "exact drain grant predecessor plan digest",
+        )
+    elif authorization_grant is not None or grant_predecessor_plan_digest is not None:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization grant is unsupported"
+        )
+    else:
+        checked_grant = None
+        predecessor_digest = None
     body = {
         "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-plan",
@@ -4499,6 +4769,24 @@ def create_exact_drain_plan(
             if schema_version == 14
             else {}
         ),
+        **(
+            {
+                "checkpoint_continuation_handoff": (
+                    checked_continuation_handoff
+                ),
+                "checkpoint_continuation_handoff_digest": (
+                    None
+                    if checked_continuation_handoff is None
+                    else digest(checked_continuation_handoff)
+                ),
+                "authorization_grant": checked_grant,
+                "grant_id": checked_grant["grant_id"],
+                "grant_digest": checked_grant["grant_digest"],
+                "grant_predecessor_plan_digest": predecessor_digest,
+            }
+            if schema_version == 15
+            else {}
+        ),
         **capability_fields,
         "phase_one_statement_timeout_seconds": (
             EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
@@ -4519,7 +4807,7 @@ def create_exact_drain_plan(
                 "provider_timeout_contract": (
                     _normalized(
                         EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED
-                        if schema_version in {11, 12, 13, 14}
+                        if schema_version in {11, 12, 13, 14, 15}
                         else EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
                     )
                 ),
@@ -4529,7 +4817,7 @@ def create_exact_drain_plan(
                             "task-retry-after-quiescence"
                         )
                     }
-                    if schema_version in {12, 13, 14}
+                    if schema_version in {12, 13, 14, 15}
                     else {}
                 ),
             }
@@ -4541,6 +4829,7 @@ def create_exact_drain_plan(
                 schema_version == 12
                 and candidate_runtime_snapshot_schema_version == 8
             )
+            or schema_version == 15
             else (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
                 if schema_version == 12
@@ -4552,22 +4841,43 @@ def create_exact_drain_plan(
             )
         ),
         "progress_schema_version": (
-            5
-            if schema_version in {12, 13, 14}
-            else (4 if schema_version == 11 else 3)
+            6
+            if schema_version == 15
+            else (
+                5
+                if schema_version in {12, 13, 14}
+                else (4 if schema_version == 11 else 3)
+            )
         ),
         "failure_evidence_contract_digest": (
-            EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
-            if schema_version in {12, 13, 14}
+            EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V5_DIGEST
+            if schema_version == 15
             else (
-                EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
-                if schema_version == 11
-                else EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST
+                EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
+                if schema_version in {12, 13, 14}
+                else (
+                    EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
+                    if schema_version == 11
+                    else EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST
+                )
             )
         ),
         "created_at": planned_at,
-        "expires_at": planned_at + EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS,
+        "expires_at": min(
+            planned_at + EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS,
+            (
+                checked_grant["expires_at"]
+                if checked_grant is not None
+                else planned_at + EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
+            ),
+        ),
     }
+    if checked_grant is not None:
+        _exact_drain_assert_grant_scope(
+            body,
+            checked_grant,
+            predecessor_plan_digest=predecessor_digest,
+        )
     return {**body, "plan_digest": digest(body)}
 
 
@@ -4584,7 +4894,7 @@ def verify_exact_drain_plan(
         )
     schema_version = normalized.get("schema_version")
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
     }:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
@@ -4606,6 +4916,7 @@ def verify_exact_drain_plan(
             12: EXACT_DRAIN_PLAN_V12_KEYS,
             13: EXACT_DRAIN_PLAN_V13_KEYS,
             14: EXACT_DRAIN_PLAN_V14_KEYS,
+            15: EXACT_DRAIN_PLAN_V15_KEYS,
         }[schema_version],
         "operation-recovery exact drain plan",
     )
@@ -4670,7 +4981,9 @@ def verify_exact_drain_plan(
     )
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery exact drain plan expired")
-    if schema_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
+    if schema_version in {
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    }:
         evidence_observed_at = _integer(
             plan["evidence_observed_at"],
             "exact drain evidence observed-at",
@@ -4696,7 +5009,9 @@ def verify_exact_drain_plan(
         evidence_max_age_seconds = None
         transaction_timeout_seconds = None
         execution_lease_seconds = None
-    if schema_version in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
+    if schema_version in {
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    }:
         phase_one_statement_timeout_seconds = _integer(
             plan["phase_one_statement_timeout_seconds"],
             "exact drain phase-one statement timeout",
@@ -4713,7 +5028,7 @@ def verify_exact_drain_plan(
         phase_one_statement_timeout_seconds = None
         phase_one_timeout_seconds = None
         phase_repair_contract_digest = None
-    if schema_version in {6, 7, 8, 9, 10, 11, 12, 13, 14}:
+    if schema_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
         phase_one_client_timeout_seconds = _integer(
             plan["phase_one_client_timeout_seconds"],
             "exact drain phase-one client timeout",
@@ -4731,7 +5046,7 @@ def verify_exact_drain_plan(
         progress_schema_version = None
         failure_evidence_contract_digest = None
     release = _candidate_release(plan["candidate_release"])
-    if schema_version in {10, 11, 12, 13, 14}:
+    if schema_version in {10, 11, 12, 13, 14, 15}:
         execution_window = _verified_exact_drain_execution_window(
             plan["execution_window"]
         )
@@ -4752,7 +5067,10 @@ def verify_exact_drain_plan(
             plan["recovery_context_digest"],
             "exact drain recovery context digest",
         )
-        if schema_version == 14:
+        if schema_version == 14 or (
+            schema_version == 15
+            and plan["checkpoint_continuation_handoff"] is not None
+        ):
             checkpoint_continuation_handoff = (
                 verify_checkpoint_continuation_handoff(
                     plan["checkpoint_continuation_handoff"],
@@ -4765,6 +5083,13 @@ def verify_exact_drain_plan(
                 plan["checkpoint_continuation_handoff_digest"],
                 "checkpoint continuation handoff digest",
             )
+        elif schema_version == 15:
+            if plan["checkpoint_continuation_handoff_digest"] is not None:
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain plan is invalid"
+                )
+            checkpoint_continuation_handoff = None
+            checkpoint_continuation_handoff_digest = None
         else:
             checkpoint_continuation_handoff = None
             checkpoint_continuation_handoff_digest = None
@@ -4775,7 +5100,7 @@ def verify_exact_drain_plan(
         recovery_context_digest = None
         checkpoint_continuation_handoff = None
         checkpoint_continuation_handoff_digest = None
-    if schema_version in {11, 12, 13, 14}:
+    if schema_version in {11, 12, 13, 14, 15}:
         operation_attempt_timeout_seconds = _integer(
             plan["operation_attempt_timeout_seconds"],
             "exact drain operation-attempt timeout",
@@ -4797,7 +5122,7 @@ def verify_exact_drain_plan(
                 "exact drain operation-attempt timeout disposition",
                 maximum=128,
             )
-            if schema_version in {12, 13, 14}
+            if schema_version in {12, 13, 14, 15}
             else None
         )
     else:
@@ -4807,7 +5132,7 @@ def verify_exact_drain_plan(
         provider_timeout_contract = None
         operation_attempt_timeout_disposition = None
     capability_fields = {}
-    if schema_version in {13, 14}:
+    if schema_version in {13, 14, 15}:
         capability = verify_hatchery_capability_receipt(
             plan["hatchery_capability_receipt"]
         )
@@ -4819,6 +5144,32 @@ def verify_exact_drain_plan(
             "hatchery_capability_receipt": capability,
             "hatchery_capability_receipt_digest": capability_digest,
         }
+    if schema_version == 15:
+        authorization_grant = verify_exact_drain_authorization_grant(
+            plan["authorization_grant"],
+            now=created_at,
+            allow_expired=True,
+        )
+        grant_id = _exact_drain_grant_id(plan["grant_id"])
+        grant_digest = _sha(plan["grant_digest"], "exact drain grant digest")
+        grant_predecessor_plan_digest = _sha(
+            plan["grant_predecessor_plan_digest"],
+            "exact drain grant predecessor plan digest",
+        )
+        if (
+            grant_id != authorization_grant["grant_id"]
+            or grant_digest != authorization_grant["grant_digest"]
+            or created_at < authorization_grant["approved_at"]
+            or created_at >= authorization_grant["expires_at"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant binding is invalid"
+            )
+    else:
+        authorization_grant = None
+        grant_id = None
+        grant_digest = None
+        grant_predecessor_plan_digest = None
     backup = _backup(
         plan["rollback_backup"],
         "operation-recovery exact drain backup",
@@ -4866,9 +5217,15 @@ def verify_exact_drain_plan(
             )
         )
     )
+    if authorization_grant is not None:
+        _exact_drain_assert_grant_scope(
+            plan,
+            authorization_grant,
+            predecessor_plan_digest=grant_predecessor_plan_digest,
+        )
     if (
         schema_version
-        not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+        not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
         or plan.get("action") != "drain-exact-operation-cohort"
         or plan.get("authority") != "unapproved-plan"
@@ -4918,7 +5275,15 @@ def verify_exact_drain_plan(
         != (
             MAX_PLAN_LIFETIME_SECONDS
             if schema_version == 1
-            else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
+            else (
+                min(
+                    created_at + EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS,
+                    authorization_grant["expires_at"],
+                )
+                - created_at
+                if schema_version == 15
+                else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
+            )
         )
         or (
             schema_version in {
@@ -4935,6 +5300,7 @@ def verify_exact_drain_plan(
                 12,
                 13,
                 14,
+                15,
             }
             and (
                 evidence_observed_at != snapshot["observed_at"]
@@ -4953,14 +5319,20 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {10, 11, 12, 13, 14}
+            schema_version in {10, 11, 12, 13, 14, 15}
             and (
                 execution_window != expected_execution_window
                 or recovery_context_digest != digest(recovery_context)
             )
         )
         or (
-            schema_version == 14
+            (
+                schema_version == 14
+                or (
+                    schema_version == 15
+                    and checkpoint_continuation_handoff is not None
+                )
+            )
             and (
                 checkpoint_continuation_handoff_digest
                 != digest(checkpoint_continuation_handoff)
@@ -4979,7 +5351,7 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {11, 12, 13, 14}
+            schema_version in {11, 12, 13, 14, 15}
             and (
                 operation_attempt_timeout_seconds
                 != EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
@@ -4991,7 +5363,7 @@ def verify_exact_drain_plan(
                     EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED,
                 )
                 or (
-                    schema_version in {12, 13, 14}
+                    schema_version in {12, 13, 14, 15}
                     and operation_attempt_timeout_disposition
                     != "task-retry-after-quiescence"
                 )
@@ -5011,6 +5383,7 @@ def verify_exact_drain_plan(
                 12,
                 13,
                 14,
+                15,
             }
             and (
                 phase_one_statement_timeout_seconds
@@ -5037,6 +5410,7 @@ def verify_exact_drain_plan(
                             11: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
                             13: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
                             14: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
+                            15: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
                         }[schema_version],
                     )
                 )
@@ -5053,6 +5427,7 @@ def verify_exact_drain_plan(
                 12,
                 13,
                 14,
+                15,
             }
             and (
                 phase_one_client_timeout_seconds
@@ -5061,32 +5436,40 @@ def verify_exact_drain_plan(
                 <= phase_one_statement_timeout_seconds
                 or progress_schema_version
                 != (
-                    5
-                    if schema_version in {12, 13, 14}
+                    6
+                    if schema_version == 15
                     else (
-                        4
-                        if schema_version == 11
-                        else (3 if schema_version in {8, 9, 10} else 2)
+                        5
+                        if schema_version in {12, 13, 14}
+                        else (
+                            4
+                            if schema_version == 11
+                            else (3 if schema_version in {8, 9, 10} else 2)
+                        )
                     )
                 )
                 or failure_evidence_contract_digest
                 != (
-                    EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
-                    if schema_version in {12, 13, 14}
+                    EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V5_DIGEST
+                    if schema_version == 15
                     else (
-                        EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
-                        if schema_version == 11
+                        EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST
+                        if schema_version in {12, 13, 14}
                         else (
-                            EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST
-                            if schema_version in {8, 9, 10}
-                            else EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST
+                            EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST
+                            if schema_version == 11
+                            else (
+                                EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST
+                                if schema_version in {8, 9, 10}
+                                else EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST
+                            )
                         )
                     )
                 )
             )
         )
         or (
-            schema_version in {13, 14}
+            schema_version in {13, 14, 15}
             and (
                 capability_fields["hatchery_capability_receipt_digest"]
                 != capability_fields["hatchery_capability_receipt"][
@@ -5202,6 +5585,24 @@ def verify_exact_drain_plan(
                             if schema_version == 14
                             else {}
                         ),
+                        **(
+                            {
+                                "checkpoint_continuation_handoff": (
+                                    checkpoint_continuation_handoff
+                                ),
+                                "checkpoint_continuation_handoff_digest": (
+                                    checkpoint_continuation_handoff_digest
+                                ),
+                                "authorization_grant": authorization_grant,
+                                "grant_id": grant_id,
+                                "grant_digest": grant_digest,
+                                "grant_predecessor_plan_digest": (
+                                    grant_predecessor_plan_digest
+                                ),
+                            }
+                            if schema_version == 15
+                            else {}
+                        ),
                     }
                 ),
             }
@@ -5209,7 +5610,7 @@ def verify_exact_drain_plan(
         **(
             {}
             if schema_version
-            not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+            not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
             else {
                 "phase_one_statement_timeout_seconds": (
                     phase_one_statement_timeout_seconds
@@ -5223,7 +5624,7 @@ def verify_exact_drain_plan(
         **(
             {}
             if schema_version
-            not in {6, 7, 8, 9, 10, 11, 12, 13, 14}
+            not in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
             else {
                 "phase_one_client_timeout_seconds": (
                     phase_one_client_timeout_seconds
@@ -5236,7 +5637,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {11, 12, 13, 14}
+            if schema_version not in {11, 12, 13, 14, 15}
             else {
                 "operation_attempt_timeout_seconds": (
                     operation_attempt_timeout_seconds
@@ -5252,7 +5653,7 @@ def verify_exact_drain_plan(
                             operation_attempt_timeout_disposition
                         )
                     }
-                    if schema_version in {12, 13, 14}
+                    if schema_version in {12, 13, 14, 15}
                     else {}
                 ),
             }
@@ -5266,6 +5667,1316 @@ def verify_exact_drain_plan(
             "operation-recovery exact drain plan digest differs"
         )
     return {**body, "plan_digest": plan["plan_digest"]}
+
+
+def _exact_drain_grant_id(value: Any) -> str:
+    text = _text(value, "exact drain grant ID", maximum=36)
+    try:
+        parsed = uuid.UUID(text)
+    except (ValueError, AttributeError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ID is invalid"
+        ) from error
+    if str(parsed) != text or parsed.version != 4:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ID is invalid"
+        )
+    return text
+
+
+def _exact_drain_recovery_position(
+    plan: Mapping[str, Any],
+) -> tuple[int, int]:
+    context = plan["recovery_context"]
+    return (
+        _integer(context.get("recovery_epoch"), "exact drain recovery epoch"),
+        _integer(
+            context.get("reconciliation_cycle", 0),
+            "exact drain reconciliation cycle",
+        ),
+    )
+
+
+def _exact_drain_grant_scope(
+    reference_plan: Mapping[str, Any],
+    *,
+    maximum_recovery_epoch: int,
+    maximum_reconciliation_cycle: int,
+) -> dict[str, Any]:
+    recovery_epoch, reconciliation_cycle = _exact_drain_recovery_position(
+        reference_plan
+    )
+    maximum_epoch = _integer(
+        maximum_recovery_epoch,
+        "exact drain grant maximum recovery epoch",
+    )
+    maximum_cycle = _integer(
+        maximum_reconciliation_cycle,
+        "exact drain grant maximum reconciliation cycle",
+    )
+    if maximum_epoch < recovery_epoch or maximum_cycle < reconciliation_cycle:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant recovery bounds are invalid"
+        )
+    cohort_operations = sorted(
+        reference_plan["cohort"]["operations"],
+        key=lambda item: item["operation_id"],
+    )
+    authority = reference_plan["installation_authority"]
+    return {
+        "operation": "exact-drain",
+        "initial_reference_plan_digest": reference_plan["plan_digest"],
+        "installation_authority": authority,
+        "installation_authority_digest": digest(authority),
+        "cohort_digest": reference_plan["cohort_digest"],
+        "operation_ids_digest": digest(
+            [item["operation_id"] for item in cohort_operations]
+        ),
+        "task_payloads_digest": digest(
+            [
+                {
+                    "operation_id": item["operation_id"],
+                    "operation_type": item["operation_type"],
+                    "task_payload_digest": item["task_payload_digest"],
+                }
+                for item in cohort_operations
+            ]
+        ),
+        "initial_generation": reference_plan["pre_generation"],
+        "minimum_recovery_epoch": recovery_epoch,
+        "maximum_recovery_epoch": maximum_epoch,
+        "minimum_reconciliation_cycle": reconciliation_cycle,
+        "maximum_reconciliation_cycle": maximum_cycle,
+        "candidate_release_digest": reference_plan["candidate_release"][
+            "release_digest"
+        ],
+        "provider_policy_digest": reference_plan["provider_policy_digest"],
+        "effective_profile_digest": reference_plan[
+            "effective_profile_digest"
+        ],
+        "worker_runtime_digest": reference_plan["worker_runtime_digest"],
+        "phase_repair_contract_digest": reference_plan[
+            "phase_repair_contract_digest"
+        ],
+    }
+
+
+def create_exact_drain_authorization_grant_plan(
+    reference_plan_value: Mapping[str, Any],
+    *,
+    grant_id: str,
+    maximum_recovery_epoch: int,
+    maximum_reconciliation_cycle: int,
+    maximum_plan_claims: int,
+    maximum_worker_attempts: int,
+    maximum_execution_seconds: int,
+    maximum_concurrent_drains: int,
+    created_at: int | None = None,
+    expires_at: int,
+) -> Mapping[str, Any]:
+    """Plan one revocable standing grant without authorizing a drain."""
+    planned_at = (
+        int(time.time())
+        if created_at is None
+        else _integer(created_at, "exact drain grant plan created-at")
+    )
+    expiry = _integer(expires_at, "exact drain grant plan expires-at")
+    reference = verify_exact_drain_plan(
+        reference_plan_value,
+        now=planned_at,
+    )
+    if reference["schema_version"] not in {13, 14}:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant reference is invalid"
+        )
+    claims = _integer(
+        maximum_plan_claims,
+        "exact drain grant maximum plan claims",
+        minimum=1,
+    )
+    worker_attempts = _integer(
+        maximum_worker_attempts,
+        "exact drain grant maximum worker attempts",
+        minimum=1,
+    )
+    execution_seconds = _integer(
+        maximum_execution_seconds,
+        "exact drain grant maximum execution seconds",
+        minimum=1,
+    )
+    concurrency = _integer(
+        maximum_concurrent_drains,
+        "exact drain grant maximum concurrency",
+        minimum=1,
+    )
+    if (
+        expiry <= planned_at
+        or expiry - planned_at > EXACT_DRAIN_GRANT_MAX_LIFETIME_SECONDS
+        or worker_attempts < reference["worker_max_attempts"] + 1
+        or execution_seconds
+        < reference["execution_window"]["calculated_seconds"]
+        or concurrency != 1
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant budgets are invalid"
+        )
+    scope = _exact_drain_grant_scope(
+        reference,
+        maximum_recovery_epoch=maximum_recovery_epoch,
+        maximum_reconciliation_cycle=maximum_reconciliation_cycle,
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-grant-plan",
+        "action": "authorize-exact-drain-descendants",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "grant_id": _exact_drain_grant_id(grant_id),
+        "reference_plan": reference,
+        "scope": scope,
+        "budgets": {
+            "maximum_plan_claims": claims,
+            "maximum_worker_attempts": worker_attempts,
+            "maximum_execution_seconds": execution_seconds,
+            "maximum_concurrent_drains": concurrency,
+        },
+        "revocable": True,
+        "created_at": planned_at,
+        "expires_at": expiry,
+    }
+    return {**body, "grant_plan_digest": digest(body)}
+
+
+def verify_exact_drain_authorization_grant_plan(
+    value: Any,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    plan = _closed(
+        _normalized(value),
+        EXACT_DRAIN_GRANT_PLAN_KEYS,
+        "operation-recovery exact drain grant plan",
+    )
+    created_at = _integer(
+        plan["created_at"], "exact drain grant plan created-at"
+    )
+    expires_at = _integer(
+        plan["expires_at"], "exact drain grant plan expires-at"
+    )
+    observed_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "exact drain grant verification time")
+    )
+    if not allow_expired and observed_at >= expires_at:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant plan expired"
+        )
+    reference = verify_exact_drain_plan(
+        plan["reference_plan"],
+        now=created_at,
+        allow_expired=True,
+    )
+    if reference["schema_version"] not in {13, 14}:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant plan is invalid"
+        )
+    scope_value = _closed(
+        _normalized(plan["scope"]),
+        EXACT_DRAIN_GRANT_SCOPE_KEYS,
+        "operation-recovery exact drain grant scope",
+    )
+    minimum_epoch = _integer(
+        scope_value["minimum_recovery_epoch"],
+        "exact drain grant minimum recovery epoch",
+    )
+    maximum_epoch = _integer(
+        scope_value["maximum_recovery_epoch"],
+        "exact drain grant maximum recovery epoch",
+    )
+    minimum_cycle = _integer(
+        scope_value["minimum_reconciliation_cycle"],
+        "exact drain grant minimum reconciliation cycle",
+    )
+    maximum_cycle = _integer(
+        scope_value["maximum_reconciliation_cycle"],
+        "exact drain grant maximum reconciliation cycle",
+    )
+    expected_scope = _exact_drain_grant_scope(
+        reference,
+        maximum_recovery_epoch=maximum_epoch,
+        maximum_reconciliation_cycle=maximum_cycle,
+    )
+    budgets_value = _closed(
+        _normalized(plan["budgets"]),
+        EXACT_DRAIN_GRANT_BUDGET_KEYS,
+        "operation-recovery exact drain grant budgets",
+    )
+    budgets = {
+        "maximum_plan_claims": _integer(
+            budgets_value["maximum_plan_claims"],
+            "exact drain grant maximum plan claims",
+            minimum=1,
+        ),
+        "maximum_worker_attempts": _integer(
+            budgets_value["maximum_worker_attempts"],
+            "exact drain grant maximum worker attempts",
+            minimum=1,
+        ),
+        "maximum_execution_seconds": _integer(
+            budgets_value["maximum_execution_seconds"],
+            "exact drain grant maximum execution seconds",
+            minimum=1,
+        ),
+        "maximum_concurrent_drains": _integer(
+            budgets_value["maximum_concurrent_drains"],
+            "exact drain grant maximum concurrency",
+            minimum=1,
+        ),
+    }
+    body = {
+        "schema_version": _integer(
+            plan["schema_version"], "exact drain grant plan schema version"
+        ),
+        "kind": _text(plan["kind"], "exact drain grant plan kind"),
+        "action": _text(plan["action"], "exact drain grant plan action"),
+        "authority": _text(
+            plan["authority"], "exact drain grant plan authority"
+        ),
+        "mutation_authorized": plan["mutation_authorized"],
+        "grant_id": _exact_drain_grant_id(plan["grant_id"]),
+        "reference_plan": reference,
+        "scope": expected_scope,
+        "budgets": budgets,
+        "revocable": plan["revocable"],
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-authorization-grant-plan"
+        or body["action"] != "authorize-exact-drain-descendants"
+        or body["authority"] != "unapproved-plan"
+        or body["mutation_authorized"] is not False
+        or body["revocable"] is not True
+        or scope_value != expected_scope
+        or minimum_epoch != expected_scope["minimum_recovery_epoch"]
+        or minimum_cycle != expected_scope["minimum_reconciliation_cycle"]
+        or expires_at <= created_at
+        or expires_at - created_at > EXACT_DRAIN_GRANT_MAX_LIFETIME_SECONDS
+        or budgets["maximum_worker_attempts"]
+        < reference["worker_max_attempts"] + 1
+        or budgets["maximum_execution_seconds"]
+        < reference["execution_window"]["calculated_seconds"]
+        or budgets["maximum_concurrent_drains"] != 1
+        or _sha(
+            plan["grant_plan_digest"], "exact drain grant plan digest"
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant plan is invalid"
+        )
+    return {**body, "grant_plan_digest": plan["grant_plan_digest"]}
+
+
+def activate_exact_drain_authorization_grant(
+    grant_plan_value: Mapping[str, Any],
+    *,
+    approval_digest: str,
+    approved_at: int | None = None,
+) -> Mapping[str, Any]:
+    authorized_at = (
+        int(time.time())
+        if approved_at is None
+        else _integer(approved_at, "exact drain grant approval time")
+    )
+    grant_plan = verify_exact_drain_authorization_grant_plan(
+        grant_plan_value,
+        now=authorized_at,
+    )
+    approval = _sha(approval_digest, "exact drain grant approval digest")
+    if approval != grant_plan["grant_plan_digest"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant approval differs"
+        )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-grant",
+        "authority": "operator-approved-grant",
+        "mutation_authorized": True,
+        "grant_id": grant_plan["grant_id"],
+        "grant_plan": grant_plan,
+        "grant_plan_digest": grant_plan["grant_plan_digest"],
+        "approval_digest": approval,
+        "scope": grant_plan["scope"],
+        "budgets": grant_plan["budgets"],
+        "approved_at": authorized_at,
+        "expires_at": grant_plan["expires_at"],
+        "revocable": True,
+    }
+    return {**body, "grant_digest": digest(body)}
+
+
+def verify_exact_drain_authorization_grant(
+    value: Any,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    grant = _closed(
+        _normalized(value),
+        EXACT_DRAIN_GRANT_KEYS,
+        "operation-recovery exact drain authorization grant",
+    )
+    approved_at = _integer(
+        grant["approved_at"], "exact drain grant approval time"
+    )
+    expires_at = _integer(grant["expires_at"], "exact drain grant expiry")
+    observed_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "exact drain grant verification time")
+    )
+    if not allow_expired and observed_at >= expires_at:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization grant expired"
+        )
+    plan = verify_exact_drain_authorization_grant_plan(
+        grant["grant_plan"],
+        now=approved_at,
+        allow_expired=True,
+    )
+    body = {
+        "schema_version": _integer(
+            grant["schema_version"], "exact drain grant schema version"
+        ),
+        "kind": _text(grant["kind"], "exact drain grant kind"),
+        "authority": _text(grant["authority"], "exact drain grant authority"),
+        "mutation_authorized": grant["mutation_authorized"],
+        "grant_id": _exact_drain_grant_id(grant["grant_id"]),
+        "grant_plan": plan,
+        "grant_plan_digest": _sha(
+            grant["grant_plan_digest"], "exact drain grant plan digest"
+        ),
+        "approval_digest": _sha(
+            grant["approval_digest"], "exact drain grant approval digest"
+        ),
+        "scope": _normalized(grant["scope"]),
+        "budgets": _normalized(grant["budgets"]),
+        "approved_at": approved_at,
+        "expires_at": expires_at,
+        "revocable": grant["revocable"],
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-authorization-grant"
+        or body["authority"] != "operator-approved-grant"
+        or body["mutation_authorized"] is not True
+        or body["grant_id"] != plan["grant_id"]
+        or body["grant_plan_digest"] != plan["grant_plan_digest"]
+        or body["approval_digest"] != plan["grant_plan_digest"]
+        or body["scope"] != plan["scope"]
+        or body["budgets"] != plan["budgets"]
+        or body["expires_at"] != plan["expires_at"]
+        or body["revocable"] is not True
+        or approved_at < plan["created_at"]
+        or approved_at >= expires_at
+        or _sha(grant["grant_digest"], "exact drain grant digest")
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization grant is invalid"
+        )
+    return {**body, "grant_digest": grant["grant_digest"]}
+
+
+def _exact_drain_grant_nonce(value: Any, label: str) -> str:
+    return _sha(value, label)
+
+
+def create_exact_drain_grant_ledger(
+    grant_value: Mapping[str, Any],
+    *,
+    ledger_nonce: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Create the private CAS ledger for one approved standing grant."""
+    observed_at = (
+        int(time.time())
+        if created_at is None
+        else _integer(created_at, "exact drain grant ledger created-at")
+    )
+    grant = verify_exact_drain_authorization_grant(
+        grant_value,
+        now=observed_at,
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-grant-ledger",
+        "grant_id": grant["grant_id"],
+        "grant_digest": grant["grant_digest"],
+        "grant": grant,
+        "use_records": [],
+        "revocation": None,
+        "revision": 0,
+        "ledger_nonce": _exact_drain_grant_nonce(
+            ledger_nonce, "exact drain grant ledger nonce"
+        ),
+        "prior_ledger_digest": None,
+        "created_at": observed_at,
+        "updated_at": observed_at,
+    }
+    return {**body, "ledger_digest": digest(body)}
+
+
+def _verify_exact_drain_grant_claim_record(
+    value: Any,
+    *,
+    grant: Mapping[str, Any],
+    sequence: int,
+    prior_record_digest: str | None,
+) -> dict[str, Any]:
+    record = _closed(
+        _normalized(value),
+        EXACT_DRAIN_GRANT_CLAIM_KEYS,
+        "operation-recovery exact drain grant claim record",
+    )
+    authorized_at = _integer(
+        record["authorized_at"], "exact drain grant claim time"
+    )
+    plan = verify_exact_drain_plan(
+        record["plan"],
+        now=authorized_at,
+        allow_expired=True,
+    )
+    recovery_epoch, reconciliation_cycle = _exact_drain_recovery_position(plan)
+    body = {
+        "schema_version": _integer(
+            record["schema_version"], "exact drain grant claim schema version"
+        ),
+        "kind": _text(record["kind"], "exact drain grant claim kind"),
+        "sequence": _integer(
+            record["sequence"], "exact drain grant claim sequence", minimum=1
+        ),
+        "grant_id": _exact_drain_grant_id(record["grant_id"]),
+        "grant_digest": _sha(
+            record["grant_digest"], "exact drain grant claim grant digest"
+        ),
+        "plan": plan,
+        "plan_digest": _sha(
+            record["plan_digest"], "exact drain grant claim plan digest"
+        ),
+        "predecessor_plan_digest": _sha(
+            record["predecessor_plan_digest"],
+            "exact drain grant claim predecessor digest",
+        ),
+        "pre_generation": _text(
+            record["pre_generation"], "exact drain grant claim generation"
+        ),
+        "recovery_epoch": _integer(
+            record["recovery_epoch"], "exact drain grant claim recovery epoch"
+        ),
+        "reconciliation_cycle": _integer(
+            record["reconciliation_cycle"],
+            "exact drain grant claim reconciliation cycle",
+        ),
+        "worker_attempt_budget": _integer(
+            record["worker_attempt_budget"],
+            "exact drain grant claim worker-attempt budget",
+            minimum=1,
+        ),
+        "execution_seconds": _integer(
+            record["execution_seconds"],
+            "exact drain grant claim execution seconds",
+            minimum=1,
+        ),
+        "authorized_at": authorized_at,
+        "expires_at": _integer(
+            record["expires_at"], "exact drain grant claim expiry"
+        ),
+        "nonce": _exact_drain_grant_nonce(
+            record["nonce"], "exact drain grant claim nonce"
+        ),
+        "prior_record_digest": (
+            None
+            if record["prior_record_digest"] is None
+            else _sha(
+                record["prior_record_digest"],
+                "exact drain grant prior record digest",
+            )
+        ),
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-authorization-grant-claim"
+        or body["sequence"] != sequence
+        or body["grant_id"] != grant["grant_id"]
+        or body["grant_digest"] != grant["grant_digest"]
+        or plan["schema_version"] != 15
+        or plan["grant_id"] != grant["grant_id"]
+        or plan["grant_digest"] != grant["grant_digest"]
+        or body["plan_digest"] != plan["plan_digest"]
+        or body["predecessor_plan_digest"]
+        != plan["grant_predecessor_plan_digest"]
+        or body["pre_generation"] != plan["pre_generation"]
+        or body["recovery_epoch"] != recovery_epoch
+        or body["reconciliation_cycle"] != reconciliation_cycle
+        or body["worker_attempt_budget"] != plan["worker_max_attempts"] + 1
+        or body["execution_seconds"]
+        != plan["execution_window"]["calculated_seconds"]
+        or body["expires_at"]
+        != min(
+            grant["expires_at"],
+            authorized_at + body["execution_seconds"],
+        )
+        or body["prior_record_digest"] != prior_record_digest
+        or _sha(
+            record["record_digest"], "exact drain grant claim record digest"
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant claim record is invalid"
+        )
+    return {**body, "record_digest": record["record_digest"]}
+
+
+def _verify_exact_drain_grant_close_record(
+    value: Any,
+    *,
+    grant: Mapping[str, Any],
+    sequence: int,
+    prior_record_digest: str | None,
+    claims: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    record = _closed(
+        _normalized(value),
+        EXACT_DRAIN_GRANT_CLOSE_KEYS,
+        "operation-recovery exact drain grant close record",
+    )
+    body = {
+        "schema_version": _integer(
+            record["schema_version"], "exact drain grant close schema version"
+        ),
+        "kind": _text(record["kind"], "exact drain grant close kind"),
+        "sequence": _integer(
+            record["sequence"], "exact drain grant close sequence", minimum=1
+        ),
+        "grant_id": _exact_drain_grant_id(record["grant_id"]),
+        "grant_digest": _sha(
+            record["grant_digest"], "exact drain grant close grant digest"
+        ),
+        "plan_digest": _sha(
+            record["plan_digest"], "exact drain grant close plan digest"
+        ),
+        "claim_record_digest": _sha(
+            record["claim_record_digest"],
+            "exact drain grant close claim digest",
+        ),
+        "application_receipt_digest": _sha(
+            record["application_receipt_digest"],
+            "exact drain grant close application digest",
+        ),
+        "closed_at": _integer(
+            record["closed_at"], "exact drain grant close time"
+        ),
+        "nonce": _exact_drain_grant_nonce(
+            record["nonce"], "exact drain grant close nonce"
+        ),
+        "prior_record_digest": (
+            None
+            if record["prior_record_digest"] is None
+            else _sha(
+                record["prior_record_digest"],
+                "exact drain grant prior record digest",
+            )
+        ),
+    }
+    claim = claims.get(body["plan_digest"])
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-authorization-grant-close"
+        or body["sequence"] != sequence
+        or body["grant_id"] != grant["grant_id"]
+        or body["grant_digest"] != grant["grant_digest"]
+        or claim is None
+        or body["claim_record_digest"] != claim["record_digest"]
+        or body["closed_at"] < claim["authorized_at"]
+        or body["closed_at"] >= claim["expires_at"]
+        or body["prior_record_digest"] != prior_record_digest
+        or _sha(
+            record["record_digest"], "exact drain grant close record digest"
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant close record is invalid"
+        )
+    return {**body, "record_digest": record["record_digest"]}
+
+
+def _verify_exact_drain_grant_revocation(
+    value: Any,
+    *,
+    grant: Mapping[str, Any],
+    sequence: int,
+    prior_record_digest: str | None,
+) -> dict[str, Any]:
+    record = _closed(
+        _normalized(value),
+        EXACT_DRAIN_GRANT_REVOCATION_KEYS,
+        "operation-recovery exact drain grant revocation",
+    )
+    body = {
+        "schema_version": _integer(
+            record["schema_version"],
+            "exact drain grant revocation schema version",
+        ),
+        "kind": _text(record["kind"], "exact drain grant revocation kind"),
+        "sequence": _integer(
+            record["sequence"],
+            "exact drain grant revocation sequence",
+            minimum=1,
+        ),
+        "grant_id": _exact_drain_grant_id(record["grant_id"]),
+        "grant_digest": _sha(
+            record["grant_digest"], "exact drain grant revocation digest"
+        ),
+        "approval_digest": _sha(
+            record["approval_digest"],
+            "exact drain grant revocation approval digest",
+        ),
+        "revoked_at": _integer(
+            record["revoked_at"], "exact drain grant revocation time"
+        ),
+        "nonce": _exact_drain_grant_nonce(
+            record["nonce"], "exact drain grant revocation nonce"
+        ),
+        "prior_record_digest": (
+            None
+            if record["prior_record_digest"] is None
+            else _sha(
+                record["prior_record_digest"],
+                "exact drain grant prior record digest",
+            )
+        ),
+    }
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-authorization-grant-revocation"
+        or body["sequence"] != sequence
+        or body["grant_id"] != grant["grant_id"]
+        or body["grant_digest"] != grant["grant_digest"]
+        or body["approval_digest"] != grant["grant_digest"]
+        or body["revoked_at"] < grant["approved_at"]
+        or body["prior_record_digest"] != prior_record_digest
+        or _sha(
+            record["record_digest"],
+            "exact drain grant revocation record digest",
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant revocation is invalid"
+        )
+    return {**body, "record_digest": record["record_digest"]}
+
+
+def verify_exact_drain_grant_ledger(
+    value: Any,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    ledger = _closed(
+        _normalized(value),
+        EXACT_DRAIN_GRANT_LEDGER_KEYS,
+        "operation-recovery exact drain grant ledger",
+    )
+    observed_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "exact drain grant ledger verification time")
+    )
+    grant = verify_exact_drain_authorization_grant(
+        ledger["grant"],
+        now=observed_at,
+        allow_expired=allow_expired,
+    )
+    raw_records = ledger["use_records"]
+    if not isinstance(raw_records, list):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger is invalid"
+        )
+    records = []
+    prior_record_digest = None
+    nonces: set[str] = set()
+    claims: dict[str, Mapping[str, Any]] = {}
+    closed: set[str] = set()
+    maximum_open_claims = 0
+    for sequence, raw_record in enumerate(raw_records, start=1):
+        kind = raw_record.get("kind") if isinstance(raw_record, Mapping) else None
+        if kind == "operation-recovery-exact-drain-authorization-grant-claim":
+            record = _verify_exact_drain_grant_claim_record(
+                raw_record,
+                grant=grant,
+                sequence=sequence,
+                prior_record_digest=prior_record_digest,
+            )
+            predecessor = (
+                None if not claims else list(claims.values())[-1]
+            )
+            expected_predecessor = (
+                grant["scope"]["initial_reference_plan_digest"]
+                if predecessor is None
+                else predecessor["plan_digest"]
+            )
+            if record["predecessor_plan_digest"] != expected_predecessor:
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain grant continuity differs"
+                )
+            if predecessor is not None:
+                before_position = (
+                    predecessor["recovery_epoch"],
+                    predecessor["reconciliation_cycle"],
+                )
+                after_position = (
+                    record["recovery_epoch"],
+                    record["reconciliation_cycle"],
+                )
+                if (
+                    after_position < before_position
+                    or (
+                        after_position == before_position
+                        and record["pre_generation"]
+                        != predecessor["pre_generation"]
+                    )
+                    or (
+                        after_position > before_position
+                        and record["pre_generation"]
+                        == predecessor["pre_generation"]
+                    )
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain grant continuity differs"
+                    )
+            if record["plan_digest"] in claims:
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain grant claim replayed"
+                )
+            claims[record["plan_digest"]] = record
+        elif kind == "operation-recovery-exact-drain-authorization-grant-close":
+            record = _verify_exact_drain_grant_close_record(
+                raw_record,
+                grant=grant,
+                sequence=sequence,
+                prior_record_digest=prior_record_digest,
+                claims=claims,
+            )
+            if record["plan_digest"] in closed:
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain grant close replayed"
+                )
+            closed.add(record["plan_digest"])
+        else:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant ledger is invalid"
+            )
+        if record["nonce"] in nonces:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant claim replayed"
+            )
+        nonces.add(record["nonce"])
+        records.append(record)
+        prior_record_digest = record["record_digest"]
+        maximum_open_claims = max(
+            maximum_open_claims,
+            len(set(claims) - closed),
+        )
+    if ledger["revocation"] is None:
+        revocation = None
+    else:
+        revocation = _verify_exact_drain_grant_revocation(
+            ledger["revocation"],
+            grant=grant,
+            sequence=len(records) + 1,
+            prior_record_digest=prior_record_digest,
+        )
+        if revocation["nonce"] in nonces:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant revocation replayed"
+            )
+        nonces.add(revocation["nonce"])
+    created_at = _integer(
+        ledger["created_at"], "exact drain grant ledger created-at"
+    )
+    updated_at = _integer(
+        ledger["updated_at"], "exact drain grant ledger updated-at"
+    )
+    revision = _integer(
+        ledger["revision"], "exact drain grant ledger revision"
+    )
+    body = {
+        "schema_version": _integer(
+            ledger["schema_version"], "exact drain grant ledger schema version"
+        ),
+        "kind": _text(ledger["kind"], "exact drain grant ledger kind"),
+        "grant_id": _exact_drain_grant_id(ledger["grant_id"]),
+        "grant_digest": _sha(
+            ledger["grant_digest"], "exact drain grant ledger grant digest"
+        ),
+        "grant": grant,
+        "use_records": records,
+        "revocation": revocation,
+        "revision": revision,
+        "ledger_nonce": _exact_drain_grant_nonce(
+            ledger["ledger_nonce"], "exact drain grant ledger nonce"
+        ),
+        "prior_ledger_digest": (
+            None
+            if ledger["prior_ledger_digest"] is None
+            else _sha(
+                ledger["prior_ledger_digest"],
+                "exact drain grant prior ledger digest",
+            )
+        ),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+    budgets = grant["budgets"]
+    event_times = [
+        (
+            record["authorized_at"]
+            if record["kind"]
+            == "operation-recovery-exact-drain-authorization-grant-claim"
+            else record["closed_at"]
+        )
+        for record in records
+    ]
+    if revocation is not None:
+        event_times.append(revocation["revoked_at"])
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-authorization-grant-ledger"
+        or body["grant_id"] != grant["grant_id"]
+        or body["grant_digest"] != grant["grant_digest"]
+        or revision != len(records) + (1 if revocation is not None else 0)
+        or created_at < grant["approved_at"]
+        or any(
+            after < before
+            for before, after in zip(
+                [created_at, *event_times],
+                event_times,
+            )
+        )
+        or updated_at != (event_times[-1] if event_times else created_at)
+        or len(claims) > budgets["maximum_plan_claims"]
+        or sum(record["worker_attempt_budget"] for record in claims.values())
+        > budgets["maximum_worker_attempts"]
+        or sum(record["execution_seconds"] for record in claims.values())
+        > budgets["maximum_execution_seconds"]
+        or maximum_open_claims > budgets["maximum_concurrent_drains"]
+        or _sha(ledger["ledger_digest"], "exact drain grant ledger digest")
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger is invalid"
+        )
+    return {**body, "ledger_digest": ledger["ledger_digest"]}
+
+
+def claim_exact_drain_grant(
+    ledger_value: Mapping[str, Any],
+    plan_value: Mapping[str, Any],
+    *,
+    expected_ledger_digest: str,
+    claim_nonce: str,
+    ledger_nonce: str,
+    claimed_at: int | None = None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """CAS-claim one schema-15 plan or recover its prior durable claim."""
+    authorized_at = (
+        int(time.time())
+        if claimed_at is None
+        else _integer(claimed_at, "exact drain grant claim time")
+    )
+    ledger = verify_exact_drain_grant_ledger(
+        ledger_value,
+        now=authorized_at,
+    )
+    if authorized_at < ledger["updated_at"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger time regressed"
+        )
+    if _sha(
+        expected_ledger_digest, "exact drain expected grant ledger digest"
+    ) != ledger["ledger_digest"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger CAS differs"
+        )
+    if ledger["revocation"] is not None:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization grant revoked"
+        )
+    plan = verify_exact_drain_plan(plan_value, now=authorized_at)
+    grant = ledger["grant"]
+    if (
+        plan["schema_version"] != 15
+        or plan["grant_id"] != grant["grant_id"]
+        or plan["grant_digest"] != grant["grant_digest"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant scope differs"
+        )
+    claim_records = [
+        record
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-claim"
+    ]
+    closed_plan_digests = {
+        record["plan_digest"]
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-close"
+    }
+    for record in claim_records:
+        if record["plan_digest"] == plan["plan_digest"]:
+            if (
+                record["plan"] != plan
+                or record["plan_digest"] in closed_plan_digests
+                or record["record_digest"]
+                != claim_records[-1]["record_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain grant claim replayed"
+                )
+            return ledger, record
+    expected_predecessor = (
+        claim_records[-1]["plan_digest"]
+        if claim_records
+        else grant["scope"]["initial_reference_plan_digest"]
+    )
+    if plan["grant_predecessor_plan_digest"] != expected_predecessor:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant continuity differs"
+        )
+    _exact_drain_assert_grant_scope(
+        plan,
+        grant,
+        predecessor_plan_digest=expected_predecessor,
+    )
+    if claim_records:
+        predecessor = claim_records[-1]
+        before_position = (
+            predecessor["recovery_epoch"],
+            predecessor["reconciliation_cycle"],
+        )
+        after_position = _exact_drain_recovery_position(plan)
+        if (
+            after_position < before_position
+            or (
+                after_position == before_position
+                and plan["pre_generation"] != predecessor["pre_generation"]
+            )
+            or (
+                after_position > before_position
+                and plan["pre_generation"] == predecessor["pre_generation"]
+            )
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant continuity differs"
+            )
+    claim_value = _exact_drain_grant_nonce(
+        claim_nonce, "exact drain grant claim nonce"
+    )
+    next_ledger_nonce = _exact_drain_grant_nonce(
+        ledger_nonce, "exact drain grant ledger nonce"
+    )
+    if claim_value == next_ledger_nonce or any(
+        record["nonce"] == claim_value for record in ledger["use_records"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant claim replayed"
+        )
+    recovery_epoch, reconciliation_cycle = _exact_drain_recovery_position(plan)
+    record_body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-grant-claim",
+        "sequence": len(ledger["use_records"]) + 1,
+        "grant_id": grant["grant_id"],
+        "grant_digest": grant["grant_digest"],
+        "plan": plan,
+        "plan_digest": plan["plan_digest"],
+        "predecessor_plan_digest": expected_predecessor,
+        "pre_generation": plan["pre_generation"],
+        "recovery_epoch": recovery_epoch,
+        "reconciliation_cycle": reconciliation_cycle,
+        "worker_attempt_budget": plan["worker_max_attempts"] + 1,
+        "execution_seconds": plan["execution_window"]["calculated_seconds"],
+        "authorized_at": authorized_at,
+        "expires_at": min(
+            grant["expires_at"],
+            authorized_at + plan["execution_window"]["calculated_seconds"],
+        ),
+        "nonce": claim_value,
+        "prior_record_digest": (
+            None
+            if not ledger["use_records"]
+            else ledger["use_records"][-1]["record_digest"]
+        ),
+    }
+    record = {**record_body, "record_digest": digest(record_body)}
+    budgets = grant["budgets"]
+    records = [*ledger["use_records"], record]
+    updated_claims = [*claim_records, record]
+    open_claim_count = len(
+        {
+            item["plan_digest"] for item in updated_claims
+        }
+        - closed_plan_digests
+    )
+    if (
+        len(updated_claims) > budgets["maximum_plan_claims"]
+        or sum(item["worker_attempt_budget"] for item in updated_claims)
+        > budgets["maximum_worker_attempts"]
+        or sum(item["execution_seconds"] for item in updated_claims)
+        > budgets["maximum_execution_seconds"]
+        or open_claim_count > budgets["maximum_concurrent_drains"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant budget exhausted"
+        )
+    ledger_body = {
+        key: value
+        for key, value in ledger.items()
+        if key != "ledger_digest"
+    }
+    ledger_body.update(
+        use_records=records,
+        revision=ledger["revision"] + 1,
+        ledger_nonce=next_ledger_nonce,
+        prior_ledger_digest=ledger["ledger_digest"],
+        updated_at=authorized_at,
+    )
+    updated = {**ledger_body, "ledger_digest": digest(ledger_body)}
+    return (
+        verify_exact_drain_grant_ledger(updated, now=authorized_at),
+        record,
+    )
+
+
+def close_exact_drain_grant_claim(
+    ledger_value: Mapping[str, Any],
+    *,
+    plan_digest: str,
+    claim_record_digest: str,
+    application_receipt_digest: str,
+    expected_ledger_digest: str,
+    close_nonce: str,
+    ledger_nonce: str,
+    closed_at: int | None = None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Append the immutable application outcome for one grant claim."""
+    observed_at = (
+        int(time.time())
+        if closed_at is None
+        else _integer(closed_at, "exact drain grant close time")
+    )
+    ledger = verify_exact_drain_grant_ledger(
+        ledger_value,
+        now=observed_at,
+    )
+    if observed_at < ledger["updated_at"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger time regressed"
+        )
+    if _sha(
+        expected_ledger_digest, "exact drain expected grant ledger digest"
+    ) != ledger["ledger_digest"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger CAS differs"
+        )
+    if ledger["revocation"] is not None:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization grant revoked"
+        )
+    plan_value = _sha(plan_digest, "exact drain grant close plan digest")
+    claim_value = _sha(
+        claim_record_digest, "exact drain grant close claim digest"
+    )
+    application_value = _sha(
+        application_receipt_digest,
+        "exact drain grant close application digest",
+    )
+    claims = {
+        record["plan_digest"]: record
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-claim"
+    }
+    existing = [
+        record
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-close"
+        and record["plan_digest"] == plan_value
+    ]
+    if existing:
+        if (
+            len(existing) != 1
+            or existing[0]["claim_record_digest"] != claim_value
+            or existing[0]["application_receipt_digest"] != application_value
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant close replayed"
+            )
+        return ledger, existing[0]
+    claim = claims.get(plan_value)
+    if claim is None or claim["record_digest"] != claim_value:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant claim differs"
+        )
+    close_value = _exact_drain_grant_nonce(
+        close_nonce, "exact drain grant close nonce"
+    )
+    next_ledger_nonce = _exact_drain_grant_nonce(
+        ledger_nonce, "exact drain grant ledger nonce"
+    )
+    if close_value == next_ledger_nonce or any(
+        record["nonce"] == close_value for record in ledger["use_records"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant close replayed"
+        )
+    record_body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-grant-close",
+        "sequence": len(ledger["use_records"]) + 1,
+        "grant_id": ledger["grant_id"],
+        "grant_digest": ledger["grant_digest"],
+        "plan_digest": plan_value,
+        "claim_record_digest": claim_value,
+        "application_receipt_digest": application_value,
+        "closed_at": observed_at,
+        "nonce": close_value,
+        "prior_record_digest": ledger["use_records"][-1]["record_digest"],
+    }
+    record = {**record_body, "record_digest": digest(record_body)}
+    ledger_body = {
+        key: value for key, value in ledger.items() if key != "ledger_digest"
+    }
+    ledger_body.update(
+        use_records=[*ledger["use_records"], record],
+        revision=ledger["revision"] + 1,
+        ledger_nonce=next_ledger_nonce,
+        prior_ledger_digest=ledger["ledger_digest"],
+        updated_at=observed_at,
+    )
+    updated = {**ledger_body, "ledger_digest": digest(ledger_body)}
+    return (
+        verify_exact_drain_grant_ledger(updated, now=observed_at),
+        record,
+    )
+
+
+def revoke_exact_drain_grant(
+    ledger_value: Mapping[str, Any],
+    *,
+    approval_digest: str,
+    expected_ledger_digest: str,
+    revocation_nonce: str,
+    ledger_nonce: str,
+    revoked_at: int | None = None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """CAS-append an authenticated terminal revocation to the grant ledger."""
+    observed_at = (
+        int(time.time())
+        if revoked_at is None
+        else _integer(revoked_at, "exact drain grant revocation time")
+    )
+    ledger = verify_exact_drain_grant_ledger(
+        ledger_value,
+        now=observed_at,
+        allow_expired=True,
+    )
+    if observed_at < ledger["updated_at"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger time regressed"
+        )
+    if _sha(
+        expected_ledger_digest, "exact drain expected grant ledger digest"
+    ) != ledger["ledger_digest"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant ledger CAS differs"
+        )
+    approval = _sha(
+        approval_digest, "exact drain grant revocation approval digest"
+    )
+    if approval != ledger["grant_digest"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant revocation approval differs"
+        )
+    if ledger["revocation"] is not None:
+        return ledger, ledger["revocation"]
+    revocation_value = _exact_drain_grant_nonce(
+        revocation_nonce, "exact drain grant revocation nonce"
+    )
+    next_ledger_nonce = _exact_drain_grant_nonce(
+        ledger_nonce, "exact drain grant ledger nonce"
+    )
+    if revocation_value == next_ledger_nonce or any(
+        record["nonce"] == revocation_value
+        for record in ledger["use_records"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant revocation replayed"
+        )
+    record_body = {
+        "schema_version": 1,
+        "kind": (
+            "operation-recovery-exact-drain-authorization-grant-revocation"
+        ),
+        "sequence": len(ledger["use_records"]) + 1,
+        "grant_id": ledger["grant_id"],
+        "grant_digest": ledger["grant_digest"],
+        "approval_digest": approval,
+        "revoked_at": observed_at,
+        "nonce": revocation_value,
+        "prior_record_digest": (
+            None
+            if not ledger["use_records"]
+            else ledger["use_records"][-1]["record_digest"]
+        ),
+    }
+    record = {**record_body, "record_digest": digest(record_body)}
+    ledger_body = {
+        key: value for key, value in ledger.items() if key != "ledger_digest"
+    }
+    ledger_body.update(
+        revocation=record,
+        revision=ledger["revision"] + 1,
+        ledger_nonce=next_ledger_nonce,
+        prior_ledger_digest=ledger["ledger_digest"],
+        updated_at=observed_at,
+    )
+    updated = {**ledger_body, "ledger_digest": digest(ledger_body)}
+    return (
+        verify_exact_drain_grant_ledger(
+            updated,
+            now=observed_at,
+            allow_expired=True,
+        ),
+        record,
+    )
 
 
 def _post_abort_worker_digest(reference_plan_digest: str) -> str:
@@ -5317,9 +7028,21 @@ def _post_abort_reference_application_journal(
     reference_plan: Mapping[str, Any],
     reference_authorization: Mapping[str, Any],
 ) -> dict[str, Any]:
+    grant_projection = (
+        {
+            "grant_id": reference_plan["grant_id"],
+            "grant_digest": reference_plan["grant_digest"],
+        }
+        if reference_plan.get("schema_version") == 15
+        else {}
+    )
     journal = _closed(
         _normalized(value),
-        POST_ABORT_REFERENCE_JOURNAL_KEYS,
+        (
+            POST_ABORT_REFERENCE_JOURNAL_V2_KEYS
+            if grant_projection
+            else POST_ABORT_REFERENCE_JOURNAL_KEYS
+        ),
         "post-abort reference application journal",
     )
     body = {
@@ -5357,18 +7080,24 @@ def _post_abort_reference_application_journal(
             journal["worker_attempt"],
             "post-abort reference journal worker attempt",
         ),
+        **grant_projection,
     }
     receipt_digest = _sha(
         journal["receipt_digest"],
         "post-abort reference journal digest",
     )
     if (
-        body["schema_version"] != 1
+        body["schema_version"] != (2 if grant_projection else 1)
         or body["kind"]
         != "operation-recovery-exact-drain-application-journal"
         or body["plan_digest"] != reference_plan["plan_digest"]
         or body["authorization_receipt_digest"]
         != reference_authorization["receipt_digest"]
+        or any(
+            journal.get(key) != item
+            or reference_authorization.get(key) != item
+            for key, item in grant_projection.items()
+        )
         or body["started_at"] != reference_authorization["authorized_at"]
         or not 1 <= body["worker_pid"] <= (1 << 31) - 1
         or not body["worker_start_time"]
@@ -5470,7 +7199,7 @@ def _post_abort_v10_retry_recovery(
 ) -> dict[str, Any]:
     recovery_epoch_before = (
         reference_plan["recovery_context"]["recovery_epoch"]
-        if reference_plan["schema_version"] in {10, 11, 12}
+        if reference_plan["schema_version"] in {10, 11, 12, 15}
         else 0
     )
     if recovery_epoch_before != 0:
@@ -5765,14 +7494,14 @@ def _post_abort_v11_retry_recovery(
 ) -> dict[str, Any]:
     context = reference_plan.get("recovery_context")
     if (
-        reference_plan["schema_version"] not in {10, 11, 12}
+        reference_plan["schema_version"] not in {10, 11, 12, 15}
         or not isinstance(context, Mapping)
         or context.get("origin") != "post-abort"
         or context.get("schema_version") not in {1, 2}
         or context.get("recovery_epoch") != context.get("schema_version")
         or (
             context.get("schema_version") == 2
-            and reference_plan["schema_version"] not in {11, 12}
+            and reference_plan["schema_version"] not in {11, 12, 15}
         )
         or prior_retry_recovery_value is None
     ):
@@ -5991,7 +7720,7 @@ def _post_terminal_reconciliation_retry_recovery(
     """Authorize one bounded cycle without inventing recovery epoch four."""
     context = reference_plan.get("recovery_context")
     if (
-        reference_plan.get("schema_version") != 12
+        reference_plan.get("schema_version") not in {12, 15}
         or not isinstance(context, Mapping)
         or context.get("schema_version") != 3
         or context.get("origin") != "post-abort"
@@ -6471,7 +8200,7 @@ def _post_abort_contract(
         schema_version == 13
         and (
             prior_retry_recovery is None
-            or reference_plan.get("schema_version") != 12
+            or reference_plan.get("schema_version") not in {12, 15}
             or recovery_context_schema != 3
             or recovery_epoch != 3
             or recovery_context.get("origin") != "post-abort"
@@ -6489,7 +8218,7 @@ def _post_abort_contract(
         )
     if (
         schema_version not in {10, 11, 12, 13}
-        and reference_plan["schema_version"] in {10, 11, 12, 13}
+        and reference_plan["schema_version"] in {10, 11, 12, 13, 15}
     ):
         raise OperationRecoveryError(
             "operation-recovery legacy post-abort schema cannot reference "
@@ -6498,7 +8227,7 @@ def _post_abort_contract(
     if schema_version in {10, 11, 12, 13}:
         if schema_version == 10 and (
             prior_retry_recovery is not None
-            or reference_plan["schema_version"] in {11, 12}
+            or reference_plan["schema_version"] in {11, 12, 15}
         ):
             raise OperationRecoveryError(
                 "operation-recovery post-abort retry recovery is invalid"
@@ -7170,7 +8899,7 @@ def verify_post_abort_recovery_plan(
     )
     if (
         schema_version not in {10, 11, 12, 13}
-        and reference["schema_version"] in {10, 11, 12, 13}
+        and reference["schema_version"] in {10, 11, 12, 13, 15}
     ):
         raise OperationRecoveryError(
             "operation-recovery legacy post-abort schema cannot reference "
@@ -7546,6 +9275,50 @@ def verify_post_abort_recovery_plan(
     return {**body, "plan_digest": plan["plan_digest"]}
 
 
+def create_exact_drain_grant_authorization_receipt(
+    plan_value: Mapping[str, Any],
+    grant_use_record_value: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Derive one short-lived plan receipt from its durable grant claim."""
+    plan = verify_exact_drain_plan(plan_value, allow_expired=True)
+    if plan["schema_version"] != 15:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant receipt plan is invalid"
+        )
+    raw_record = _closed(
+        _normalized(grant_use_record_value),
+        EXACT_DRAIN_GRANT_CLAIM_KEYS,
+        "operation-recovery exact drain grant claim record",
+    )
+    record = _verify_exact_drain_grant_claim_record(
+        raw_record,
+        grant=plan["authorization_grant"],
+        sequence=_integer(
+            raw_record["sequence"], "exact drain grant claim sequence", minimum=1
+        ),
+        prior_record_digest=raw_record["prior_record_digest"],
+    )
+    if record["plan_digest"] != plan["plan_digest"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant claim differs"
+        )
+    body = {
+        "schema_version": 2,
+        "kind": "operation-recovery-exact-drain-authorization-receipt",
+        "plan_digest": plan["plan_digest"],
+        "candidate_release": plan["candidate_release"],
+        "provider_policy_digest": plan["provider_policy_digest"],
+        "worker_runtime_digest": plan["worker_runtime_digest"],
+        "grant_id": plan["grant_id"],
+        "grant_digest": plan["grant_digest"],
+        "grant_use_record": record,
+        "grant_use_record_digest": record["record_digest"],
+        "authorized_at": record["authorized_at"],
+        "expires_at": record["expires_at"],
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
 def verify_exact_drain_authorization_receipt(
     value: Any,
     *,
@@ -7553,7 +9326,13 @@ def verify_exact_drain_authorization_receipt(
 ) -> Mapping[str, Any]:
     """Validate the approval handoff consumed by the detached worker."""
     verified_plan = verify_exact_drain_plan(plan, allow_expired=True)
-    keys = frozenset(
+    normalized = _normalized(value)
+    schema_version = (
+        normalized.get("schema_version")
+        if isinstance(normalized, Mapping)
+        else None
+    )
+    legacy_keys = frozenset(
         {
             "schema_version",
             "kind",
@@ -7566,15 +9345,105 @@ def verify_exact_drain_authorization_receipt(
             "receipt_digest",
         }
     )
+    grant_keys = frozenset(
+        {
+            "schema_version",
+            "kind",
+            "plan_digest",
+            "candidate_release",
+            "provider_policy_digest",
+            "worker_runtime_digest",
+            "grant_id",
+            "grant_digest",
+            "grant_use_record",
+            "grant_use_record_digest",
+            "authorized_at",
+            "expires_at",
+            "receipt_digest",
+        }
+    )
     receipt = _closed(
-        _normalized(value),
-        keys,
+        normalized,
+        grant_keys if schema_version == 2 else legacy_keys,
         "operation-recovery exact drain authorization receipt",
     )
     authorized_at = _integer(
         receipt["authorized_at"],
         "exact drain authorization time",
     )
+    if schema_version == 2:
+        if verified_plan["schema_version"] != 15:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain authorization receipt is invalid"
+            )
+        raw_record = _closed(
+            receipt["grant_use_record"],
+            EXACT_DRAIN_GRANT_CLAIM_KEYS,
+            "operation-recovery exact drain grant claim record",
+        )
+        record = _verify_exact_drain_grant_claim_record(
+            raw_record,
+            grant=verified_plan["authorization_grant"],
+            sequence=_integer(
+                raw_record["sequence"],
+                "exact drain grant claim sequence",
+                minimum=1,
+            ),
+            prior_record_digest=raw_record["prior_record_digest"],
+        )
+        body = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-authorization-receipt",
+            "plan_digest": _sha(
+                receipt["plan_digest"], "exact drain plan digest"
+            ),
+            "candidate_release": _candidate_release(
+                receipt["candidate_release"]
+            ),
+            "provider_policy_digest": _sha(
+                receipt["provider_policy_digest"], "provider policy digest"
+            ),
+            "worker_runtime_digest": _sha(
+                receipt["worker_runtime_digest"], "worker runtime digest"
+            ),
+            "grant_id": _exact_drain_grant_id(receipt["grant_id"]),
+            "grant_digest": _sha(
+                receipt["grant_digest"], "exact drain grant digest"
+            ),
+            "grant_use_record": record,
+            "grant_use_record_digest": _sha(
+                receipt["grant_use_record_digest"],
+                "exact drain grant use record digest",
+            ),
+            "authorized_at": authorized_at,
+            "expires_at": _integer(
+                receipt["expires_at"], "exact drain authorization expiry"
+            ),
+        }
+        if (
+            body["plan_digest"] != verified_plan["plan_digest"]
+            or body["candidate_release"] != verified_plan["candidate_release"]
+            or body["provider_policy_digest"]
+            != verified_plan["provider_policy_digest"]
+            or body["worker_runtime_digest"]
+            != verified_plan["worker_runtime_digest"]
+            or body["grant_id"] != verified_plan["grant_id"]
+            or body["grant_digest"] != verified_plan["grant_digest"]
+            or record["plan_digest"] != verified_plan["plan_digest"]
+            or body["grant_use_record_digest"] != record["record_digest"]
+            or authorized_at != record["authorized_at"]
+            or body["expires_at"] != record["expires_at"]
+            or authorized_at >= body["expires_at"]
+            or _sha(
+                receipt["receipt_digest"],
+                "exact drain authorization receipt digest",
+            )
+            != digest(body)
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain authorization receipt is invalid"
+            )
+        return {**body, "receipt_digest": receipt["receipt_digest"]}
     body = {
         "schema_version": 1,
         "kind": "operation-recovery-exact-drain-authorization-receipt",
@@ -7597,7 +9466,8 @@ def verify_exact_drain_authorization_receipt(
         "authorized_at": authorized_at,
     }
     if (
-        body["plan_digest"] != verified_plan["plan_digest"]
+        verified_plan["schema_version"] == 15
+        or body["plan_digest"] != verified_plan["plan_digest"]
         or body["approval_digest"] != verified_plan["plan_digest"]
         or body["candidate_release"] != verified_plan["candidate_release"]
         or body["provider_policy_digest"]

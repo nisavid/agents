@@ -1,0 +1,57 @@
+name: Source skill disposition
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/source-skill-disposition.yml"
+      - "evals/control-plane-matrix.json"
+      - "plugins/**"
+      - "release/plugin-content-locks/**"
+      - "release/public-release-runtime-packages.json"
+      - "release/source-skill-disposition/**"
+      - "release/source-skill-lineage/**"
+      - "release/task-witness/**"
+      - "scripts/validate_source_skill_disposition.py"
+      - "tests/test_validate_source_skill_disposition.py"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/source-skill-disposition.yml"
+      - "evals/control-plane-matrix.json"
+      - "plugins/**"
+      - "release/plugin-content-locks/**"
+      - "release/public-release-runtime-packages.json"
+      - "release/source-skill-disposition/**"
+      - "release/source-skill-lineage/**"
+      - "release/task-witness/**"
+      - "scripts/validate_source_skill_disposition.py"
+      - "tests/test_validate_source_skill_disposition.py"
+
+concurrency:
+  group: source-skill-disposition-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate disposition and refresh contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the schema validator
+        run: python -m pip install jsonschema==4.26.0
+
+      - name: Validate the source-skill disposition
+        run: |
+          python -m unittest tests.test_validate_source_skill_disposition
+          python scripts/validate_source_skill_disposition.py .

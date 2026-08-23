@@ -32,7 +32,7 @@ pull-request work.
 
 | Public name                                | Responsibility                                                                                                                             |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `$rolecasting:delegating-cross-agent-work` | Freeze target, relationship, ownership, transport, assurance, and authority; retain leader integration.                                     |
+| `$rolecasting:delegating-cross-agent-work` | Freeze target, relationship, ownership, transport, assurance, and authority; batch same-shape work, use bounded waits, and retain leader integration. |
 | `$rolecasting:choosing-agent-models`       | Select a model-effort pair proven by the live-catalog and target-executor-schema intersection after delegation is settled.                 |
 
 ## Layout

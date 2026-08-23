@@ -1008,6 +1008,57 @@ class ExactDrainProgressTest(unittest.TestCase):
                     clock=lambda: 1002.0,
                 )
 
+    def test_schema_six_progress_carries_the_standing_grant_chain(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            plan = {
+                "plan_digest": "a" * 64,
+                "grant_id": "11111111-1111-4111-8111-111111111111",
+                "grant_digest": "b" * 64,
+                "progress_artifact_path": str(path),
+                "progress_schema_version": 6,
+                "worker_max_attempts": 3,
+                "selected_operations": [],
+            }
+            authorization = {
+                "schema_version": 2,
+                "receipt_digest": "c" * 64,
+                "authorized_at": 1000,
+                "grant_id": plan["grant_id"],
+                "grant_digest": plan["grant_digest"],
+            }
+            body = {
+                "schema_version": 2,
+                "kind": "operation-recovery-exact-drain-application-journal",
+                "plan_digest": plan["plan_digest"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "grant_id": plan["grant_id"],
+                "grant_digest": plan["grant_digest"],
+                "started_at": authorization["authorized_at"],
+                "worker_pid": os.getpid(),
+                "worker_start_time": "darwin:1000:1",
+                "worker_attempt": 1,
+            }
+            journal = {**body, "receipt_digest": digest(body)}
+
+            create_exact_drain_progress_recorder(
+                plan=plan,
+                authorization=authorization,
+                journal=journal,
+                clock=lambda: 1001.0,
+            )
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest=plan["plan_digest"],
+                progress_schema_version=6,
+                now=1002.0,
+            )
+
+        self.assertEqual(progress["grant_id"], plan["grant_id"])
+        self.assertEqual(progress["grant_digest"], plan["grant_digest"])
+
     def test_progress_is_private_digest_sealed_and_payload_free(self) -> None:
         ticks = iter((1000.0, 1002.0, 1002.0, 1006.0))
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:

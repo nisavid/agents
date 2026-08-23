@@ -459,7 +459,7 @@ def validate_exact_drain_provider_policy(
     if (
         policy.schema_version not in {1, 2}
         or (
-            plan_schema_version in {11, 12, 13, 14}
+            plan_schema_version in {11, 12, 13, 14, 15}
             and policy.schema_version != 2
         )
         or (
@@ -5105,7 +5105,7 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
             )
-        elif schema_version in {13, 14}:
+        elif schema_version in {13, 14, 15}:
             if snapshot["schema_version"] != 8:
                 raise OperationRecoveryError(
                     "exact drain idempotent-refresh repair snapshot is required"
@@ -5240,7 +5240,7 @@ class ExactDrainClaimAdapter:
         if (
             terminal_reconciliation
             and verified.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
@@ -5249,11 +5249,11 @@ class ExactDrainClaimAdapter:
         self._clock = clock
         self._maximum_retry_delay_seconds = (
             verified["execution_window"]["maximum_retry_delay_seconds"]
-            if verified.get("schema_version") in {10, 11, 12, 13, 14}
+            if verified.get("schema_version") in {10, 11, 12, 13, 14, 15}
             else None
         )
         if verified.get("schema_version") in {
-            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
         }:
             if authorization is None:
                 raise OperationRecoveryError(
@@ -5282,34 +5282,34 @@ class ExactDrainClaimAdapter:
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
             else None
         )
         self.operation_attempt_timeout_seconds = (
             verified["operation_attempt_timeout_seconds"]
-            if verified.get("schema_version") in {11, 12, 13, 14}
+            if verified.get("schema_version") in {11, 12, 13, 14, 15}
             else None
         )
         self.phase_one_nested_stage_prefixes = (
             tuple(verified["phase_one_nested_stage_prefixes"])
-            if verified.get("schema_version") in {11, 12, 13, 14}
+            if verified.get("schema_version") in {11, 12, 13, 14, 15}
             else ()
         )
         self.operation_attempt_timeout_disposition = (
             verified["operation_attempt_timeout_disposition"]
-            if verified.get("schema_version") in {12, 13, 14}
+            if verified.get("schema_version") in {12, 13, 14, 15}
             else "worker-fail-stop"
         )
         self._cleanup_deadline: float | None = None
         self._terminal_reconciliation_deadline: float | None = None
         self._plan = verified
-        if verified.get("schema_version") == 14:
+        if verified.get("checkpoint_continuation_handoff") is not None:
             verify_checkpoint_continuation_handoff(
                 verified["checkpoint_continuation_handoff"],
                 now=int(self._clock()),
@@ -5907,7 +5907,7 @@ class ExactDrainClaimAdapter:
         against the durable documents and memory_units tables.  No protected
         text or identifiers leave PostgreSQL.
         """
-        if self._plan.get("schema_version") != 14:
+        if self._plan.get("checkpoint_continuation_handoff") is None:
             return
         handoff = self._plan.get("checkpoint_continuation_handoff")
         if not isinstance(handoff, Mapping):
@@ -6237,7 +6237,7 @@ class ExactDrainClaimAdapter:
                     schema="public",
                     operation_ids=list(self._selected),
                 )
-                if self._plan.get("schema_version") in {12, 13, 14}
+                if self._plan.get("schema_version") in {12, 13, 14, 15}
                 else []
             )
             selected_status_counts = {
@@ -7265,7 +7265,7 @@ async def read_exact_drain_status(
                 schema=schema,
                 operation_ids=selected_ids,
             )
-            if verified["schema_version"] in {12, 13, 14}
+            if verified["schema_version"] in {12, 13, 14, 15}
             else []
         )
         outside_rows = await connection.fetch(

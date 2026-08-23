@@ -63,15 +63,15 @@ from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa
 
 _WORKER_PROGRESS_RECORDER = None
 _WORKER_STAGE = "worker.bootstrap"
-EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 15))
+EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 16))
 DETACHED_RUNTIME_SCHEMA_VERSIONS = EXECUTION_LEASE_SCHEMA_VERSIONS
-UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS = frozenset(range(9, 15))
+UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS = frozenset(range(9, 16))
 
 
 def _record_worker_stage(recorder, *, status: str, stage: str) -> None:
     global _WORKER_STAGE
     _WORKER_STAGE = stage
-    if getattr(recorder, "progress_schema_version", None) in {3, 4, 5}:
+    if getattr(recorder, "progress_schema_version", None) in {3, 4, 5, 6}:
         recorder.worker_stage(status=status, stage=stage)
 
 
@@ -540,7 +540,7 @@ def run() -> int:
             progress_schema_version=progress_schema_version,
         )
         failure_stage = getattr(recorder, "_worker_stage", _WORKER_STAGE)
-        if getattr(recorder, "progress_schema_version", None) in {3, 4, 5}:
+        if getattr(recorder, "progress_schema_version", None) in {3, 4, 5, 6}:
             try:
                 if getattr(recorder, "_worker_status", None) != "failed":
                     recorder.worker_failure(exit_code=2, failure=failure)

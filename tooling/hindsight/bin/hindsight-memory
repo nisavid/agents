@@ -178,8 +178,14 @@ from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     OperationRecoveryError,
+    activate_exact_drain_authorization_grant,
+    claim_exact_drain_grant,
+    close_exact_drain_grant_claim,
     create_claim_release_plan,
     create_cohort_manifest,
+    create_exact_drain_authorization_grant_plan,
+    create_exact_drain_grant_authorization_receipt,
+    create_exact_drain_grant_ledger,
     create_exact_drain_plan,
     create_global_queue_blocker_classification,
     create_hatchery_capability_receipt,
@@ -189,10 +195,13 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     exact_drain_execution_deadline,
     exact_drain_execution_window_seconds,
     normalize_pg0_binding,
+    revoke_exact_drain_grant,
     verify_checkpoint_continuation_handoff,
     verify_claim_release_plan,
     verify_cohort_manifest,
+    verify_exact_drain_authorization_grant_plan,
     verify_exact_drain_authorization_receipt,
+    verify_exact_drain_grant_ledger,
     verify_exact_drain_plan,
     verify_exact_drain_status,
     verify_global_queue_blocker_classification,
@@ -8662,7 +8671,7 @@ def _operation_recovery_exact_phase_repair_snapshot(
     schema_version: int = 12,
 ) -> str:
     snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
-    expected_snapshot_schema = 8 if schema_version in {13, 14} else 7
+    expected_snapshot_schema = 8 if schema_version in {13, 14, 15} else 7
     if snapshot.get("schema_version") != expected_snapshot_schema:
         raise OperationRecoveryError(
             "exact drain full-query repair snapshot is required"
@@ -8935,6 +8944,171 @@ def _operation_recovery_exact_recovery_context(
     }
 
 
+def operation_recovery_drain_grant_plan_command(
+    args: argparse.Namespace,
+) -> int:
+    reference = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(
+            args.reference_plan,
+            "exact drain grant reference plan",
+        )
+    )
+    if reference["schema_version"] not in {13, 14}:
+        raise OperationRecoveryError(
+            "exact drain grant requires a current-contract reference plan"
+        )
+    if _operation_recovery_candidate(args) != reference["candidate_release"]:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant candidate differs"
+        )
+    plan = create_exact_drain_authorization_grant_plan(
+        reference,
+        grant_id=args.grant_id,
+        maximum_recovery_epoch=args.maximum_recovery_epoch,
+        maximum_reconciliation_cycle=args.maximum_reconciliation_cycle,
+        maximum_plan_claims=args.maximum_plan_claims,
+        maximum_worker_attempts=args.maximum_worker_attempts,
+        maximum_execution_seconds=args.maximum_execution_seconds,
+        maximum_concurrent_drains=args.maximum_concurrent_drains,
+        expires_at=args.expires_at,
+    )
+    output = Path(args.output)
+    write_private(output, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "grant_id": plan["grant_id"],
+            "grant_plan_digest": plan["grant_plan_digest"],
+            "expires_at": plan["expires_at"],
+            "output": str(output.resolve()),
+        }
+    )
+
+
+def operation_recovery_drain_grant_approve_command(
+    args: argparse.Namespace,
+) -> int:
+    plan = verify_exact_drain_authorization_grant_plan(
+        _operation_recovery_read_private_json(
+            args.plan,
+            "exact drain authorization grant plan",
+        )
+    )
+    if (
+        _operation_recovery_candidate(args)
+        != plan["reference_plan"]["candidate_release"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant candidate differs"
+        )
+    grant = activate_exact_drain_authorization_grant(
+        plan,
+        approval_digest=args.approval_digest,
+    )
+    manager = _portable_manager(args)
+    ledger_path = _operation_recovery_exact_grant_ledger_path(manager)
+    with _operation_recovery_lock(manager):
+        with manager._lock():
+            if ledger_path.exists():
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain grant ledger already exists"
+                )
+            ledger = create_exact_drain_grant_ledger(
+                grant,
+                ledger_nonce=secrets.token_hex(32),
+            )
+            write_private(ledger_path, ledger, create_only=True)
+    return _print_result(
+        {
+            "status": "approved",
+            "grant_id": grant["grant_id"],
+            "grant_digest": grant["grant_digest"],
+            "expires_at": grant["expires_at"],
+            "ledger": str(ledger_path.resolve()),
+        }
+    )
+
+
+def operation_recovery_drain_grant_status_command(
+    args: argparse.Namespace,
+) -> int:
+    manager = _portable_manager(args)
+    with _operation_recovery_lock(manager):
+        with manager._lock():
+            ledger = verify_exact_drain_grant_ledger(
+                _operation_recovery_read_private_json(
+                    _operation_recovery_exact_grant_ledger_path(manager),
+                    "exact drain authorization grant ledger",
+                ),
+                allow_expired=True,
+            )
+    claims = [
+        record
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-claim"
+    ]
+    closes = [
+        record
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-close"
+    ]
+    return _print_result(
+        {
+            "status": (
+                "revoked"
+                if ledger["revocation"] is not None
+                else (
+                    "expired"
+                    if int(time.time()) >= ledger["grant"]["expires_at"]
+                    else "active"
+                )
+            ),
+            "grant_id": ledger["grant_id"],
+            "grant_digest": ledger["grant_digest"],
+            "ledger_digest": ledger["ledger_digest"],
+            "claim_count": len(claims),
+            "closed_count": len(closes),
+            "expires_at": ledger["grant"]["expires_at"],
+        }
+    )
+
+
+def operation_recovery_drain_grant_revoke_command(
+    args: argparse.Namespace,
+) -> int:
+    manager = _portable_manager(args)
+    ledger_path = _operation_recovery_exact_grant_ledger_path(manager)
+    with _operation_recovery_lock(manager):
+        with manager._lock():
+            ledger = verify_exact_drain_grant_ledger(
+                _operation_recovery_read_private_json(
+                    ledger_path,
+                    "exact drain authorization grant ledger",
+                ),
+                allow_expired=True,
+            )
+            updated, revocation = revoke_exact_drain_grant(
+                ledger,
+                approval_digest=args.approval_digest,
+                expected_ledger_digest=ledger["ledger_digest"],
+                revocation_nonce=secrets.token_hex(32),
+                ledger_nonce=secrets.token_hex(32),
+            )
+            if updated["ledger_digest"] != ledger["ledger_digest"]:
+                write_private(ledger_path, updated)
+    return _print_result(
+        {
+            "status": "revoked",
+            "grant_id": updated["grant_id"],
+            "grant_digest": updated["grant_digest"],
+            "ledger_digest": updated["ledger_digest"],
+            "revocation_record_digest": revocation["record_digest"],
+        }
+    )
+
+
 def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     candidate_before = _operation_recovery_candidate(args)
     cohort = verify_cohort_manifest(
@@ -8998,7 +9172,37 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
             == "post-terminal-reconciliation"
             else 12
         )
-    if plan_schema_version in {13, 14}:
+    authorization_grant = None
+    grant_predecessor_plan_digest = None
+    grant_ledger_digest = None
+    grant_manager = None
+    grant_ledger_path = None
+    if getattr(args, "config", None) is not None:
+        grant_manager = _portable_manager(args)
+        grant_ledger_path = _operation_recovery_exact_grant_ledger_path(
+            grant_manager
+        )
+        if grant_ledger_path.exists():
+            grant_ledger = _operation_recovery_exact_grant_ledger(
+                grant_manager
+            )
+            authorization_grant = grant_ledger["grant"]
+            grant_ledger_digest = grant_ledger["ledger_digest"]
+            grant_claims = [
+                record
+                for record in grant_ledger["use_records"]
+                if record["kind"]
+                == "operation-recovery-exact-drain-authorization-grant-claim"
+            ]
+            grant_predecessor_plan_digest = (
+                grant_claims[-1]["plan_digest"]
+                if grant_claims
+                else authorization_grant["scope"][
+                    "initial_reference_plan_digest"
+                ]
+            )
+            plan_schema_version = 15
+    if plan_schema_version in {13, 14, 15}:
         _operation_recovery_exact_phase_repair_snapshot(
             schema_version=plan_schema_version
         )
@@ -9017,7 +9221,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         provider_policy,
         _operation_recovery_profile_environment(),
     )
-    if plan_schema_version in {13, 14}:
+    if plan_schema_version in {13, 14, 15}:
         _operation_recovery_validate_exact_provider_policy(
             provider_policy,
             schema_version=plan_schema_version,
@@ -9031,11 +9235,16 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
             provider_policy,
             provider_policy_digest=provider_policy_digest,
         )
-        if plan_schema_version in {13, 14}
+        if plan_schema_version in {13, 14, 15}
         else None
     )
 
     def authenticated_recovery_source_paths() -> tuple[str, ...]:
+        grant_sources = (
+            ()
+            if grant_ledger_path is None
+            else (str(grant_ledger_path),)
+        )
         if checkpoint_continuation_handoff_path is not None:
             current_handoff = verify_checkpoint_continuation_handoff(
                 _operation_recovery_read_private_json(
@@ -9048,9 +9257,12 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
                 raise OperationRecoveryError(
                     "operation-recovery checkpoint continuation handoff differs"
                 )
-            return (str(checkpoint_continuation_handoff_path),)
+            return (
+                str(checkpoint_continuation_handoff_path),
+                *grant_sources,
+            )
         if recovery_plan_path is None:
-            return ()
+            return grant_sources
         recovery_plan = verify_post_abort_recovery_plan(
             _operation_recovery_read_private_json(
                 recovery_plan_path,
@@ -9093,7 +9305,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
                 reference_plan["worker_max_attempts"] + 1,
             )
         )
-        return tuple(source_values)
+        return (*source_values, *grant_sources)
 
     def normalized_path(value: str | Path) -> str:
         return unicodedata.normalize(
@@ -9154,6 +9366,8 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         recovery_context=recovery_context,
         hatchery_capability_receipt=hatchery_capability_receipt,
         checkpoint_continuation_handoff=checkpoint_continuation_handoff,
+        authorization_grant=authorization_grant,
+        grant_predecessor_plan_digest=grant_predecessor_plan_digest,
         schema_version=plan_schema_version,
     )
     normalized_output = normalized_path(output_path)
@@ -9213,6 +9427,16 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         raise OperationRecoveryError(
             "operation-recovery candidate drifted during exact drain planning"
         )
+    if grant_ledger_digest is not None:
+        if grant_manager is None:
+            raise AssertionError("exact drain grant manager is unavailable")
+        current_ledger = _operation_recovery_exact_grant_ledger(
+            grant_manager
+        )
+        if current_ledger["ledger_digest"] != grant_ledger_digest:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain grant ledger drifted during planning"
+            )
     result = {
         "status": "planned",
         "authority": plan["authority"],
@@ -9281,6 +9505,32 @@ def _operation_recovery_exact_receipt(
     return {**body, "receipt_digest": digest(body)}
 
 
+def _operation_recovery_exact_grant_projection(
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    if plan.get("schema_version") != 15:
+        return {}
+    projection = {
+        "grant_id": plan["grant_id"],
+        "grant_digest": plan["grant_digest"],
+    }
+    if authorization is not None and any(
+        authorization.get(key) != value
+        for key, value in projection.items()
+    ):
+        raise OperationRecoveryError(
+            "exact drain authorization grant chain differs"
+        )
+    return projection
+
+
+def _operation_recovery_exact_artifact_schema(
+    plan: Mapping[str, Any],
+) -> int:
+    return 2 if plan.get("schema_version") == 15 else 1
+
+
 def _operation_recovery_exact_application(
     value: Any,
     *,
@@ -9310,12 +9560,17 @@ def _operation_recovery_exact_application(
         "completed_at",
         "receipt_digest",
     }
+    grant_projection = _operation_recovery_exact_grant_projection(
+        plan,
+        authorization,
+    )
+    required.update(grant_projection)
     if set(value) != required:
         raise OperationRecoveryError("exact drain application receipt is invalid")
     body = {key: value[key] for key in required if key != "receipt_digest"}
     expected_journal_digest = digest(
         {
-            "schema_version": 1,
+            "schema_version": _operation_recovery_exact_artifact_schema(plan),
             "kind": "operation-recovery-exact-drain-application-journal",
             "plan_digest": plan["plan_digest"],
             "authorization_receipt_digest": authorization[
@@ -9325,10 +9580,12 @@ def _operation_recovery_exact_application(
             "worker_pid": value["worker_pid"],
             "worker_start_time": value["worker_start_time"],
             "worker_attempt": value["worker_attempt"],
+            **grant_projection,
         }
     )
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version")
+        != _operation_recovery_exact_artifact_schema(plan)
         or value.get("kind") != "operation-recovery-exact-drain-application-receipt"
         or value.get("plan_digest") != plan["plan_digest"]
         or value.get("candidate_release") != plan["candidate_release"]
@@ -9341,6 +9598,7 @@ def _operation_recovery_exact_application(
         != expected_journal_digest
         or value.get("worker_runtime_digest") != plan["worker_runtime_digest"]
         or value.get("provider_policy_digest") != plan["provider_policy_digest"]
+        or any(value.get(key) != item for key, item in grant_projection.items())
         or value.get("terminal_status_digest")
         != terminal_status["status_digest"]
         or not isinstance(value.get("terminal_progress_digest"), str)
@@ -9371,6 +9629,10 @@ def _operation_recovery_exact_application(
         or value.get("started_at") != authorization["authorized_at"]
         or type(value.get("completed_at")) is not int
         or value.get("completed_at") < value.get("started_at")
+        or (
+            plan.get("schema_version") == 15
+            and value.get("completed_at") >= authorization["expires_at"]
+        )
         or value.get("receipt_digest") != digest(body)
     ):
         raise OperationRecoveryError("exact drain application receipt is invalid")
@@ -9419,9 +9681,14 @@ def _operation_recovery_terminal_application_evidence(
         terminal_status["observed_at"],
         progress["observed_at"],
     )
+    if (
+        plan.get("schema_version") == 15
+        and completed_at >= authorization["expires_at"]
+    ):
+        raise OperationRecoveryError("exact drain execution lease expired")
     derived = _operation_recovery_exact_receipt(
         {
-            "schema_version": 1,
+            "schema_version": _operation_recovery_exact_artifact_schema(plan),
             "kind": "operation-recovery-exact-drain-application-receipt",
             "plan_digest": plan["plan_digest"],
             "candidate_release": plan["candidate_release"],
@@ -9444,6 +9711,10 @@ def _operation_recovery_terminal_application_evidence(
             "worker_attempt": journal["worker_attempt"],
             "started_at": journal["started_at"],
             "completed_at": completed_at,
+            **_operation_recovery_exact_grant_projection(
+                plan,
+                authorization,
+            ),
         }
     )
     return _operation_recovery_exact_application(
@@ -9454,16 +9725,142 @@ def _operation_recovery_terminal_application_evidence(
     )
 
 
+def _operation_recovery_exact_grant_ledger_path(
+    manager: PortableInstallationManager,
+) -> Path:
+    return (
+        manager.config.state_root
+        / "operation-recovery"
+        / "exact-drain-grant-ledger.json"
+    )
+
+
+def _operation_recovery_exact_grant_ledger(
+    manager: PortableInstallationManager,
+    *,
+    allow_inactive: bool = False,
+) -> Mapping[str, Any]:
+    path = _operation_recovery_exact_grant_ledger_path(manager)
+    ledger = verify_exact_drain_grant_ledger(
+        _operation_recovery_read_private_json(
+            path,
+            "exact drain authorization grant ledger",
+        ),
+        allow_expired=allow_inactive,
+    )
+    if not allow_inactive and ledger["revocation"] is not None:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization grant revoked"
+        )
+    return ledger
+
+
 def _operation_recovery_exact_authorization(
     plan: Mapping[str, Any],
+    *,
+    manager: PortableInstallationManager | None = None,
+    require_active_grant: bool = True,
 ) -> Mapping[str, Any]:
-    return verify_exact_drain_authorization_receipt(
+    authorization = verify_exact_drain_authorization_receipt(
         _operation_recovery_read_private_json(
             plan["authorization_receipt_path"],
             "exact drain authorization receipt",
         ),
         plan=plan,
     )
+    if plan.get("schema_version") != 15:
+        return authorization
+    if manager is None:
+        raise OperationRecoveryError(
+            "exact drain grant ledger authority is unavailable"
+        )
+    ledger = _operation_recovery_exact_grant_ledger(
+        manager,
+        allow_inactive=not require_active_grant,
+    )
+    if (
+        ledger["grant_id"] != plan["grant_id"]
+        or ledger["grant_digest"] != plan["grant_digest"]
+        or ledger["grant"] != plan["authorization_grant"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant scope differs"
+        )
+    matching_claims = [
+        record
+        for record in ledger["use_records"]
+        if record["kind"]
+        == "operation-recovery-exact-drain-authorization-grant-claim"
+        and record["plan_digest"] == plan["plan_digest"]
+    ]
+    if (
+        len(matching_claims) != 1
+        or matching_claims[0] != authorization["grant_use_record"]
+        or matching_claims[0]["record_digest"]
+        != authorization["grant_use_record_digest"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant claim differs"
+        )
+    return authorization
+
+
+def _operation_recovery_claim_exact_grant(
+    manager: PortableInstallationManager,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    ledger_path = _operation_recovery_exact_grant_ledger_path(manager)
+    ledger = _operation_recovery_exact_grant_ledger(manager)
+    if (
+        ledger["grant_id"] != plan["grant_id"]
+        or ledger["grant_digest"] != plan["grant_digest"]
+        or ledger["grant"] != plan["authorization_grant"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain grant scope differs"
+        )
+    updated, use_record = claim_exact_drain_grant(
+        ledger,
+        plan,
+        expected_ledger_digest=ledger["ledger_digest"],
+        claim_nonce=secrets.token_hex(32),
+        ledger_nonce=secrets.token_hex(32),
+    )
+    if updated["ledger_digest"] != ledger["ledger_digest"]:
+        write_private(ledger_path, updated)
+    authorization = create_exact_drain_grant_authorization_receipt(
+        plan,
+        use_record,
+    )
+    write_private(
+        plan["authorization_receipt_path"],
+        authorization,
+        create_only=True,
+    )
+    return authorization
+
+
+def _operation_recovery_close_exact_grant(
+    manager: PortableInstallationManager,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> None:
+    if plan.get("schema_version") != 15:
+        return
+    ledger_path = _operation_recovery_exact_grant_ledger_path(manager)
+    ledger = _operation_recovery_exact_grant_ledger(manager)
+    updated, _close = close_exact_drain_grant_claim(
+        ledger,
+        plan_digest=plan["plan_digest"],
+        claim_record_digest=authorization["grant_use_record_digest"],
+        application_receipt_digest=application["receipt_digest"],
+        expected_ledger_digest=ledger["ledger_digest"],
+        close_nonce=secrets.token_hex(32),
+        ledger_nonce=secrets.token_hex(32),
+    )
+    if updated["ledger_digest"] != ledger["ledger_digest"]:
+        write_private(ledger_path, updated)
 
 
 def _operation_recovery_exact_journal(
@@ -9485,16 +9882,23 @@ def _operation_recovery_exact_journal(
         "worker_attempt",
         "receipt_digest",
     }
+    grant_projection = _operation_recovery_exact_grant_projection(
+        plan,
+        authorization,
+    )
+    required.update(grant_projection)
     if set(value) != required:
         raise OperationRecoveryError("exact drain application journal is invalid")
     body = {key: value[key] for key in required if key != "receipt_digest"}
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version")
+        != _operation_recovery_exact_artifact_schema(plan)
         or value.get("kind")
         != "operation-recovery-exact-drain-application-journal"
         or value.get("plan_digest") != plan["plan_digest"]
         or value.get("authorization_receipt_digest")
         != authorization["receipt_digest"]
+        or any(value.get(key) != item for key, item in grant_projection.items())
         or value.get("started_at") != authorization["authorized_at"]
         or type(value.get("worker_pid")) is not int
         or not 1 <= value["worker_pid"] <= MAX_SIGNAL_PID
@@ -9527,7 +9931,15 @@ def _operation_recovery_exact_journal_worker_active(
 def _operation_recovery_post_abort_reference_artifacts(
     reference_plan: Mapping[str, Any],
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    authorization = _operation_recovery_exact_authorization(reference_plan)
+    # Post-abort is separately approved. Its reference receipt is historical
+    # evidence only and must not turn a live grant into post-abort authority.
+    authorization = verify_exact_drain_authorization_receipt(
+        _operation_recovery_read_private_json(
+            reference_plan["authorization_receipt_path"],
+            "reference exact drain authorization receipt",
+        ),
+        plan=reference_plan,
+    )
     journal = _operation_recovery_exact_journal(
         _operation_recovery_read_private_json(
             reference_plan["application_receipt_path"],
@@ -9676,7 +10088,7 @@ def _operation_recovery_exact_execution_lease_projection(
     now: int | None = None,
 ) -> Mapping[str, Any]:
     if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
     }:
         return {}
     window_seconds = exact_drain_execution_window_seconds(plan)
@@ -9692,7 +10104,9 @@ def _operation_recovery_exact_execution_lease_projection(
             "execution_lease_remaining_seconds": None,
         }
     started_at = authorization["authorized_at"]
-    expires_at = started_at + window_seconds
+    expires_at = exact_drain_execution_deadline(plan, authorization)
+    if expires_at is None:
+        return {}
     return {
         "expires_at": plan["expires_at"],
         "execution_lease_status": (
@@ -9704,7 +10118,7 @@ def _operation_recovery_exact_execution_lease_projection(
     }
 
 
-EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 15))
+EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 16))
 
 
 def _operation_recovery_assert_exact_execution_lease(
@@ -9716,7 +10130,7 @@ def _operation_recovery_assert_exact_execution_lease(
     if plan.get("schema_version") not in EXECUTION_LEASE_SCHEMA_VERSIONS:
         return None
     observed_at = int(time.time()) if now is None else now
-    if plan.get("schema_version") == 14:
+    if plan.get("checkpoint_continuation_handoff") is not None:
         verify_checkpoint_continuation_handoff(
             plan["checkpoint_continuation_handoff"],
             now=observed_at,
@@ -9741,7 +10155,11 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
     with _operation_recovery_lock(manager):
         with manager._lock():
             authorization = (
-                _operation_recovery_exact_authorization(plan)
+                _operation_recovery_exact_authorization(
+                    plan,
+                    manager=manager,
+                    require_active_grant=False,
+                )
                 if plan.get("schema_version")
                 in EXECUTION_LEASE_SCHEMA_VERSIONS
                 and Path(plan["authorization_receipt_path"]).exists()
@@ -9791,7 +10209,9 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 ):
                     if authorization is None:
                         authorization = _operation_recovery_exact_authorization(
-                            plan
+                            plan,
+                            manager=manager,
+                            require_active_grant=False,
                         )
                     journal = _operation_recovery_exact_journal(
                         application_value,
@@ -9809,7 +10229,9 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 else:
                     if authorization is None:
                         authorization = _operation_recovery_exact_authorization(
-                            plan
+                            plan,
+                            manager=manager,
+                            require_active_grant=False,
                         )
                     terminal_status = verify_exact_drain_status(
                         _operation_recovery_read_private_json(
@@ -10163,7 +10585,7 @@ def _operation_recovery_exact_progress_closed_lease_expiry(
 ) -> bool:
     """Authenticate a child-closed execution-window failure."""
     if (
-        plan.get("progress_schema_version") not in {3, 4, 5}
+        plan.get("progress_schema_version") not in {3, 4, 5, 6}
         or not Path(plan["progress_artifact_path"]).is_file()
     ):
         return False
@@ -10212,9 +10634,15 @@ def _operation_recovery_finalize_exact_application(
         terminal=terminal,
     )
     write_private(plan["status_artifact_path"], terminal)
+    completed_at = int(time.time())
+    if (
+        plan.get("schema_version") == 15
+        and completed_at >= authorization["expires_at"]
+    ):
+        raise OperationRecoveryError("exact drain execution lease expired")
     application = _operation_recovery_exact_receipt(
         {
-            "schema_version": 1,
+            "schema_version": _operation_recovery_exact_artifact_schema(plan),
             "kind": "operation-recovery-exact-drain-application-receipt",
             "plan_digest": plan["plan_digest"],
             "candidate_release": candidate,
@@ -10234,7 +10662,11 @@ def _operation_recovery_finalize_exact_application(
             "worker_start_time": journal["worker_start_time"],
             "worker_attempt": journal["worker_attempt"],
             "started_at": journal["started_at"],
-            "completed_at": int(time.time()),
+            "completed_at": completed_at,
+            **_operation_recovery_exact_grant_projection(
+                plan,
+                authorization,
+            ),
         }
     )
     write_private(plan["application_receipt_path"], application)
@@ -10247,9 +10679,17 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
         _operation_recovery_read_private_json(args.plan, "exact drain plan"),
         allow_expired=True,
     )
-    if (
-        not hmac.compare_digest(args.approval_digest, plan["plan_digest"])
-        or candidate != plan["candidate_release"]
+    approval_digest = getattr(args, "approval_digest", None)
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError("exact drain approval differs")
+    if plan["schema_version"] == 15:
+        if approval_digest is not None:
+            raise OperationRecoveryError(
+                "schema-15 exact drain uses its standing grant"
+            )
+    elif (
+        not isinstance(approval_digest, str)
+        or not hmac.compare_digest(approval_digest, plan["plan_digest"])
     ):
         raise OperationRecoveryError("exact drain approval differs")
     authorization_path = Path(plan["authorization_receipt_path"])
@@ -10259,6 +10699,16 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
     manager = _portable_manager(args)
     with _operation_recovery_lock(manager):
         with manager._lock():
+            if plan["schema_version"] == 15:
+                ledger = _operation_recovery_exact_grant_ledger(manager)
+                if (
+                    ledger["grant_id"] != plan["grant_id"]
+                    or ledger["grant_digest"] != plan["grant_digest"]
+                    or ledger["grant"] != plan["authorization_grant"]
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain grant scope differs"
+                    )
             application_value = (
                 _operation_recovery_read_private_json(
                     application_path,
@@ -10276,7 +10726,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 application_value is None and authorization_path.exists()
             )
             if application_value is not None and not journal_resume:
-                authorization = _operation_recovery_exact_authorization(plan)
+                authorization = _operation_recovery_exact_authorization(
+                    plan,
+                    manager=manager,
+                )
                 terminal_status = verify_exact_drain_status(
                     _operation_recovery_read_private_json(
                         plan["status_artifact_path"],
@@ -10289,6 +10742,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     plan=plan,
                     authorization=authorization,
                     terminal_status=terminal_status,
+                )
+                _operation_recovery_close_exact_grant(
+                    manager,
+                    plan,
+                    authorization,
+                    application,
                 )
                 return _print_result(
                     {
@@ -10306,7 +10765,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     }
                 )
             if journal_resume:
-                authorization = _operation_recovery_exact_authorization(plan)
+                authorization = _operation_recovery_exact_authorization(
+                    plan,
+                    manager=manager,
+                )
                 journal = _operation_recovery_exact_journal(
                     application_value,
                     plan=plan,
@@ -10323,7 +10785,8 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                             "exact drain receipt state is incomplete"
                         )
                     authorization = _operation_recovery_exact_authorization(
-                        plan
+                        plan,
+                        manager=manager,
                     )
                 else:
                     verify_exact_drain_plan(plan)
@@ -10365,9 +10828,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 journal_resume
                 and _operation_recovery_exact_status_is_terminal(before)
             )
-            if terminal_reconciliation and plan["schema_version"] == 14:
+            if terminal_reconciliation and (
+                plan.get("checkpoint_continuation_handoff") is not None
+            ):
                 raise OperationRecoveryError(
-                    "schema-14 interrupted exact drain cannot resume after a terminal state"
+                    "checkpoint-continuation exact drain cannot resume after "
+                    "a terminal state"
                 )
             if (
                 journal_resume
@@ -10393,7 +10859,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         args.provider_policy
                     )
                 )
-                if plan["schema_version"] in {13, 14}:
+                if plan["schema_version"] in {13, 14, 15}:
                     _operation_recovery_validate_exact_provider_policy(
                         provider_policy,
                         schema_version=plan["schema_version"],
@@ -10415,7 +10881,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     raise OperationRecoveryError(
                         "exact drain runtime authority drifted"
                     )
-            if authorization is None:
+            if authorization is None and plan["schema_version"] == 15:
+                authorization = _operation_recovery_claim_exact_grant(
+                    manager,
+                    plan,
+                )
+            elif authorization is None:
                 authorized_at = int(time.time())
                 authorization = verify_exact_drain_authorization_receipt(
                     _operation_recovery_exact_receipt(
@@ -10466,6 +10937,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         journal=journal,
                         terminal=before,
                     )
+                    _operation_recovery_close_exact_grant(
+                        manager,
+                        plan,
+                        authorization,
+                        application,
+                    )
                     return _print_result(
                         {
                             "status": "terminal",
@@ -10499,7 +10976,9 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     )
                 journal = _operation_recovery_exact_receipt(
                     {
-                        "schema_version": 1,
+                        "schema_version": (
+                            _operation_recovery_exact_artifact_schema(plan)
+                        ),
                         "kind": (
                             "operation-recovery-exact-drain-"
                             "application-journal"
@@ -10512,6 +10991,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         "worker_pid": os.getpid(),
                         "worker_start_time": worker_start_time,
                         "worker_attempt": worker_attempt,
+                        **_operation_recovery_exact_grant_projection(
+                            plan,
+                            authorization,
+                        ),
                     }
                 )
                 write_private(plan["application_receipt_path"], journal)
@@ -10534,6 +11017,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     authorization=authorization,
                     journal=journal,
                     terminal=terminal,
+                )
+                _operation_recovery_close_exact_grant(
+                    manager,
+                    plan,
+                    authorization,
+                    application,
                 )
                 return _print_result(
                     {
@@ -10660,7 +11149,9 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     )
                 journal = _operation_recovery_exact_receipt(
                     {
-                        "schema_version": 1,
+                        "schema_version": (
+                            _operation_recovery_exact_artifact_schema(plan)
+                        ),
                         "kind": (
                             "operation-recovery-exact-drain-"
                             "application-journal"
@@ -10673,6 +11164,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         "worker_pid": process.pid,
                         "worker_start_time": worker_start_time,
                         "worker_attempt": worker_attempt,
+                        **_operation_recovery_exact_grant_projection(
+                            plan,
+                            authorization,
+                        ),
                     }
                 )
                 write_private(
@@ -10796,6 +11291,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 journal=journal,
                 terminal=terminal,
             )
+            _operation_recovery_close_exact_grant(
+                manager,
+                plan,
+                authorization,
+                application,
+            )
     return _print_result(
         {
             "status": "terminal",
@@ -10817,6 +11318,9 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
     )
     if candidate != plan["candidate_release"]:
         raise OperationRecoveryError("exact drain candidate differs")
+    manager = (
+        _portable_manager(args) if plan.get("schema_version") == 15 else None
+    )
     progress_path = Path(plan["progress_artifact_path"])
     application_path = Path(plan["application_receipt_path"])
     authorization = None
@@ -10829,7 +11333,11 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
-        authorization = _operation_recovery_exact_authorization(plan)
+        authorization = _operation_recovery_exact_authorization(
+            plan,
+            manager=manager,
+            require_active_grant=False,
+        )
     if not progress_path.exists() and not application_path.exists():
         return _print_result(
             {
@@ -10997,7 +11505,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             "progress_digest": progress["progress_digest"],
             **(
                 {}
-                if plan.get("progress_schema_version") not in {3, 4, 5}
+                if plan.get("progress_schema_version") not in {3, 4, 5, 6}
                 else {
                     "worker_status": progress["worker_status"],
                     "worker_stage": progress["worker_stage"],
@@ -11065,18 +11573,22 @@ def _operation_recovery_exact_verification(
         "verified_at",
         "receipt_digest",
     }
+    grant_projection = _operation_recovery_exact_grant_projection(plan)
+    required.update(grant_projection)
     if set(value) != required:
         raise OperationRecoveryError(
             "exact drain verification receipt is invalid"
         )
     body = {key: value[key] for key in required if key != "receipt_digest"}
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version")
+        != _operation_recovery_exact_artifact_schema(plan)
         or value.get("kind")
         != "operation-recovery-exact-drain-verification-receipt"
         or value.get("plan_digest") != plan["plan_digest"]
         or value.get("application_receipt_digest")
         != application["receipt_digest"]
+        or any(value.get(key) != item for key, item in grant_projection.items())
         or value.get("terminal_status_digest")
         != application["terminal_status_digest"]
         or value.get("terminal_progress_digest")
@@ -11109,8 +11621,15 @@ def _operation_recovery_exact_verification(
 def _operation_recovery_drain_verify_locked(
     args: argparse.Namespace,
     plan: Mapping[str, Any],
+    manager: PortableInstallationManager | None = None,
 ) -> int:
-    authorization = _operation_recovery_exact_authorization(plan)
+    if manager is None and plan.get("schema_version") == 15:
+        manager = _portable_manager(args)
+    authorization = _operation_recovery_exact_authorization(
+        plan,
+        manager=manager,
+        require_active_grant=False,
+    )
     terminal_status = verify_exact_drain_status(
         _operation_recovery_read_private_json(
             plan["status_artifact_path"],
@@ -11146,7 +11665,7 @@ def _operation_recovery_drain_verify_locked(
         )
     )
     body = {
-        "schema_version": 1,
+        "schema_version": _operation_recovery_exact_artifact_schema(plan),
         "kind": "operation-recovery-exact-drain-verification-receipt",
         "plan_digest": plan["plan_digest"],
         "application_receipt_digest": application["receipt_digest"],
@@ -11157,6 +11676,7 @@ def _operation_recovery_drain_verify_locked(
         "outside_nonterminal_counts": live["outside_nonterminal_counts"],
         "successful": successful,
         "verified_at": int(time.time()),
+        **_operation_recovery_exact_grant_projection(plan),
     }
     if not successful:
         raise OperationRecoveryError(
@@ -11230,7 +11750,7 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
     )
     reference_context = reference.get("recovery_context")
     chained_recovery = (
-        reference["schema_version"] in {10, 11, 12}
+        reference["schema_version"] in {10, 11, 12, 15}
         and isinstance(reference_context, Mapping)
         and reference_context.get("schema_version") in {1, 2, 3}
         and reference_context.get("origin") == "post-abort"
@@ -14407,6 +14927,75 @@ def parser() -> argparse.ArgumentParser:
         dest="operation_recovery_drain_command",
         required=True,
     )
+
+    recovery_drain_grant = recovery_drain_commands.add_parser("grant")
+    recovery_drain_grant_commands = recovery_drain_grant.add_subparsers(
+        dest="operation_recovery_drain_grant_command",
+        required=True,
+    )
+    recovery_drain_grant_plan = recovery_drain_grant_commands.add_parser(
+        "plan"
+    )
+    add_operation_recovery_authority(recovery_drain_grant_plan)
+    recovery_drain_grant_plan.add_argument("--reference-plan", required=True)
+    recovery_drain_grant_plan.add_argument("--grant-id", required=True)
+    recovery_drain_grant_plan.add_argument(
+        "--maximum-recovery-epoch", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument(
+        "--maximum-reconciliation-cycle", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument(
+        "--maximum-plan-claims", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument(
+        "--maximum-worker-attempts", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument(
+        "--maximum-execution-seconds", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument(
+        "--maximum-concurrent-drains", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument(
+        "--expires-at", required=True, type=int
+    )
+    recovery_drain_grant_plan.add_argument("--output", required=True)
+    recovery_drain_grant_plan.set_defaults(
+        run=operation_recovery_drain_grant_plan_command
+    )
+
+    recovery_drain_grant_approve = recovery_drain_grant_commands.add_parser(
+        "approve"
+    )
+    add_operation_recovery_authority(recovery_drain_grant_approve)
+    recovery_drain_grant_approve.add_argument("--plan", required=True)
+    recovery_drain_grant_approve.add_argument(
+        "--approval-digest", required=True
+    )
+    recovery_drain_grant_approve.set_defaults(
+        run=operation_recovery_drain_grant_approve_command
+    )
+
+    recovery_drain_grant_status = recovery_drain_grant_commands.add_parser(
+        "status"
+    )
+    recovery_drain_grant_status.add_argument("--config", required=True)
+    recovery_drain_grant_status.set_defaults(
+        run=operation_recovery_drain_grant_status_command
+    )
+
+    recovery_drain_grant_revoke = recovery_drain_grant_commands.add_parser(
+        "revoke"
+    )
+    recovery_drain_grant_revoke.add_argument("--config", required=True)
+    recovery_drain_grant_revoke.add_argument(
+        "--approval-digest", required=True
+    )
+    recovery_drain_grant_revoke.set_defaults(
+        run=operation_recovery_drain_grant_revoke_command
+    )
+
     recovery_drain_plan = recovery_drain_commands.add_parser("plan")
     add_operation_recovery_authority(recovery_drain_plan)
     recovery_drain_plan.add_argument("--cohort", required=True)
@@ -14435,7 +15024,7 @@ def parser() -> argparse.ArgumentParser:
     recovery_drain_apply = recovery_drain_commands.add_parser("apply")
     add_operation_recovery_authority(recovery_drain_apply)
     recovery_drain_apply.add_argument("--plan", required=True)
-    recovery_drain_apply.add_argument("--approval-digest", required=True)
+    recovery_drain_apply.add_argument("--approval-digest")
     recovery_drain_apply.add_argument("--provider-policy", required=True)
     recovery_drain_apply.add_argument("--provider-runtime-root", required=True)
     recovery_drain_apply.add_argument("--worker-runtime", required=True)

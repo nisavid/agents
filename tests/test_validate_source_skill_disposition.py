@@ -18,10 +18,15 @@ SCRIPT = REPO_ROOT / "scripts" / "validate_source_skill_disposition.py"
 WORKFLOW = REPO_ROOT / ".github/workflows/source-skill-disposition.yml"
 LINEAGE_ROOT = Path("release/source-skill-lineage")
 DISPOSITION_ROOT = Path("release/source-skill-disposition")
+SOURCE_MANIFEST = LINEAGE_ROOT / "source-manifest.json"
+CONTRIBUTION_LEDGER = LINEAGE_ROOT / "contribution-ledger.json"
 LEDGER = DISPOSITION_ROOT / "disposition-ledger.json"
 REFRESH = DISPOSITION_ROOT / "release-refresh-contract.json"
 FINAL_RESCOUT_SCHEMA = (
     DISPOSITION_ROOT / "final-installed-library-rescout.schema.json"
+)
+FINAL_RESCOUT = (
+    LINEAGE_ROOT / "installed-hosts" / "final-candidate-rescout-v1.json"
 )
 
 
@@ -49,6 +54,23 @@ class SourceSkillDispositionWorkflowTests(unittest.TestCase):
                 "pull_request": None,
                 "push": {"branches": ["main"]},
             },
+        )
+
+    def test_workflow_runs_rolecasting_regressions(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        commands = {
+            line.strip()
+            for step in workflow["jobs"]["validate"]["steps"]
+            for line in step.get("run", "").splitlines()
+            if line.strip()
+        }
+
+        self.assertTrue(
+            {
+                "python scripts/validate_rolecasting.py .",
+                "python -m unittest tests.test_validate_rolecasting tests.test_rolecasting_eval_corpus",
+            }
+            <= commands
         )
 
 
@@ -97,9 +119,15 @@ class SourceSkillDispositionValidatorTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
 
-    def run_validator(self) -> subprocess.CompletedProcess[str]:
+    def run_validator(
+        self, *, require_final_rescout: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = [sys.executable, str(SCRIPT)]
+        if require_final_rescout:
+            arguments.append("--require-final-rescout")
+        arguments.append(str(self.repository))
         return subprocess.run(
-            [sys.executable, str(SCRIPT), str(self.repository)],
+            arguments,
             check=False,
             capture_output=True,
             text=True,
@@ -110,9 +138,113 @@ class SourceSkillDispositionValidatorTests(unittest.TestCase):
 
     def write(self, relative: Path, value: dict[str, object]) -> None:
         value["content_sha256"] = content_sha256(value)
+        self.write_canonical(relative, value)
+
+    def write_canonical(self, relative: Path, value: dict[str, object]) -> None:
         (self.repository / relative).write_text(
             json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
         )
+
+    def raw_sha256(self, relative: Path) -> str:
+        return "sha256:" + hashlib.sha256(
+            (self.repository / relative).read_bytes()
+        ).hexdigest()
+
+    def final_rescout_artifact(self) -> dict[str, object]:
+        profile_manifests = []
+        for profile_id, observed_at_utc in (
+            ("personal", "2026-08-23T00:01:00Z"),
+            ("work", "2026-08-23T00:02:00Z"),
+        ):
+            path = LINEAGE_ROOT / "installed-hosts" / f"{profile_id}.json"
+            self.write_canonical(
+                path,
+                {
+                    "observed_at_utc": observed_at_utc,
+                    "profile_id": profile_id,
+                },
+            )
+            profile_manifests.append(
+                {
+                    "observed_at_utc": observed_at_utc,
+                    "path": path.as_posix(),
+                    "profile_id": profile_id,
+                    "sha256": self.raw_sha256(path),
+                }
+            )
+        entries = [
+            {
+                "disposition": "retain-as-is",
+                "identity_sha256": "sha256:" + "1" * 64,
+                "owner_id": "personal",
+                "profile_id": "personal",
+                "referenced_materials_sha256": "sha256:" + "2" * 64,
+                "route_id": "global-instructions",
+                "source_kind": "global-agent-instructions",
+                "surface": "global-agent-instructions",
+            },
+            {
+                "disposition": "migrate-to-plugin-equipment",
+                "identity_sha256": "sha256:" + "3" * 64,
+                "owner_id": "rolecasting",
+                "profile_id": "work",
+                "referenced_materials_sha256": "sha256:" + "4" * 64,
+                "route_id": "delegating-cross-agent-work",
+                "source_kind": "plugin-provided",
+                "surface": "plugin-provided-skills",
+            },
+        ]
+        surface_counts = {
+            "external-tool-managed-skills": 0,
+            "global-agent-instructions": 1,
+            "plugin-provided-skills": 1,
+            "recursively-referenced-additional-instructions": 0,
+            "recursively-referenced-conditional-instructions": 0,
+            "recursively-referenced-supporting-materials": 0,
+            "skills-managed-skills": 0,
+            "standalone-skills": 0,
+        }
+        value = {
+            "candidate_identity_sha256": canonical_sha256(
+                self.load(SOURCE_MANIFEST)["candidate"]
+            ),
+            "completed_at_utc": "2026-08-23T00:05:00Z",
+            "content_sha256": "",
+            "contract": "coordinated-final-installed-library-rescout-v1",
+            "contribution_ledger_sha256": self.raw_sha256(CONTRIBUTION_LEDGER),
+            "disposition_ledger_sha256": self.raw_sha256(LEDGER),
+            "disposition_set": [
+                "retain-as-is",
+                "migrate-to-plugin-equipment",
+                "migrate-to-external-personal-owner",
+                "drop-with-reason",
+            ],
+            "enumerated_profile_ids": ["personal", "work"],
+            "instruction_inventory": {
+                "contract": "complete-installed-instruction-library-v1",
+                "entries": entries,
+                "sha256": canonical_sha256(entries),
+                "surface_counts": surface_counts,
+            },
+            "profile_manifests": profile_manifests,
+            "release_refresh_contract_sha256": self.raw_sha256(REFRESH),
+            "rescout_surfaces": [
+                "external-tool-managed-skills",
+                "global-agent-instructions",
+                "plugin-provided-skills",
+                "recursively-referenced-additional-instructions",
+                "recursively-referenced-conditional-instructions",
+                "recursively-referenced-supporting-materials",
+                "skills-managed-skills",
+                "standalone-skills",
+            ],
+            "schema_version": 1,
+            "source_manifest_sha256": self.raw_sha256(SOURCE_MANIFEST),
+            "source_sync": "three-way-semantic-reconciliation-of-historical-import-current-source-and-current-plugin",
+            "started_at_utc": "2026-08-23T00:00:00Z",
+        }
+        value["content_sha256"] = content_sha256(value)
+        return value
 
     def assert_rejected(self, expected: str) -> None:
         completed = self.run_validator()
@@ -338,6 +470,203 @@ class SourceSkillDispositionValidatorTests(unittest.TestCase):
         self.assert_rejected(
             "final installed-library rescout schema binding drift"
         )
+
+    def test_final_rescout_rejects_out_of_window_observations(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["profile_manifests"][0]["observed_at_utc"] = (
+            "2026-08-22T23:59:59Z"
+        )
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout timestamp drift")
+
+    def test_final_rescout_rejects_observations_after_completion(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["profile_manifests"][0]["observed_at_utc"] = (
+            "2026-08-23T00:05:01Z"
+        )
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout timestamp drift")
+
+    def test_final_rescout_rejects_invalid_calendar_timestamps(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["completed_at_utc"] = "2026-99-23T00:05:00Z"
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout timestamp drift")
+
+    def test_final_rescout_rejects_completion_before_start(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["completed_at_utc"] = "2026-08-22T23:59:59Z"
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout timestamp drift")
+
+    def test_final_rescout_rejects_profile_inventory_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["enumerated_profile_ids"] = ["personal"]
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout profile inventory drift")
+
+    def test_final_rescout_rejects_unsorted_profile_manifests(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["profile_manifests"].reverse()
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout profile inventory drift")
+
+    def test_final_rescout_rejects_instruction_profile_coverage_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["instruction_inventory"]["entries"][1]["profile_id"] = "zwork"
+        artifact["instruction_inventory"]["sha256"] = canonical_sha256(
+            artifact["instruction_inventory"]["entries"]
+        )
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout profile inventory drift")
+
+    def test_final_rescout_rejects_instruction_inventory_order_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["instruction_inventory"]["entries"].reverse()
+        artifact["instruction_inventory"]["sha256"] = canonical_sha256(
+            artifact["instruction_inventory"]["entries"]
+        )
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected(
+            "final installed-library rescout instruction inventory drift"
+        )
+
+    def test_final_rescout_rejects_duplicate_instruction_routes(self) -> None:
+        artifact = self.final_rescout_artifact()
+        duplicate = dict(artifact["instruction_inventory"]["entries"][0])
+        duplicate["identity_sha256"] = "sha256:" + "f" * 64
+        artifact["instruction_inventory"]["entries"].append(duplicate)
+        artifact["instruction_inventory"]["sha256"] = canonical_sha256(
+            artifact["instruction_inventory"]["entries"]
+        )
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected(
+            "final installed-library rescout instruction inventory drift"
+        )
+
+    def test_final_rescout_rejects_surface_count_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["instruction_inventory"]["surface_counts"][
+            "plugin-provided-skills"
+        ] = 0
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout surface count drift")
+
+    def test_final_rescout_rejects_inventory_digest_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["instruction_inventory"]["sha256"] = "sha256:" + "f" * 64
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout inventory digest mismatch")
+
+    def test_final_rescout_rejects_content_digest_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["content_sha256"] = "sha256:" + "f" * 64
+        self.write_canonical(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout content digest mismatch")
+
+    def test_final_rescout_rejects_candidate_identity_binding_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["candidate_identity_sha256"] = "sha256:" + "f" * 64
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout candidate binding mismatch")
+
+    def test_final_rescout_rejects_input_artifact_binding_drift(self) -> None:
+        fields = (
+            "source_manifest_sha256",
+            "contribution_ledger_sha256",
+            "disposition_ledger_sha256",
+            "release_refresh_contract_sha256",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                artifact = self.final_rescout_artifact()
+                artifact[field] = "sha256:" + "f" * 64
+                self.write(FINAL_RESCOUT, artifact)
+
+                self.assert_rejected(
+                    "final installed-library rescout input binding mismatch"
+                )
+
+    def test_final_rescout_rejects_profile_manifest_binding_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        artifact["profile_manifests"][0]["sha256"] = "sha256:" + "f" * 64
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected(
+            "final installed-library rescout profile manifest binding mismatch"
+        )
+
+    def test_final_rescout_rejects_missing_profile_manifest(self) -> None:
+        artifact = self.final_rescout_artifact()
+        (self.repository / artifact["profile_manifests"][0]["path"]).unlink()
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected("final installed-library rescout profile manifest is missing")
+
+    def test_final_rescout_rejects_profile_manifest_identity_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        path = Path(artifact["profile_manifests"][0]["path"])
+        self.write_canonical(
+            path,
+            {
+                "observed_at_utc": artifact["profile_manifests"][0]["observed_at_utc"],
+                "profile_id": "other",
+            },
+        )
+        artifact["profile_manifests"][0]["sha256"] = self.raw_sha256(path)
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected(
+            "final installed-library rescout profile manifest binding mismatch"
+        )
+
+    def test_final_rescout_rejects_profile_manifest_observation_drift(self) -> None:
+        artifact = self.final_rescout_artifact()
+        path = Path(artifact["profile_manifests"][0]["path"])
+        self.write_canonical(
+            path,
+            {
+                "observed_at_utc": "2026-08-23T00:03:00Z",
+                "profile_id": artifact["profile_manifests"][0]["profile_id"],
+            },
+        )
+        artifact["profile_manifests"][0]["sha256"] = self.raw_sha256(path)
+        self.write(FINAL_RESCOUT, artifact)
+
+        self.assert_rejected(
+            "final installed-library rescout profile manifest binding mismatch"
+        )
+
+    def test_final_refresh_mode_requires_the_rescout_artifact(self) -> None:
+        completed = self.run_validator(require_final_rescout=True)
+
+        self.assertEqual(completed.returncode, 1, completed)
+        self.assertEqual(
+            completed.stderr,
+            "source-skill-disposition: final installed-library rescout artifact is required\n",
+        )
+
+    def test_final_refresh_mode_accepts_a_valid_rescout_artifact(self) -> None:
+        self.write(FINAL_RESCOUT, self.final_rescout_artifact())
+
+        completed = self.run_validator(require_final_rescout=True)
+
+        self.assertEqual(completed.returncode, 0, completed)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(completed.stdout, "source-skill-disposition-valid\n")
 
     def test_final_rescout_rejects_a_drop_without_a_rationale(self) -> None:
         schema = self.load(FINAL_RESCOUT_SCHEMA)

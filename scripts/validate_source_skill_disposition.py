@@ -8,6 +8,7 @@ import json
 import posixpath
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -93,7 +94,17 @@ FINAL_RESCOUT_ARTIFACT = {
         "path": FINAL_RESCOUT_SCHEMA.as_posix(),
         "sha256": "sha256:c1a1432331130d2c7504279cba44d841d14bc4535e6ca5fab557d3b1b066f592",
     },
+    "validation_command": "uv run --with jsonschema==4.26.0 python scripts/validate_source_skill_disposition.py --require-final-rescout .",
 }
+FINAL_RESCOUT_INVARIANTS = [
+    "started_at_utc <= profile_manifests[].observed_at_utc <= completed_at_utc",
+    "started_at_utc <= completed_at_utc",
+    "enumerated_profile_ids == sorted(profile_manifests[].profile_id)",
+    "enumerated_profile_ids == sorted(unique(instruction_inventory.entries[].profile_id))",
+    "instruction_inventory.surface_counts == counts(instruction_inventory.entries[].surface)",
+    "instruction_inventory.sha256 == canonical_json_sha256(instruction_inventory.entries)",
+    "content_sha256 == canonical_json_sha256(document excluding content_sha256)",
+]
 DISTRIBUTION_IDENTITIES = [
     {
         "id": "artifact-customs",
@@ -416,6 +427,10 @@ def content_sha256(value: dict[str, object]) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
 
 
+def raw_sha256(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def canonical_document(value: object) -> bytes:
     return (
         json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
@@ -466,6 +481,123 @@ def read_json_object(repository: Path, relative: str, label: str) -> dict[str, o
     except OSError:
         raise DispositionError(f"{label} is missing") from None
     return strict_json(raw, label)
+
+
+def utc_timestamp(value: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise DispositionError(
+            "final installed-library rescout timestamp drift"
+        ) from None
+
+
+def validate_final_rescout_artifact(
+    value: dict[str, object],
+    *,
+    repository: Path,
+    schema: dict[str, object],
+    source_manifest: dict[str, object],
+    source_raw: bytes,
+    contribution_raw: bytes,
+    disposition_raw: bytes,
+    refresh_raw: bytes,
+) -> None:
+    try:
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+    except ModuleNotFoundError:
+        raise DispositionError(
+            "jsonschema is required to validate the final installed-library rescout artifact"
+        ) from None
+
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError:
+        raise DispositionError(
+            "final installed-library rescout schema contract drift"
+        ) from None
+    require(
+        not list(Draft202012Validator(schema).iter_errors(value)),
+        "final installed-library rescout schema mismatch",
+    )
+
+    started_at = utc_timestamp(value["started_at_utc"])
+    completed_at = utc_timestamp(value["completed_at_utc"])
+    require(
+        started_at <= completed_at,
+        "final installed-library rescout timestamp drift",
+    )
+    profile_manifests = value["profile_manifests"]
+    for manifest in profile_manifests:
+        observed_at = utc_timestamp(manifest["observed_at_utc"])
+        require(
+            started_at <= observed_at <= completed_at,
+            "final installed-library rescout timestamp drift",
+        )
+
+    profile_ids = [manifest["profile_id"] for manifest in profile_manifests]
+    enumerated_profile_ids = value["enumerated_profile_ids"]
+    require(
+        profile_ids == sorted(set(profile_ids))
+        and enumerated_profile_ids == profile_ids,
+        "final installed-library rescout profile inventory drift",
+    )
+
+    inventory = value["instruction_inventory"]
+    entries = inventory["entries"]
+    entry_keys = [(entry["profile_id"], entry["route_id"]) for entry in entries]
+    require(
+        entry_keys == sorted(set(entry_keys)),
+        "final installed-library rescout instruction inventory drift",
+    )
+    require(
+        enumerated_profile_ids
+        == sorted({entry["profile_id"] for entry in entries}),
+        "final installed-library rescout profile inventory drift",
+    )
+
+    observed_counts = {surface: 0 for surface in RESCOUT_SURFACES}
+    for entry in entries:
+        observed_counts[entry["surface"]] += 1
+    require(
+        inventory["surface_counts"] == observed_counts,
+        "final installed-library rescout surface count drift",
+    )
+    require(
+        inventory["sha256"] == raw_sha256(canonical_bytes(entries)),
+        "final installed-library rescout inventory digest mismatch",
+    )
+    require(
+        value["content_sha256"] == content_sha256(value),
+        "final installed-library rescout content digest mismatch",
+    )
+
+    require(
+        value["candidate_identity_sha256"]
+        == raw_sha256(canonical_bytes(source_manifest["candidate"])),
+        "final installed-library rescout candidate binding mismatch",
+    )
+    require(
+        value["source_manifest_sha256"] == raw_sha256(source_raw)
+        and value["contribution_ledger_sha256"] == raw_sha256(contribution_raw)
+        and value["disposition_ledger_sha256"] == raw_sha256(disposition_raw)
+        and value["release_refresh_contract_sha256"] == raw_sha256(refresh_raw),
+        "final installed-library rescout input binding mismatch",
+    )
+
+    for manifest in profile_manifests:
+        bound_manifest, bound_raw = read_document(
+            repository,
+            Path(manifest["path"]),
+            "final installed-library rescout profile manifest",
+        )
+        require(
+            manifest["sha256"] == raw_sha256(bound_raw)
+            and bound_manifest.get("profile_id") == manifest["profile_id"]
+            and bound_manifest.get("observed_at_utc") == manifest["observed_at_utc"],
+            "final installed-library rescout profile manifest binding mismatch",
+        )
 
 
 def validate_content_document(
@@ -814,9 +946,14 @@ def validate_refresh_contract(
     value: dict[str, object],
     *,
     repository: Path,
+    source_manifest: dict[str, object],
+    source_raw: bytes,
+    contribution_raw: bytes,
     disposition_raw: bytes,
+    refresh_raw: bytes,
     final_rescout_schema: dict[str, object],
     final_rescout_schema_raw: bytes,
+    final_rescout: dict[str, object] | None,
 ) -> None:
     validate_content_document(
         value,
@@ -887,9 +1024,21 @@ def validate_refresh_contract(
         and final_rescout_schema["additionalProperties"] is False
         and type(final_rescout_schema["required"]) is list
         and set(final_rescout_schema["required"])
-        == set(final_rescout_schema["properties"]),
+        == set(final_rescout_schema["properties"])
+        and final_rescout_schema["x-invariants"] == FINAL_RESCOUT_INVARIANTS,
         "final installed-library rescout schema contract drift",
     )
+    if final_rescout is not None:
+        validate_final_rescout_artifact(
+            final_rescout,
+            repository=repository,
+            schema=final_rescout_schema,
+            source_manifest=source_manifest,
+            source_raw=source_raw,
+            contribution_raw=contribution_raw,
+            disposition_raw=disposition_raw,
+            refresh_raw=refresh_raw,
+        )
 
     follow_ups = value["follow_up_issues"]
     require(
@@ -1277,7 +1426,7 @@ def validate_refresh_contract(
     require(workflow["ordered_steps"] == WORKFLOW_STEPS, "release refresh step drift")
 
 
-def validate(repository: Path) -> None:
+def validate(repository: Path, *, require_final_rescout: bool = False) -> None:
     source_manifest, source_raw = read_document(
         repository, SOURCE_MANIFEST, "source manifest"
     )
@@ -1287,13 +1436,25 @@ def validate(repository: Path) -> None:
     disposition_ledger, disposition_raw = read_document(
         repository, DISPOSITION_LEDGER, "disposition ledger"
     )
-    refresh_contract, _ = read_document(
+    refresh_contract, refresh_raw = read_document(
         repository, REFRESH_CONTRACT, "release refresh contract"
     )
     final_rescout_schema, final_rescout_schema_raw = read_document(
         repository,
         FINAL_RESCOUT_SCHEMA,
         "final installed-library rescout schema",
+    )
+    final_rescout_path = repository / FINAL_RESCOUT_ARTIFACT["path"]
+    final_rescout = None
+    if final_rescout_path.exists() or final_rescout_path.is_symlink():
+        final_rescout, _ = read_document(
+            repository,
+            Path(FINAL_RESCOUT_ARTIFACT["path"]),
+            "final installed-library rescout artifact",
+        )
+    require(
+        not require_final_rescout or final_rescout is not None,
+        "final installed-library rescout artifact is required",
     )
     validate_disposition_ledger(
         disposition_ledger,
@@ -1306,19 +1467,33 @@ def validate(repository: Path) -> None:
     validate_refresh_contract(
         refresh_contract,
         repository=repository,
+        source_manifest=source_manifest,
+        source_raw=source_raw,
+        contribution_raw=contribution_raw,
         disposition_raw=disposition_raw,
+        refresh_raw=refresh_raw,
         final_rescout_schema=final_rescout_schema,
         final_rescout_schema_raw=final_rescout_schema_raw,
+        final_rescout=final_rescout,
     )
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) > 2:
-        print("usage: validate_source_skill_disposition.py [repository]", file=sys.stderr)
+    arguments = argv[1:]
+    require_final_rescout = bool(
+        arguments and arguments[0] == "--require-final-rescout"
+    )
+    if require_final_rescout:
+        arguments = arguments[1:]
+    if len(arguments) > 1 or (arguments and arguments[0].startswith("-")):
+        print(
+            "usage: validate_source_skill_disposition.py [--require-final-rescout] [repository]",
+            file=sys.stderr,
+        )
         return 2
-    repository = Path(argv[1] if len(argv) == 2 else ".").resolve()
+    repository = Path(arguments[0] if arguments else ".").resolve()
     try:
-        validate(repository)
+        validate(repository, require_final_rescout=require_final_rescout)
     except DispositionError as error:
         print(f"source-skill-disposition: {error}", file=sys.stderr)
         return 1

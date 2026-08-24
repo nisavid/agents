@@ -2,30 +2,8 @@ name: Source skill disposition
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/source-skill-disposition.yml"
-      - "evals/control-plane-matrix.json"
-      - "plugins/**"
-      - "release/plugin-content-locks/**"
-      - "release/public-release-runtime-packages.json"
-      - "release/source-skill-disposition/**"
-      - "release/source-skill-lineage/**"
-      - "release/task-witness/**"
-      - "scripts/validate_source_skill_disposition.py"
-      - "tests/test_validate_source_skill_disposition.py"
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/source-skill-disposition.yml"
-      - "evals/control-plane-matrix.json"
-      - "plugins/**"
-      - "release/plugin-content-locks/**"
-      - "release/public-release-runtime-packages.json"
-      - "release/source-skill-disposition/**"
-      - "release/source-skill-lineage/**"
-      - "release/task-witness/**"
-      - "scripts/validate_source_skill_disposition.py"
-      - "tests/test_validate_source_skill_disposition.py"
 
 concurrency:
   group: source-skill-disposition-${{ github.ref }}

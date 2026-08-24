@@ -16,6 +16,15 @@ from pathlib import Path
 
 
 sys.dont_write_bytecode = True
+
+
+def _unblock_controller_signals() -> None:
+    """Let the worker honor the controller's termination request."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
+
+
+_unblock_controller_signals()
+
 LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 import hindsight_memory_control_plane as _control_plane  # noqa: E402
@@ -39,6 +48,8 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     ExactDrainUvicornSignalGuard,
     ExactDrainWorkerMainShutdownBridge,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
+    EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS,
+    EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS,
     exact_drain_candidate_provider_root,
     exact_drain_effective_profile_digest,
     exact_drain_worker_failure_evidence,
@@ -172,6 +183,12 @@ def _validate_worker_environment(
             "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
+            "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
+                EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
+            ),
+            "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
+                EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS
+            ),
             "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
             "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
             "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",

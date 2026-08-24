@@ -91,6 +91,8 @@ EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
         "HINDSIGHT_API_LLM_TRACE_MAX_CHARS",
         "HINDSIGHT_API_LLM_TRACE_SCOPES",
         "HINDSIGHT_API_RECALL_BUDGET_FUNCTION",
+        "HINDSIGHT_API_RETAIN_LLM_TIMEOUT",
+        "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
         "HINDSIGHT_API_RERANKER_PROVIDER",
         "HINDSIGHT_API_SKIP_LLM_VERIFICATION",
         *(
@@ -106,6 +108,8 @@ EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
         ),
     }
 )
+EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS = "3600"
+EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS = "8192"
 EXACT_DRAIN_PROVIDER_ORDER = (
     "work-codex",
     "personal-codex",
@@ -452,7 +456,15 @@ def validate_exact_drain_provider_policy(
         and any(
             member.queue_timeout_seconds != 3600
             or member.execution_timeout_seconds
-            != (1200 if member.id == "hatchery" else 3600)
+            != (
+                (
+                    3600
+                    if plan_schema_version in {11, 12, 13, 14}
+                    else 1200
+                )
+                if member.id == "hatchery"
+                else 3600
+            )
             for member in policy.members
         )
     )
@@ -500,9 +512,16 @@ def validate_exact_drain_provider_policy(
 def exact_drain_effective_profile_digest(
     policy: ProviderRuntimePolicy,
     environment: Mapping[str, str],
+    *,
+    plan_schema_version: int | None = None,
 ) -> str:
     """Validate and bind the effective five-member Hindsight LLM profile."""
-    validate_exact_drain_provider_policy(policy)
+    if plan_schema_version is None:
+        plan_schema_version = 12 if policy.schema_version == 2 else 10
+    validate_exact_drain_provider_policy(
+        policy,
+        plan_schema_version=plan_schema_version,
+    )
     try:
         strategy = strict_json_loads(
             environment.get("HINDSIGHT_API_LLM_STRATEGY", "").encode(

@@ -204,6 +204,8 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     CLAIM_RELEASE_BLOCKER_KEYS,
     EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
+    EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS,
+    EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     ExactDrainClaimAdapter,
@@ -9881,6 +9883,16 @@ def _operation_recovery_profile_environment() -> dict[str, str]:
         for key, value in values.items()
         if isinstance(key, str) and isinstance(value, str)
     }
+    environment.update(
+        {
+            "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
+                EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
+            ),
+            "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
+                EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS
+            ),
+        }
+    )
     if any(
         not key or any(character in key + value for character in "\0\r\n")
         for key, value in environment.items()
@@ -9960,6 +9972,12 @@ def _operation_recovery_exact_worker_environment(
             "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
+            "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
+                EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
+            ),
+            "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
+                EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS
+            ),
             "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
             "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
             "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",

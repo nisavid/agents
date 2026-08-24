@@ -62,6 +62,7 @@ def _exact_split_timeout_policy_data() -> dict[str, object]:
                 "http://hatchery.komodo-vector.ts.net:13305/v1"
             )
             member["max_concurrent"] = 2
+            member["execution_timeout_seconds"] = 3_600
         else:
             member["identity"]["credential_marker"] = (
                 f"provider-policy:{member_id}"
@@ -4217,6 +4218,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS",
         ):
             self.assertEqual(environment[key], "0")
+        self.assertEqual(environment["HINDSIGHT_API_RETAIN_LLM_TIMEOUT"], "3600")
+        self.assertEqual(
+            environment["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"],
+            "8192",
+        )
 
         self.assertEqual(
             environment["HINDSIGHT_API_DATABASE_URL"],
@@ -6535,7 +6541,6 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             policy_value
         )
         self.assertEqual(policy.member("hatchery").max_concurrent, 2)
-        validate(policy)
         with self.assertRaisesRegex(Exception, "provider policy differs"):
             validate(
                 replace(
@@ -6602,15 +6607,32 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 for member in policy.members
             ),
         )
-        validate(bounded_policy)
+
+        repair_policy = policy
+        validate(repair_policy)
+        old_timeout_policy = replace(
+            policy,
+            members=tuple(
+                replace(hatchery, execution_timeout_seconds=1_200)
+                if member.id == hatchery.id
+                else member
+                for member in policy.members
+            ),
+        )
+        with self.assertRaisesRegex(Exception, "provider policy differs"):
+            validate(old_timeout_policy)
+        operation_recovery_runtime.validate_exact_drain_provider_policy(
+            repair_policy,
+            plan_schema_version=14,
+        )
 
         legacy_value = deepcopy(policy_value)
         legacy_value["schema_version"] = 1
         for member in legacy_value["members"]:
-            execution_timeout = member.pop("execution_timeout_seconds")
+            member.pop("execution_timeout_seconds")
             member.pop("queue_timeout_seconds")
             member["timeout_seconds"] = (
-                execution_timeout if member["id"] == "hatchery" else None
+                1_200 if member["id"] == "hatchery" else None
             )
             if member["id"] == "hatchery":
                 member["max_concurrent"] = 1

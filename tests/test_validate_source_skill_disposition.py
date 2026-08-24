@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 import jsonschema
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,11 +40,16 @@ def content_sha256(value: dict[str, object]) -> str:
 
 class SourceSkillDispositionWorkflowTests(unittest.TestCase):
     def test_workflow_runs_for_every_pull_request_and_main_push(self) -> None:
-        workflow = WORKFLOW.read_text()
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        events = workflow.get("on", workflow.get(True))
 
-        self.assertIn("  pull_request:\n", workflow)
-        self.assertIn("  push:\n    branches: [main]\n", workflow)
-        self.assertNotIn("    paths:\n", workflow)
+        self.assertEqual(
+            events,
+            {
+                "pull_request": None,
+                "push": {"branches": ["main"]},
+            },
+        )
 
 
 class SourceSkillDispositionValidatorTests(unittest.TestCase):

@@ -587,9 +587,19 @@ def validate_final_rescout_artifact(
     )
 
     for manifest in profile_manifests:
+        relative = manifest["path"]
+        normalized = posixpath.normpath(relative)
+        require(
+            not relative.startswith(("/", "~"))
+            and "\\" not in relative
+            and normalized == relative
+            and normalized not in {".", ".."}
+            and not normalized.startswith("../"),
+            "final installed-library rescout profile manifest binding mismatch",
+        )
         bound_manifest, bound_raw = read_document(
             repository,
-            Path(manifest["path"]),
+            Path(relative),
             "final installed-library rescout profile manifest",
         )
         require(

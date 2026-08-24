@@ -67,6 +67,8 @@ class SourceSkillDispositionWorkflowTests(unittest.TestCase):
 
         self.assertTrue(
             {
+                "python -m unittest tests.test_validate_source_skill_disposition",
+                "python scripts/validate_source_skill_disposition.py .",
                 "python scripts/validate_rolecasting.py .",
                 "python -m unittest tests.test_validate_rolecasting tests.test_rolecasting_eval_corpus",
             }

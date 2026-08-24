@@ -769,6 +769,170 @@ class OperationRecoveryContractTest(unittest.TestCase):
             recovery,
         )
 
+    def test_schema_twelve_post_abort_accepts_released_checkpoint_metadata(self):
+        """A released worker row may advance only its durable checkpoint."""
+        reference_snapshot = self.drain_snapshot()
+        reference_snapshot["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        reference_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in reference_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        reference_backup = drain_backup_evidence()
+        reference_backup["source_authority"]["data_identity_digest"] = (
+            reference_snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        reference_backup["source_authority_digest"] = digest(
+            reference_backup["source_authority"]
+        )
+        reference = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            reference_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=reference_backup,
+            rollback_backup_path="/private/tmp/v12-release-reference-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path=(
+                "/private/tmp/v12-release-reference-auth.json"
+            ),
+            application_receipt_path=(
+                "/private/tmp/v12-release-reference-app.json"
+            ),
+            status_artifact_path=(
+                "/private/tmp/v12-release-reference-status.json"
+            ),
+            verification_receipt_path=(
+                "/private/tmp/v12-release-reference-verify.json"
+            ),
+            created_at=1_785_462_000,
+            schema_version=12,
+        )
+        checkpoint_only_id = reference["selected_operations"][2][
+            "operation_id"
+        ]
+        owned_id = reference["selected_operations"][3]["operation_id"]
+        snapshot = deepcopy(reference_snapshot)
+        checkpoint_only = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] == checkpoint_only_id
+        )
+        checkpoint_only.update(
+            updated_at="2026-07-29T14:00:00Z",
+            result_metadata_digest="d" * 64,
+        )
+        checkpoint_only["row_digest"] = digest(
+            {
+                key: value
+                for key, value in checkpoint_only.items()
+                if key != "row_digest"
+            }
+        )
+        owned = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] == owned_id
+        )
+        owned.update(
+            current_status="failed",
+            updated_at="2026-07-29T14:00:00Z",
+            completed_at="2026-07-29T14:00:00Z",
+            retry_count=1,
+            worker_id_present=True,
+            worker_id_digest=recovery_contract._post_abort_worker_digest(
+                reference["plan_digest"]
+            ),
+            claimed_at="2026-07-29T13:59:00Z",
+            error_category="provider_transport",
+            error_digest="e" * 64,
+        )
+        owned["row_digest"] = digest(
+            {
+                key: value
+                for key, value in owned.items()
+                if key != "row_digest"
+            }
+        )
+        snapshot["status_counts"] = {
+            "pending": 42,
+            "processing": 0,
+            "completed": 5,
+            "failed": 1,
+            "cancelled": 0,
+        }
+        snapshot["observed_at"] += 1_000
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        backup = drain_backup_evidence()
+        backup["source_authority"]["data_identity_digest"] = (
+            snapshot["installation_authority"]["observed_data_identity_digest"]
+        )
+        backup["source_authority"]["generation_before"] = (
+            snapshot["generation_before"]
+        )
+        backup["source_authority"]["generation_after"] = (
+            snapshot["generation_after"]
+        )
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        with patch.object(
+            recovery_contract,
+            "_post_abort_released_operation_ids",
+            return_value=frozenset({checkpoint_only_id}),
+        ):
+            recovery = create_post_abort_recovery_plan(
+                reference,
+                snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v12-release-backup.age",
+                rollback_bundle_path="/private/tmp/v12-release-bundle.age",
+                authorization_receipt_path="/private/tmp/v12-release-auth.json",
+                application_receipt_path="/private/tmp/v12-release-app.json",
+                verification_receipt_path="/private/tmp/v12-release-verify.json",
+                rollback_receipt_path="/private/tmp/v12-release-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=exact_drain_application_journal(
+                    reference
+                ),
+                reference_application_progress_digest="f" * 64,
+                schema_version=12,
+                created_at=1_785_463_100,
+            )
+            self.assertEqual(recovery["selected_operation_count"], 1)
+            self.assertNotIn(
+                checkpoint_only_id,
+                {
+                    item["operation_id"]
+                    for item in recovery["selected_operations"]
+                },
+            )
+            self.assertEqual(
+                recovery_contract.verify_post_abort_recovery_plan(
+                    recovery,
+                    now=recovery["created_at"],
+                ),
+                recovery,
+            )
+
     def test_schema_twelve_status_closes_payload_free_failure_classification(self):
         plan = self.drain_plan(schema_version=12)
         body = {

@@ -5279,6 +5279,39 @@ def _post_abort_worker_digest(reference_plan_digest: str) -> str:
     ).hexdigest()
 
 
+def _post_abort_released_operation_ids(
+    reference_plan: Mapping[str, Any],
+) -> frozenset[str]:
+    """Return rows durably marked released by the reference worker.
+
+    A repaired worker can persist a retain checkpoint and then release its
+    claim while shutting down.  The row is consequently unowned in the
+    post-abort snapshot even though its durable metadata changed during the
+    worker attempt.  Keep the proof tied to the plan-bound, payload-free
+    progress artifact; absent artifacts retain the historical contract used
+    by older plans and fixtures.
+    """
+    progress_path = Path(reference_plan["progress_artifact_path"])
+    if not progress_path.exists():
+        return frozenset()
+    # Import lazily: the progress module imports this contract module for its
+    # shared error type and archive-path helper.
+    from .operation_recovery_progress import read_exact_drain_progress
+
+    progress = read_exact_drain_progress(
+        progress_path,
+        plan_digest=reference_plan["plan_digest"],
+        progress_schema_version=reference_plan.get(
+            "progress_schema_version", 1
+        ),
+    )
+    return frozenset(
+        item["operation_id"]
+        for item in progress["tasks"]
+        if item["status"] == "pending" and item["stage"] == "released"
+    )
+
+
 def _post_abort_reference_application_journal(
     value: Any,
     reference_plan: Mapping[str, Any],
@@ -6080,6 +6113,11 @@ def _post_abort_v10_contract(
     dict[str, Any],
 ]:
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
+    released_operation_ids = (
+        _post_abort_released_operation_ids(reference_plan)
+        if schema_version == 12
+        else frozenset()
+    )
     reference_selected = {
         item["operation_id"]: item
         for item in reference_plan["selected_operations"]
@@ -6192,6 +6230,21 @@ def _post_abort_v10_contract(
                 and current_updated_at is not None
                 and current_updated_at > reference_updated_at
             )
+            released_worker_checkpoint_advanced = (
+                schema_version == 12
+                and operation_id in released_operation_ids
+                and row["result_metadata_digest"]
+                != reference_row["result_metadata_digest"]
+                and reference_row["retry_count"] == row["retry_count"]
+                and reference_row["next_retry_at"]
+                == row["next_retry_at"]
+                and reference_row["error_category"]
+                == row["error_category"]
+                and reference_row["error_digest"] == row["error_digest"]
+                and reference_updated_at is not None
+                and current_updated_at is not None
+                and current_updated_at > reference_updated_at
+            )
             if (
                 reference_row["current_status"] != "pending"
                 or not reference_wholly_unowned
@@ -6201,12 +6254,18 @@ def _post_abort_v10_contract(
                 or (
                     schema_version == 12
                     and row["row_digest"] != reference_row["row_digest"]
-                    and not released_retry_checkpoint_advanced
+                    and not (
+                        released_retry_checkpoint_advanced
+                        or released_worker_checkpoint_advanced
+                    )
                 )
                 or (
                     row["result_metadata_digest"]
                     != reference_row["result_metadata_digest"]
-                    and not released_retry_checkpoint_advanced
+                    and not (
+                        released_retry_checkpoint_advanced
+                        or released_worker_checkpoint_advanced
+                    )
                 )
                 or row["task_payload_present"]
                 is not reference_row["task_payload_present"]

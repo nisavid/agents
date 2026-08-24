@@ -3869,6 +3869,51 @@ def _exact_drain_recovery_context(
             and retry_at <= snapshot["observed_at"]
         )
 
+    def terminal_completed_evidence_is_valid(
+        item: Mapping[str, Any],
+    ) -> bool:
+        """Preserve historical terminal metadata outside the pending set.
+
+        A continuation snapshot may include rows completed by earlier
+        migrations.  Their claim identity and retry checkpoint are durable
+        history, not evidence that this worker owns them.  Keep that history
+        in the signed initial projection while rejecting incomplete or future
+        retry state.
+        """
+        if (
+            item["current_status"] != "completed"
+            or item["completed_at"] is None
+            or item["worker_id_present"]
+            != (item["worker_id_digest"] is not None)
+            or item["claimed_at"] is None
+            and item["worker_id_present"]
+            or item["claimed_at"] is not None
+            and not item["worker_id_present"]
+        ):
+            return False
+        retry_at = _post_abort_timestamp(item["next_retry_at"])
+        if retry_at is not None and retry_at > snapshot["observed_at"]:
+            return False
+        if item["retry_count"] == 0:
+            return (
+                item["next_retry_at"] is None
+                and item["error_category"] == "none"
+                and item["error_digest"] is None
+            )
+        return (
+            retry_at is not None
+            and (
+                (
+                    item["error_category"] == "none"
+                    and item["error_digest"] is None
+                )
+                or (
+                    item["error_category"] in FAILURE_CAUSE_FAMILIES
+                    and item["error_digest"] is not None
+                )
+            )
+        )
+
     initial_origin_valid = (
         set(snapshot_rows) == set(cohort_rows)
         and all(
@@ -3893,9 +3938,6 @@ def _exact_drain_recovery_context(
                 (item["current_status"] == "completed")
                 == (item["completed_at"] is not None)
             )
-            and item["worker_id_present"] is False
-            and item["worker_id_digest"] is None
-            and item["claimed_at"] is None
             and (
                 (
                     item["next_retry_at"] is None
@@ -3903,6 +3945,7 @@ def _exact_drain_recovery_context(
                     and item["error_digest"] is None
                 )
                 or initial_retry_evidence_is_valid(item)
+                or terminal_completed_evidence_is_valid(item)
             )
             for item in snapshot_rows.values()
         )

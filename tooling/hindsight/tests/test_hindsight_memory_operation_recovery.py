@@ -936,9 +936,6 @@ class OperationRecoveryContractTest(unittest.TestCase):
     def test_schema_twelve_epoch_one_retry_accepts_authenticated_release_subset(self):
         """Epoch one may omit rows released by the stopped worker."""
         initial = self.drain_plan(schema_version=12)
-        initial["selected_operations"] = deepcopy(
-            initial["selected_operations"][:2]
-        )
         selected = initial["selected_operations"]
         current = {
             item["operation_id"]: item
@@ -950,6 +947,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
             current,
         )
         reference = deepcopy(initial)
+        rebound_authority = rebound_installation_authority()
+        reference["installation_authority"] = rebound_authority
+        reference["live_snapshot"]["installation_authority"] = (
+            rebound_authority
+        )
         released_id = selected[0]["operation_id"]
         retained_id = selected[1]["operation_id"]
         reference["recovery_context"] = {
@@ -995,6 +997,60 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(
             [item["operation_id"] for item in retry["operations"]],
             [retained_id],
+        )
+
+        released_current = deepcopy(current)
+        released_row = released_current[released_id]
+        released_row.update(
+            updated_at="2026-07-29T14:00:00Z",
+            result_metadata_digest="d" * 64,
+        )
+        released_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in released_row.items()
+                if key != "row_digest"
+            }
+        )
+        retained_row = released_current[retained_id]
+        retained_row.update(
+            worker_id_present=True,
+            worker_id_digest=recovery_contract._post_abort_worker_digest(
+                reference["plan_digest"]
+            ),
+            claimed_at="2026-07-29T13:59:00Z",
+        )
+        retained_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in retained_row.items()
+                if key != "row_digest"
+            }
+        )
+        chained_snapshot = deepcopy(reference["live_snapshot"])
+        chained_snapshot["operations"] = list(released_current.values())
+        chained_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in chained_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with patch.object(
+            recovery_contract,
+            "_post_abort_released_operation_ids",
+            return_value=frozenset({released_id}),
+        ):
+            chained = recovery_contract._post_abort_v10_contract(
+                reference,
+                chained_snapshot,
+                schema_version=11,
+                prior_retry_recovery=prior,
+            )
+        self.assertEqual(len(chained[0]), 1)
+        self.assertEqual(
+            chained[5]["retry_recovery"]["schema_version"],
+            2,
         )
 
     def test_schema_twelve_status_closes_payload_free_failure_classification(self):

@@ -6137,9 +6137,20 @@ def _post_abort_v10_contract(
     dict[str, Any],
 ]:
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
+    recovery_context = reference_plan.get("recovery_context")
+    released_checkpoint_capable = (
+        schema_version == 12
+        or (
+            schema_version == 11
+            and reference_plan.get("schema_version") == 12
+            and isinstance(recovery_context, Mapping)
+            and recovery_context.get("schema_version") == 1
+            and recovery_context.get("recovery_epoch") == 1
+        )
+    )
     released_operation_ids = (
         _post_abort_released_operation_ids(reference_plan)
-        if schema_version == 12
+        if released_checkpoint_capable
         else frozenset()
     )
     reference_selected = {
@@ -6240,7 +6251,7 @@ def _post_abort_v10_contract(
                 else _post_abort_timestamp(row["next_retry_at"])
             )
             released_retry_checkpoint_advanced = (
-                schema_version == 12
+                released_checkpoint_capable
                 and row["result_metadata_digest"] is not None
                 and row["result_metadata_digest"]
                 != reference_row["result_metadata_digest"]
@@ -6255,7 +6266,7 @@ def _post_abort_v10_contract(
                 and current_updated_at > reference_updated_at
             )
             released_worker_checkpoint_advanced = (
-                schema_version == 12
+                released_checkpoint_capable
                 and operation_id in released_operation_ids
                 and row["result_metadata_digest"]
                 != reference_row["result_metadata_digest"]
@@ -6276,7 +6287,7 @@ def _post_abort_v10_contract(
                 or row["completed_at"] is not None
                 or row["created_at"] != reference_row["created_at"]
                 or (
-                    schema_version == 12
+                    released_checkpoint_capable
                     and row["row_digest"] != reference_row["row_digest"]
                     and not (
                         released_retry_checkpoint_advanced

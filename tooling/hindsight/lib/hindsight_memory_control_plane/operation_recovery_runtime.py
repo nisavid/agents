@@ -255,8 +255,10 @@ def _exact_drain_error_is_transient(error_message: Any) -> bool:
     return (
         isinstance(error_message, str)
         and EXACT_DRAIN_AUTHENTICATION_ERROR.search(error_message) is None
-        and EXACT_DRAIN_CAPACITY_ERROR.search(error_message) is None
-        and EXACT_DRAIN_TRANSPORT_ERROR.search(error_message) is not None
+        and (
+            EXACT_DRAIN_CAPACITY_ERROR.search(error_message) is not None
+            or EXACT_DRAIN_TRANSPORT_ERROR.search(error_message) is not None
+        )
     )
 
 
@@ -1091,6 +1093,7 @@ def _exact_drain_closed_cause_evidence(
 def exact_drain_worker_failure_evidence(
     error: BaseException,
     *,
+    worker_stage: str | None = None,
     progress_schema_version: int = 5,
 ) -> dict[str, Any]:
     """Return a closed retry projection for a worker-level failure."""
@@ -1143,7 +1146,17 @@ def exact_drain_worker_failure_evidence(
     if evidence["category"] == "phase_one_timeout" and not phase_one_deadline:
         evidence["category"] = "worker_initialization_timeout"
     elif evidence["category"] == "operation_error":
-        evidence["category"] = "worker_initialization"
+        runtime_stage = (
+            isinstance(worker_stage, str)
+            and (
+                worker_stage.startswith("worker.poller.")
+                or worker_stage.startswith("worker.shutdown.")
+                or worker_stage == "worker.main"
+            )
+        )
+        evidence["category"] = (
+            "worker_runtime_failure" if runtime_stage else "worker_initialization"
+        )
     evidence["retryable"] = evidence["category"] in {
         "provider_capacity",
         "provider_transport",
@@ -5634,6 +5647,11 @@ class ExactDrainClaimAdapter:
                 exit_code=exit_code,
                 failure=exact_drain_worker_failure_evidence(
                     error,
+                    worker_stage=getattr(
+                        self._progress_recorder,
+                        "_worker_stage",
+                        None,
+                    ),
                     progress_schema_version=self._plan[
                         "progress_schema_version"
                     ],

@@ -221,6 +221,23 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 self.assertTrue(evidence["retryable"])
                 self.assertIsNone(evidence["http_status"])
 
+    def test_worker_failure_classifies_poller_runtime_failures_separately(self):
+        evidence = exact_drain_worker_failure_evidence(
+            RuntimeError("poller task bookkeeping failed"),
+            worker_stage="worker.poller.running",
+        )
+
+        self.assertEqual(evidence["category"], "worker_runtime_failure")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+
+    def test_provider_capacity_failures_are_transient_for_task_failover(self):
+        self.assertTrue(
+            operation_recovery_runtime._exact_drain_error_is_transient(
+                "provider capacity exhausted"
+            )
+        )
+
     def test_worker_failure_preserves_phase_one_deadline_category(self):
         message = (
             operation_recovery_runtime.EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
@@ -3094,8 +3111,15 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "public",
             )
         )
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-4",
+                "provider capacity exhausted after failover",
+                "public",
+            )
+        )
 
-        self.assertEqual(len(events), 3)
+        self.assertEqual(len(events), 4)
         self.assertEqual(events[0][:3], ("retry", "exact-backend", "operation-1"))
         self.assertEqual(
             events[0][4:],
@@ -3120,6 +3144,13 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "401 unauthorized while opening provider connection",
                 "public",
             ),
+        )
+        self.assertEqual(
+            events[3][:3], ("retry", "exact-backend", "operation-4")
+        )
+        self.assertEqual(
+            events[3][4:],
+            ("provider capacity exhausted after failover", "public"),
         )
 
     def test_swallowed_exact_terminal_failures_surface_after_public_shutdown(self):

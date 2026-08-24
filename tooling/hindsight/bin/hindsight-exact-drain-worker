@@ -558,6 +558,7 @@ def run() -> int:
         )
         failure = exact_drain_worker_failure_evidence(
             error,
+            worker_stage=getattr(recorder, "_worker_stage", _WORKER_STAGE),
             progress_schema_version=progress_schema_version,
         )
         failure_stage = getattr(recorder, "_worker_stage", _WORKER_STAGE)

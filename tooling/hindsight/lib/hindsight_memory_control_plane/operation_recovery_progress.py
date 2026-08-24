@@ -73,6 +73,7 @@ TASK_FAILURE_CATEGORIES_V4 = frozenset(
         "unclassified_empty",
         "worker_initialization",
         "worker_initialization_timeout",
+        "worker_runtime_failure",
     }
 )
 TASK_FAILURE_CATEGORIES_V5 = TASK_FAILURE_CATEGORIES_V4 | {

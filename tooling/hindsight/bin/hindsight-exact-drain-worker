@@ -175,14 +175,18 @@ def _validate_worker_environment(
     }
     expected_environment.update(
         {
-            "HINDSIGHT_API_WORKER_MAX_SLOTS": "2",
+            # Keep one reserved consolidation slot and two retain slots.  The
+            # provider gate is also capped at two, so this raises Hindsight's
+            # own drain-side concurrency without allowing a third Hatchery
+            # execution through this worker.
+            "HINDSIGHT_API_WORKER_MAX_SLOTS": "3",
             "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
-            "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "2",
             "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
-            "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
+            "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "2",
             "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
                 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
             ),

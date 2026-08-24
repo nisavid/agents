@@ -4189,7 +4189,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
         )
         self.assertEqual(
-            environment["HINDSIGHT_API_WORKER_MAX_SLOTS"], "2"
+            environment["HINDSIGHT_API_WORKER_MAX_SLOTS"], "3"
         )
         self.assertEqual(
             environment[
@@ -4197,8 +4197,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ],
             "1",
         )
+        self.assertEqual(
+            environment["HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS"],
+            "2",
+        )
         for operation_type in (
-            "RETAIN",
             "FILE_CONVERT_RETAIN",
             "REFRESH_MENTAL_MODEL",
             "GRAPH_MAINTENANCE",
@@ -4219,6 +4222,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         ):
             self.assertEqual(environment[key], "0")
         self.assertEqual(environment["HINDSIGHT_API_RETAIN_LLM_TIMEOUT"], "3600")
+        self.assertEqual(
+            environment["HINDSIGHT_API_RETAIN_MAX_CONCURRENT"], "2"
+        )
         self.assertEqual(
             environment["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"],
             "8192",

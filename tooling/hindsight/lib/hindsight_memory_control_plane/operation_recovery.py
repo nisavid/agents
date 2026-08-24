@@ -234,31 +234,51 @@ EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4 = {
 EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4_DIGEST = digest(
     EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V4
 )
-EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT = {
-    "schema_version": 1,
-    "kind": "operation-recovery-exact-drain-provider-timeouts",
-    "members": [
-        {
-            "provider_id": provider_id,
-            "queue_timeout_seconds": 3_600,
-            "execution_timeout_seconds": (
-                1_200 if provider_id == "hatchery" else 3_600
-            ),
-            "max_concurrent": (
-                EXACT_DRAIN_HATCHERY_MAX_CONCURRENT
-                if provider_id == "hatchery"
-                else None
-            ),
-        }
-        for provider_id in (
-            "work-codex",
-            "personal-codex",
-            "alt1-codex",
-            "alt2-codex",
-            "hatchery",
-        )
-    ],
-}
+def _exact_drain_provider_timeout_contract(
+    *,
+    hatchery_execution_timeout_seconds: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-provider-timeouts",
+        "members": [
+            {
+                "provider_id": provider_id,
+                "queue_timeout_seconds": 3_600,
+                "execution_timeout_seconds": (
+                    hatchery_execution_timeout_seconds
+                    if provider_id == "hatchery"
+                    else 3_600
+                ),
+                "max_concurrent": (
+                    EXACT_DRAIN_HATCHERY_MAX_CONCURRENT
+                    if provider_id == "hatchery"
+                    else None
+                ),
+            }
+            for provider_id in (
+                "work-codex",
+                "personal-codex",
+                "alt1-codex",
+                "alt2-codex",
+                "hatchery",
+            )
+        ],
+    }
+
+
+# Keep the historical contract available so already-approved plans remain
+# verifiable. New schema-11+ plans bind the repaired Hatchery execution bound.
+EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT = (
+    _exact_drain_provider_timeout_contract(
+        hatchery_execution_timeout_seconds=1_200,
+    )
+)
+EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED = (
+    _exact_drain_provider_timeout_contract(
+        hatchery_execution_timeout_seconds=3_600,
+    )
+)
 POST_ABORT_PLAN_LIFETIME_SECONDS = 86_400
 POST_ABORT_EVIDENCE_MAX_AGE_SECONDS = 3_600
 POST_ABORT_TRANSACTION_TIMEOUT_SECONDS = 120
@@ -4497,7 +4517,11 @@ def create_exact_drain_plan(
                 "phase_one_deadline_anchor": "first-phase-one-entry",
                 "phase_one_nested_stage_prefixes": ["llm."],
                 "provider_timeout_contract": (
-                    _normalized(EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT)
+                    _normalized(
+                        EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED
+                        if schema_version in {11, 12, 13, 14}
+                        else EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
+                    )
                 ),
                 **(
                     {
@@ -4962,7 +4986,10 @@ def verify_exact_drain_plan(
                 or phase_one_deadline_anchor != "first-phase-one-entry"
                 or phase_one_nested_stage_prefixes != ["llm."]
                 or provider_timeout_contract
-                != EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
+                not in (
+                    EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT,
+                    EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED,
+                )
                 or (
                     schema_version in {12, 13, 14}
                     and operation_attempt_timeout_disposition

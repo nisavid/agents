@@ -501,14 +501,14 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["phase_one_nested_stage_prefixes"], ["llm."])
         self.assertEqual(
             plan["provider_timeout_contract"],
-            recovery_contract.EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT,
+            recovery_contract.EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED,
         )
         self.assertEqual(
             plan["provider_timeout_contract"]["members"][-1],
             {
                 "provider_id": "hatchery",
                 "queue_timeout_seconds": 3_600,
-                "execution_timeout_seconds": 1_200,
+                "execution_timeout_seconds": 3_600,
                 "max_concurrent": 2,
             },
         )
@@ -523,6 +523,25 @@ class OperationRecoveryContractTest(unittest.TestCase):
             "worker-main",
         )
         self.assertEqual(plan["progress_schema_version"], 4)
+
+        legacy = deepcopy(plan)
+        legacy["provider_timeout_contract"] = deepcopy(
+            recovery_contract.EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
+        )
+        legacy["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in legacy.items()
+                if key != "plan_digest"
+            }
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                legacy,
+                now=legacy["created_at"],
+            ),
+            legacy,
+        )
         self.assertEqual(
             plan["failure_evidence_contract_digest"],
             recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST,

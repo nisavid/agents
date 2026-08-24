@@ -270,11 +270,14 @@ A future progress contract should expose payload-free `queued` versus
 from a request whose budget was consumed waiting behind another call.
 
 Schema 11 raises only the Hindsight-side Hatchery execution gate from one to
-two. The operation-level drain concurrency remains one, and Hatchery retains a
-separate 3,600-second queue deadline, 1,200-second execution deadline, and the
-outer 3,600-second attempt deadline. The new gate is exact-drain authority,
-bound into the plan and provider-policy digests; it requires a new candidate,
-plan, and authorization and cannot affect the active schema-10 worker.
+two. The operation-level drain concurrency remains one. Its historical plan
+contract retained a separate 3,600-second queue deadline, 1,200-second
+execution deadline, and the outer 3,600-second attempt deadline. Repaired
+schema-12-and-later candidates bind the execution deadline to 3,600 seconds as
+well; the verifier still accepts the historical contract so already-approved
+plans remain verifiable. The new gate is exact-drain authority, bound into the
+plan and provider-policy digests; it requires a new candidate, plan, and
+authorization and cannot affect an already-approved worker.
 
 ## Recommended path
 
@@ -406,7 +409,7 @@ digest. The plan must close and verify these fields:
 | Surface | Required closed fields |
 | --- | --- |
 | Attempt authority | `operation_attempt_timeout_seconds=3600`, `phase_one_timeout_seconds=3600`, `phase_one_deadline_anchor=first-phase-one-entry`, `phase_one_nested_stage_prefixes=["llm."]` |
-| Provider authority | per-member `queue_timeout_seconds=3600`, `execution_timeout_seconds` (the existing member timeout, including Hatchery's 1,200 seconds), `max_concurrent` |
+| Provider authority | per-member `queue_timeout_seconds=3600`, `execution_timeout_seconds` (3,600 seconds for repaired schema-12-and-later Hatchery plans; historical schema-11 plans retain 1,200 seconds), `max_concurrent` |
 | Failure evidence | closed categories `provider_queue_timeout`, `provider_execution_timeout`, `operation_attempt_timeout`, and the existing categories; retryability and failure stage remain explicit |
 | Progress | payload-free request state `queued` or `executing`, queue-start/acquire/finish timestamps, queue age, execution age, and separate queue/execution timeout counters |
 | Execution window | `remaining_attempt_count`, `retry_wait_count`, `effective_concurrency`, `operation_attempt_timeout_seconds`, transaction/retry/startup/shutdown margins, `calculated_seconds`, and `maximum_seconds` |

@@ -8664,8 +8664,14 @@ def _operation_recovery_exact_phase_repair_snapshot(
     schema_version: int = 12,
 ) -> str:
     snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
-    expected_snapshot_schema = 8 if schema_version in {13, 14} else 7
-    if snapshot.get("schema_version") != expected_snapshot_schema:
+    expected_snapshot_schemas = (
+        {7, 8}
+        if schema_version == 12
+        else {8}
+        if schema_version in {13, 14}
+        else {7}
+    )
+    if snapshot.get("schema_version") not in expected_snapshot_schemas:
         raise OperationRecoveryError(
             "exact drain full-query repair snapshot is required"
         )

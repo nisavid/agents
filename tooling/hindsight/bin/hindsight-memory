@@ -11524,12 +11524,25 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
                 if isinstance(reference_context, Mapping)
                 and reference_context.get("schema_version") == 2
                 else (
-                    11
-                    if snapshot["installation_authority"].get(
-                        "schema_version"
+                    12
+                    if reference["schema_version"] == 12
+                    and reference.get(
+                        "operation_attempt_timeout_disposition"
                     )
-                    == 2
-                    else 10
+                    == "task-retry-after-quiescence"
+                    and isinstance(reference_context, Mapping)
+                    and reference_context.get("origin")
+                    == "initial-snapshot"
+                    and reference_context.get("schema_version") == 1
+                    and reference_context.get("recovery_epoch") == 0
+                    else (
+                        11
+                        if snapshot["installation_authority"].get(
+                            "schema_version"
+                        )
+                        == 2
+                        else 10
+                    )
                 )
             )
         ),

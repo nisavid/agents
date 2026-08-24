@@ -6356,6 +6356,23 @@ def _post_abort_contract(
         if isinstance(recovery_context, Mapping)
         else None
     )
+    initial_repaired_schema12 = (
+        schema_version == 12
+        and prior_retry_recovery is None
+        and reference_plan.get("schema_version") == 12
+        and reference_plan.get("operation_attempt_timeout_disposition")
+        == "task-retry-after-quiescence"
+        and isinstance(recovery_context, Mapping)
+        and recovery_context.get("origin") == "initial-snapshot"
+        and recovery_context_schema == 1
+        and recovery_epoch == 0
+    )
+    chained_schema12 = (
+        schema_version == 12
+        and prior_retry_recovery is not None
+        and recovery_context_schema == 2
+        and recovery_epoch == 2
+    )
     if (
         schema_version == 13
         and (
@@ -6367,11 +6384,7 @@ def _post_abort_contract(
         )
     ) or (
         schema_version == 12
-        and (
-            prior_retry_recovery is None
-            or recovery_context_schema != 2
-            or recovery_epoch != 2
-        )
+        and not (initial_repaired_schema12 or chained_schema12)
     ) or (
         schema_version == 11
         and prior_retry_recovery is not None

@@ -330,6 +330,14 @@ completed rows and all other cohort rows remain digest-exact. It advances
 recovery epoch zero to one. Within that transaction, failed rows may reset once
 while pending and processing rows preserve their retry counts.
 
+The first post-abort boundary for a repaired schema 12 initial plan is also
+schema 12. If a graceful stop advances an unowned pending row's retry
+checkpoint, the post-abort contract records that checkpoint as preserved and
+leaves the row outside the reset set; worker-owned terminal failures remain
+eligible for the bounded recovery reset. This path is selected only for an
+initial-origin schema 12 plan with the task-retry-after-quiescence timeout
+disposition, so legacy schema 11 recovery retains its narrower contract.
+
 With `--prior-recovery-plan`, schema 11 permits an authenticated recovery from
 epoch one to epoch two. It requires every row selected by the reference exact
 plan to be failed and resets only those failed rows. Schema 12 permits one

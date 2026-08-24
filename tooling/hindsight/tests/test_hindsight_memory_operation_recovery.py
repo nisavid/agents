@@ -615,6 +615,160 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 now=tampered["created_at"],
             )
 
+    def test_schema_twelve_initial_post_abort_preserves_retry_checkpoint(self):
+        reference_snapshot = self.drain_snapshot()
+        reference_snapshot["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        reference_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in reference_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        reference_backup = drain_backup_evidence()
+        reference_backup["source_authority"]["data_identity_digest"] = (
+            reference_snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        reference_backup["source_authority_digest"] = digest(
+            reference_backup["source_authority"]
+        )
+        reference = dict(
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                reference_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=reference_backup,
+                rollback_backup_path="/private/tmp/v12-reference-backup.age",
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path="/private/tmp/v12-reference-auth.json",
+                application_receipt_path="/private/tmp/v12-reference-app.json",
+                status_artifact_path="/private/tmp/v12-reference-status.json",
+                verification_receipt_path="/private/tmp/v12-reference-verify.json",
+                created_at=1_785_462_000,
+                schema_version=12,
+            )
+        )
+        released_id = reference["selected_operations"][0]["operation_id"]
+        owned_id = reference["selected_operations"][1]["operation_id"]
+        snapshot = deepcopy(reference_snapshot)
+        released = next(
+            item for item in snapshot["operations"]
+            if item["operation_id"] == released_id
+        )
+        released.update(
+            current_status="pending",
+            updated_at="2026-07-29T14:00:00Z",
+            completed_at=None,
+            retry_count=1,
+            next_retry_at="2026-07-29T13:30:00Z",
+            worker_id_present=False,
+            worker_id_digest=None,
+            claimed_at=None,
+            result_metadata_digest="a" * 64,
+            error_category="provider_transport",
+            error_digest="b" * 64,
+        )
+        released["row_digest"] = digest(
+            {
+                key: value
+                for key, value in released.items()
+                if key != "row_digest"
+            }
+        )
+        owned = next(
+            item for item in snapshot["operations"]
+            if item["operation_id"] == owned_id
+        )
+        owned.update(
+            current_status="failed",
+            updated_at="2026-07-29T14:00:00Z",
+            completed_at="2026-07-29T14:00:00Z",
+            retry_count=1,
+            worker_id_present=True,
+            worker_id_digest=recovery_contract._post_abort_worker_digest(
+                reference["plan_digest"]
+            ),
+            claimed_at="2026-07-29T13:59:00Z",
+            error_category="provider_transport",
+            error_digest="c" * 64,
+        )
+        owned["row_digest"] = digest(
+            {
+                key: value
+                for key, value in owned.items()
+                if key != "row_digest"
+            }
+        )
+        snapshot["status_counts"] = {
+            "pending": 42,
+            "processing": 0,
+            "completed": 5,
+            "failed": 1,
+            "cancelled": 0,
+        }
+        snapshot["observed_at"] += 1_000
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        backup = drain_backup_evidence()
+        backup["source_authority"]["data_identity_digest"] = (
+            snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+        recovery = create_post_abort_recovery_plan(
+            reference,
+            snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v12-initial-backup.age",
+            rollback_bundle_path="/private/tmp/v12-initial-bundle.age",
+            authorization_receipt_path="/private/tmp/v12-initial-auth.json",
+            application_receipt_path="/private/tmp/v12-initial-app.json",
+            verification_receipt_path="/private/tmp/v12-initial-verify.json",
+            rollback_receipt_path="/private/tmp/v12-initial-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
+            ),
+            reference_application_journal=exact_drain_application_journal(
+                reference
+            ),
+            reference_application_progress_digest="c" * 64,
+            schema_version=12,
+            created_at=1_785_463_100,
+        )
+
+        self.assertEqual(recovery["schema_version"], 12)
+        self.assertNotIn(
+            released_id,
+            {
+                item["operation_id"]
+                for item in recovery["selected_operations"]
+            },
+        )
+        self.assertEqual(recovery["retry_recovery"]["schema_version"], 1)
+        self.assertEqual(
+            recovery_contract.verify_post_abort_recovery_plan(
+                recovery,
+                now=recovery["created_at"],
+            ),
+            recovery,
+        )
+
     def test_schema_twelve_status_closes_payload_free_failure_classification(self):
         plan = self.drain_plan(schema_version=12)
         body = {

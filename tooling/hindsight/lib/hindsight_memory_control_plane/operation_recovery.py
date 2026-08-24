@@ -5813,12 +5813,17 @@ def _post_abort_v11_retry_recovery(
         else frozenset()
     )
     omitted_operation_ids = set(reference_selected) - selected_ids
+    omitted_changed_operation_ids = {
+        operation_id
+        for operation_id in omitted_operation_ids
+        if current[operation_id]["row_digest"]
+        != reference_snapshot[operation_id]["row_digest"]
+    }
     if (
         not release_only_recovery
         and reference_plan["schema_version"] == 12
         and recovery_epoch_before == 1
-        and omitted_operation_ids
-        and omitted_operation_ids.issubset(released_operation_ids)
+        and omitted_changed_operation_ids.issubset(released_operation_ids)
     ):
         release_only_recovery = True
     maximum_cumulative_attempts = (

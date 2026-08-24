@@ -5936,6 +5936,8 @@ class PortableInstallationManager:
     def _validate_rebind_authorization_receipt(
         self,
         plan: Mapping[str, Any],
+        *,
+        allow_expired: bool = False,
     ) -> dict[str, Any]:
         receipt = self._read_rebind_artifact(
             Path(plan["authorization_receipt_path"]),
@@ -5945,7 +5947,10 @@ class PortableInstallationManager:
         if (
             type(authorized_at) is not int
             or authorized_at < plan["created_at"]
-            or authorized_at >= plan["expires_at"]
+            or (
+                not allow_expired
+                and authorized_at >= plan["expires_at"]
+            )
         ):
             raise PortableInstallError("data-identity authorization receipt differs")
         receipt_body = self._rebind_receipt_body(
@@ -6060,7 +6065,14 @@ class PortableInstallationManager:
                 "verified rebind upgrade handoff does not match installation state"
             )
         self._validate_rebind_rollback_bundle(plan)
-        authorization = self._validate_rebind_authorization_receipt(plan)
+        # An already-applied rebind remains the installation's authority after
+        # its planning window closes.  Historical operation-recovery evidence
+        # must therefore validate the receipt without reopening that window;
+        # mutating rebind paths continue to use the default, fail-closed check.
+        authorization = self._validate_rebind_authorization_receipt(
+            plan,
+            allow_expired=True,
+        )
         application = self._validate_rebind_application_receipt(
             plan,
             authorization,

@@ -5121,7 +5121,8 @@ def _operation_recovery_verified_rebind_handoff(
                 manager._validate_rebind_rollback_bundle(checked)
             )
             authorized = manager._validate_rebind_authorization_receipt(
-                checked
+                checked,
+                allow_expired=True,
             )
             applied = manager._validate_rebind_application_receipt(
                 checked,

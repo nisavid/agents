@@ -250,7 +250,11 @@ class OperationRecoveryCliTest(unittest.TestCase):
                     )
                 return rollback_bundle, {}
 
-            def validate_authorization(value):
+            def validate_authorization(value, *, allow_expired=False):
+                if not allow_expired:
+                    raise AssertionError(
+                        "historical rebind validation must allow expired receipts"
+                    )
                 if value is not checked_plan:
                     raise self.controller["PortableInstallError"](
                         "verified rebind plan chain differs"
@@ -329,7 +333,10 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     manager._validate_rebind_authorization_receipt.call_args_list,
-                    [call(checked_plan), call(checked_plan)],
+                    [
+                        call(checked_plan, allow_expired=True),
+                        call(checked_plan, allow_expired=True),
+                    ],
                 )
                 self.assertEqual(
                     manager._validate_rebind_application_receipt.call_args_list,
@@ -396,8 +403,15 @@ class OperationRecoveryCliTest(unittest.TestCase):
                     )
                     return checked
 
-                def validate_authorization_with_drift(value):
-                    checked = validate_authorization(value)
+                def validate_authorization_with_drift(
+                    value,
+                    *,
+                    allow_expired=False,
+                ):
+                    checked = validate_authorization(
+                        value,
+                        allow_expired=allow_expired,
+                    )
                     mutate_on_second(
                         "authorization",
                         authorization_path,

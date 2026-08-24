@@ -3849,6 +3849,26 @@ def _exact_drain_recovery_context(
             key=lambda item: item["operation_id"],
         )
     ]
+
+    def initial_retry_evidence_is_valid(item: Mapping[str, Any]) -> bool:
+        """Permit a fresh plan to bind a due, retryable pending operation.
+
+        A stopped migration can leave a pending row carrying its already
+        recorded retry checkpoint.  The checkpoint is part of the signed
+        initial-origin projection; accepting it here avoids inventing a new
+        recovery epoch merely to clear evidence that the next worker can
+        safely consume.
+        """
+        retry_at = _post_abort_timestamp(item["next_retry_at"])
+        return (
+            item["current_status"] == "pending"
+            and item["retry_count"] > 0
+            and item["error_category"] in FAILURE_CAUSE_FAMILIES
+            and item["error_digest"] is not None
+            and retry_at is not None
+            and retry_at <= snapshot["observed_at"]
+        )
+
     initial_origin_valid = (
         set(snapshot_rows) == set(cohort_rows)
         and all(
@@ -3873,12 +3893,17 @@ def _exact_drain_recovery_context(
                 (item["current_status"] == "completed")
                 == (item["completed_at"] is not None)
             )
-            and item["next_retry_at"] is None
             and item["worker_id_present"] is False
             and item["worker_id_digest"] is None
             and item["claimed_at"] is None
-            and item["error_category"] == "none"
-            and item["error_digest"] is None
+            and (
+                (
+                    item["next_retry_at"] is None
+                    and item["error_category"] == "none"
+                    and item["error_digest"] is None
+                )
+                or initial_retry_evidence_is_valid(item)
+            )
             for item in snapshot_rows.values()
         )
     )

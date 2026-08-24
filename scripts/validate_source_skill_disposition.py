@@ -586,6 +586,7 @@ def validate_final_rescout_artifact(
         "final installed-library rescout input binding mismatch",
     )
 
+    repository_root = repository.resolve()
     for manifest in profile_manifests:
         relative = manifest["path"]
         normalized = posixpath.normpath(relative)
@@ -597,9 +598,25 @@ def validate_final_rescout_artifact(
             and not normalized.startswith("../"),
             "final installed-library rescout profile manifest binding mismatch",
         )
+        target = repository / relative
+        try:
+            require(
+                not target.is_symlink(),
+                "final installed-library rescout profile manifest is missing",
+            )
+            resolved_target = target.resolve(strict=True)
+        except OSError:
+            raise DispositionError(
+                "final installed-library rescout profile manifest is missing"
+            ) from None
+        require(
+            resolved_target == repository_root
+            or repository_root in resolved_target.parents,
+            "final installed-library rescout profile manifest binding mismatch",
+        )
         bound_manifest, bound_raw = read_document(
-            repository,
-            Path(relative),
+            repository_root,
+            resolved_target.relative_to(repository_root),
             "final installed-library rescout profile manifest",
         )
         require(

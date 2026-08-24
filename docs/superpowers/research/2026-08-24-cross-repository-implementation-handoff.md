@@ -127,6 +127,22 @@ authority or ownership.
    graph and their own authorization gates. Agents #47 records adoption
    evidence; it does not execute host mutation.
 
+## Downstream audit checkpoint (2026-08-24)
+
+The authorized dotfiles read-only audit confirms that PR #165 is a legitimate
+mixed-scope accepted baseline. Its contract/schema/admission portion is the
+#154 baseline; its prepared-capture authority work is already landed groundwork
+for the separately owned #115 lane. The accepted history should be retained,
+not rewritten or reverted, and no #113, #114, #116, release, or migration
+acceptance should be inferred from it.
+
+The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict; interpretation and resolution remain deferred to a Daybreak-capable thread. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
+
+The next downstream sequence is #154/#155 owner acceptance, then #113
+production projection, #114 legacy projection, #115 prepared sealing, and
+#116 execution. #111/#112/#127/#128 remain decision gates, while #124/#125
+remain the release-boundary consumption and materialization lane.
+
 ## Explicit non-authority and stop conditions
 
 This handoff does not:

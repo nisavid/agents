@@ -125,7 +125,7 @@ The 24-hour ceiling is not a grace period for known drift. Refresh immediately i
 
 Requalification follows the affected dependency closure derived from `evals/control-plane-matrix.json` plus the concrete package, test, documentation, evaluation, topology/owner, identity-artifact, and validator paths registered for each distribution in the refresh contract. The contract also supplies provider-to-consumer dependency edges and fixed-point traversal semantics. This closes distributions omitted by the matrix: a Tricritical change pulls in Mergecraft and then Artifact Customs; Task Witness and Versionkeeping changes pull in Mergecraft and Artifact Customs; and Rolecasting changes pull in Tricritical, Mergecraft, and Artifact Customs. It is not a blanket rerun merely because one unrelated source changed.
 
-The refresh contract makes that closure actionable. It names all six coordinated distributions; the repository and per-package candidate-identity tuple; each package's lock or source-shape identity artifact; and the source manifest, contribution ledger, disposition ledger, refresh contract, candidate identity, and installed-library evidence that the future reconciliation receipt must bind. The two checked-in `initial-*` host manifests remain historical baselines. They do not prove a later rescout. Issue #45 must produce the versioned `final-candidate-rescout-v1.json` artifact under the raw-byte-bound `final-installed-library-rescout.schema.json` contract. That schema fixes field types and constants, complete/sorted profile and instruction inventories, explicit zero-or-more counts for every rescouted surface, timestamp ordering, decision vocabulary, candidate/source/ledger/contract digests, and canonical content digests. The publication receipt must bind both the schema and completed artifact by raw-byte digest.
+The refresh contract makes that closure actionable. It names all six coordinated distributions; the repository and per-package candidate-identity tuple; each package's lock or source-shape identity artifact; and the source manifest, contribution ledger, disposition ledger, refresh contract, candidate identity, and installed-library evidence that the future reconciliation receipt must bind. The two checked-in `initial-*` host manifests remain historical baselines. They do not prove a later rescout. Issue #45 must produce the versioned `final-candidate-rescout-v1.json` artifact under the raw-byte-bound `final-installed-library-rescout.schema.json` contract, then run `uv run --with jsonschema==4.26.0 python scripts/validate_source_skill_disposition.py --require-final-rescout .`. The schema fixes field types and constants; the repository validator enforces complete/sorted profile and instruction inventories, explicit zero-or-more counts for every rescouted surface, real and ordered UTC timestamps, candidate/source/ledger/contract and profile-manifest bindings, and canonical inventory and content digests. The publication receipt must bind both the schema and completed artifact by raw-byte digest.
 
 Every immediate trigger maps to an explicit change class, and each class carries concrete JSON-pointer output selectors into the registered distribution closure, identity artifacts, receipt bindings, and required output inventory. A disposition-only change rebinds policy and downstream evidence without pretending package bytes changed. Package-byte and identity-artifact changes are separate: the former refreshes affected skills, tests, docs, locks, candidate projections, and the source manifest, while the latter keeps `changes_package_bytes` false and regenerates the candidate projection and source-manifest bindings around the changed identity evidence. Source-evidence changes rerun upstream identity/license capture and three-way reconciliation even when package bytes stay stable. Installed-membership, identity, or discovery-route changes rerun the complete installed-library rescout. Because the versioned final-rescout artifact embeds the source, contribution, disposition, refresh-contract, and candidate digests, every change class regenerates it after those inputs settle. Every class then reruns affected plugin evaluation, independent review, qualification, routing/composed compatibility, and final release evidence.
 
@@ -134,11 +134,19 @@ Every immediate trigger maps to an explicit change class, and each class carries
 Run:
 
 ```sh
-uv run --with jsonschema==4.26.0 python -m unittest tests.test_validate_source_skill_disposition
-python3 scripts/validate_source_skill_disposition.py .
+uv run --with jsonschema==4.26.0 --with PyYAML==6.0.3 python -m unittest tests.test_validate_source_skill_disposition
+uv run --with jsonschema==4.26.0 python scripts/validate_source_skill_disposition.py .
+uv run --with PyYAML==6.0.3 python -m unittest tests.test_validate_rolecasting tests.test_rolecasting_eval_corpus
+uv run --with PyYAML==6.0.3 python scripts/validate_rolecasting.py .
 ```
 
-The `Source skill disposition` pull-request check installs that pinned schema engine and runs both commands. Schema behavior is therefore required evidence rather than an optional local test.
+The `Source skill disposition` pull-request check installs those pinned dependencies and runs all four commands. Schema and Rolecasting behavior are therefore required evidence rather than optional local tests.
+
+After Issue #45 creates the final rescout artifact, its final-refresh gate runs:
+
+```sh
+uv run --with jsonschema==4.26.0 python scripts/validate_source_skill_disposition.py --require-final-rescout .
+```
 
 The validator proves exact Issue #49 contribution coverage, source-ID agreement, aggregate managed-skill coverage, raw-byte evidence bindings, refresh scope, and the no-removal/no-release authority boundary.
 

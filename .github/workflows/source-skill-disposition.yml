@@ -29,7 +29,9 @@ jobs:
       - name: Install validation dependencies
         run: python -m pip install jsonschema==4.26.0 PyYAML==6.0.3
 
-      - name: Validate the source-skill disposition
+      - name: Validate source-skill disposition and Rolecasting
         run: |
           python -m unittest tests.test_validate_source_skill_disposition
           python scripts/validate_source_skill_disposition.py .
+          python -m unittest tests.test_validate_rolecasting tests.test_rolecasting_eval_corpus
+          python scripts/validate_rolecasting.py .

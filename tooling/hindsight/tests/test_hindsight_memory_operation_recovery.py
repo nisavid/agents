@@ -933,6 +933,70 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 recovery,
             )
 
+    def test_schema_twelve_epoch_one_retry_accepts_authenticated_release_subset(self):
+        """Epoch one may omit rows released by the stopped worker."""
+        initial = self.drain_plan(schema_version=12)
+        initial["selected_operations"] = deepcopy(
+            initial["selected_operations"][:2]
+        )
+        selected = initial["selected_operations"]
+        current = {
+            item["operation_id"]: item
+            for item in initial["live_snapshot"]["operations"]
+        }
+        prior = recovery_contract._post_abort_v10_retry_recovery(
+            initial,
+            selected,
+            current,
+        )
+        reference = deepcopy(initial)
+        released_id = selected[0]["operation_id"]
+        retained_id = selected[1]["operation_id"]
+        reference["recovery_context"] = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": "systalyze:public:124",
+            "recovery_epoch": 1,
+            "candidate_release_digest": release_identity()["release_digest"],
+            "selected_operation_ids_digest": digest(
+                sorted(item["operation_id"] for item in selected)
+            ),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": digest(
+                sorted(item["operation_id"] for item in selected)
+            ),
+            "post_abort_plan_digest": initial["plan_digest"],
+            "post_abort_application_receipt_digest": "a" * 64,
+            "post_abort_verification_receipt_digest": "b" * 64,
+            "retry_recovery_digest": digest(prior),
+            "selected_checkpoint_set_digest": "c" * 64,
+            "preserved_row_set_digest": "d" * 64,
+        }
+        with patch.object(
+            recovery_contract,
+            "_post_abort_released_operation_ids",
+            return_value=frozenset({released_id}),
+        ):
+            retry = recovery_contract._post_abort_v11_retry_recovery(
+                reference,
+                [
+                    {
+                        **selected[1],
+                        "expected_status": "pending",
+                    }
+                ],
+                current,
+                prior,
+            )
+        self.assertEqual(retry["schema_version"], 2)
+        self.assertEqual(retry["recovery_epoch_before"], 1)
+        self.assertEqual(retry["recovery_epoch_after"], 2)
+        self.assertEqual(
+            [item["operation_id"] for item in retry["operations"]],
+            [retained_id],
+        )
+
     def test_schema_twelve_status_closes_payload_free_failure_classification(self):
         plan = self.drain_plan(schema_version=12)
         body = {

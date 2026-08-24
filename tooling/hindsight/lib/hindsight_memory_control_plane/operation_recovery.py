@@ -5802,6 +5802,25 @@ def _post_abort_v11_retry_recovery(
     recovery_epoch_before = context["recovery_epoch"]
     recovery_epoch_after = recovery_epoch_before + 1
     release_only_recovery = recovery_epoch_before == 2
+    # A schema-12 worker may have durably released a subset of its claimed
+    # rows before the worker stopped.  Those rows are authenticated by the
+    # progress artifact and must not be selected again merely because the
+    # recovery is still at epoch one.  Keep the older epoch-one contract
+    # strict for schema 11 and for rows without release breadcrumbs.
+    released_operation_ids = (
+        _post_abort_released_operation_ids(reference_plan)
+        if reference_plan["schema_version"] == 12
+        else frozenset()
+    )
+    omitted_operation_ids = set(reference_selected) - selected_ids
+    if (
+        not release_only_recovery
+        and reference_plan["schema_version"] == 12
+        and recovery_epoch_before == 1
+        and omitted_operation_ids
+        and omitted_operation_ids.issubset(released_operation_ids)
+    ):
+        release_only_recovery = True
     maximum_cumulative_attempts = (
         ordinary_attempt_ceiling * (recovery_epoch_after + 1)
     )

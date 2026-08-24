@@ -4144,6 +4144,7 @@ def create_exact_drain_plan(
     recovery_context: Mapping[str, Any] | None = None,
     hatchery_capability_receipt: Mapping[str, Any] | None = None,
     checkpoint_continuation_handoff: Mapping[str, Any] | None = None,
+    candidate_runtime_snapshot_schema_version: int | None = None,
     created_at: int | None = None,
     schema_version: int = 12,
 ) -> Mapping[str, Any]:
@@ -4157,6 +4158,13 @@ def create_exact_drain_plan(
     }:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan schema is invalid"
+        )
+    if candidate_runtime_snapshot_schema_version is not None and (
+        type(candidate_runtime_snapshot_schema_version) is not int
+        or candidate_runtime_snapshot_schema_version not in {7, 8}
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery candidate runtime snapshot schema is invalid"
         )
     cohort = verify_cohort_manifest(cohort_value)
     snapshot = verify_live_snapshot(live_snapshot_value)
@@ -4437,6 +4445,10 @@ def create_exact_drain_plan(
         "phase_repair_contract_digest": (
             EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
             if schema_version in {13, 14}
+            or (
+                schema_version == 12
+                and candidate_runtime_snapshot_schema_version == 8
+            )
             else (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
                 if schema_version == 12
@@ -4911,21 +4923,27 @@ def verify_exact_drain_plan(
                 or phase_one_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
                 or phase_repair_contract_digest
-                != (
-                    {
-                        3: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
-                        4: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
-                        5: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
-                        6: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
-                        7: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
-                        8: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
-                        9: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
-                        10: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
-                        11: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
-                        12: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST,
-                        13: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
-                        14: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
-                    }[schema_version]
+                not in (
+                    (
+                        EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST,
+                        EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
+                    )
+                    if schema_version == 12
+                    else (
+                        {
+                            3: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
+                            4: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
+                            5: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
+                            6: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
+                            7: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
+                            8: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
+                            9: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
+                            10: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
+                            11: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
+                            13: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
+                            14: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
+                        }[schema_version],
+                    )
                 )
             )
         )

@@ -5117,12 +5117,14 @@ def exact_drain_runtime_evidence(
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST
             )
         elif schema_version == 12:
-            if snapshot["schema_version"] != 7:
+            if snapshot["schema_version"] not in {7, 8}:
                 raise OperationRecoveryError(
                     "exact drain full-query repair snapshot is required"
                 )
             sources["phase-repair-contract"] = (
-                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
+                if snapshot["schema_version"] == 8
+                else EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
             )
         elif schema_version in {13, 14}:
             if snapshot["schema_version"] != 8:

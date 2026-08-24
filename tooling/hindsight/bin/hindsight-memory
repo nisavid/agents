@@ -9012,6 +9012,9 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         )
     else:
         _operation_recovery_exact_phase_repair_snapshot()
+    candidate_runtime_snapshot, _candidate_runtime_sources = (
+        verify_exact_drain_candidate_runtime_snapshot(LIB)
+    )
     provider_policy_digest, provider_policy = (
         _operation_recovery_exact_provider_policy_evidence(
             args.provider_policy
@@ -9162,6 +9165,9 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         recovery_context=recovery_context,
         hatchery_capability_receipt=hatchery_capability_receipt,
         checkpoint_continuation_handoff=checkpoint_continuation_handoff,
+        candidate_runtime_snapshot_schema_version=(
+            candidate_runtime_snapshot["schema_version"]
+        ),
         schema_version=plan_schema_version,
     )
     normalized_output = normalized_path(output_path)

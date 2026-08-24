@@ -14,6 +14,7 @@ import jsonschema
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "validate_source_skill_disposition.py"
+WORKFLOW = REPO_ROOT / ".github/workflows/source-skill-disposition.yml"
 LINEAGE_ROOT = Path("release/source-skill-lineage")
 DISPOSITION_ROOT = Path("release/source-skill-disposition")
 LEDGER = DISPOSITION_ROOT / "disposition-ledger.json"
@@ -34,6 +35,15 @@ def content_sha256(value: dict[str, object]) -> str:
     return canonical_sha256(
         {key: item for key, item in value.items() if key != "content_sha256"}
     )
+
+
+class SourceSkillDispositionWorkflowTests(unittest.TestCase):
+    def test_workflow_runs_for_every_pull_request_and_main_push(self) -> None:
+        workflow = WORKFLOW.read_text()
+
+        self.assertIn("  pull_request:\n", workflow)
+        self.assertIn("  push:\n    branches: [main]\n", workflow)
+        self.assertNotIn("    paths:\n", workflow)
 
 
 class SourceSkillDispositionValidatorTests(unittest.TestCase):

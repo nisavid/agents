@@ -8679,12 +8679,203 @@ def _operation_recovery_exact_phase_repair_snapshot(
     return snapshot["snapshot_digest"]
 
 
+def _operation_recovery_exact_candidate_repair_context(
+    *,
+    snapshot: Mapping[str, Any],
+    candidate_release: Mapping[str, Any],
+    reference_plan_path: str,
+) -> Mapping[str, Any]:
+    """Reuse a recovery epoch only after a pre-execution worker failure.
+
+    A worker can fail while importing its candidate before it claims a row or
+    opens a provider request.  In that case the failed exact-drain plan is an
+    immutable, read-only handoff: replacing its candidate does not require a
+    post-abort database recovery or a new epoch.  Keep this proof separate
+    from the ordinary post-abort path so a partially executed task can never
+    be treated as a candidate repair.
+    """
+    reference_plan = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(
+            reference_plan_path,
+            "candidate-repair reference exact drain plan",
+        ),
+        allow_expired=True,
+    )
+    reference_context = reference_plan.get("recovery_context")
+    if (
+        reference_plan["schema_version"] != 12
+        or reference_plan["candidate_release"] == candidate_release
+        or not isinstance(reference_context, Mapping)
+        or reference_context.get("origin") != "post-abort"
+        or reference_context.get("schema_version")
+        != reference_context.get("recovery_epoch")
+        or reference_context.get("recovery_epoch") not in {1, 2}
+        or reference_context.get("candidate_release_digest")
+        != reference_plan["candidate_release"]["release_digest"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery candidate-repair reference is invalid"
+        )
+
+    _authorization, journal = (
+        _operation_recovery_post_abort_reference_artifacts(reference_plan)
+    )
+    if _operation_recovery_exact_journal_worker_active(journal):
+        raise OperationRecoveryError(
+            "operation-recovery candidate-repair reference worker remains active"
+        )
+    progress = read_exact_drain_progress(
+        Path(reference_plan["progress_artifact_path"]),
+        plan_digest=reference_plan["plan_digest"],
+        progress_schema_version=reference_plan.get(
+            "progress_schema_version", 1
+        ),
+    )
+    failure = progress.get("worker_failure")
+    if (
+        any(
+            progress.get(key) != journal[key]
+            for key in ("worker_pid", "worker_start_time", "worker_attempt")
+        )
+        or progress.get("worker_status") != "failed"
+        or progress.get("worker_stage") != "failed"
+        or progress.get("worker_failure_stage")
+        not in {"worker.bootstrap", "worker.imports"}
+        or not isinstance(failure, Mapping)
+        or failure.get("category") != "worker_initialization"
+        or failure.get("retryable") is not False
+        or type(progress.get("worker_exit_code")) is not int
+        or progress["worker_exit_code"] == 0
+        or progress.get("active_provider_requests")
+        or progress.get("provider_counters")
+        or progress.get("prior_attempts")
+        or progress.get("cooldowns")
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery candidate-repair execution evidence differs"
+        )
+
+    tasks = progress.get("tasks")
+    expected_tasks = {
+        item["operation_id"]: (
+            item["operation_type"],
+            item["row_digest"],
+        )
+        for item in reference_plan["selected_operations"]
+    }
+    observed_tasks: dict[str, tuple[Any, Any]] = {}
+    tasks_valid = isinstance(tasks, list)
+    if tasks_valid:
+        for item in tasks:
+            if (
+                not isinstance(item, Mapping)
+                or item.get("operation_id") in observed_tasks
+                or item.get("operation_id") not in expected_tasks
+                or item.get("status") != "pending"
+                or item.get("stage") != "queued"
+                or item.get("checkpoint") is not None
+                or item.get("failure") is not None
+                or item.get("failure_stage") is not None
+            ):
+                tasks_valid = False
+                break
+            observed_tasks[item["operation_id"]] = (
+                item.get("operation_type"),
+                item.get("row_digest"),
+            )
+    if (
+        not tasks_valid
+        or observed_tasks != expected_tasks
+        or progress.get("selected_status_counts")
+        != {"pending": len(expected_tasks)}
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery candidate-repair task evidence differs"
+        )
+
+    reference_snapshot = reference_plan["live_snapshot"]
+    reference_rows = {
+        item["operation_id"]: item
+        for item in reference_snapshot["operations"]
+    }
+    current_rows = {
+        item["operation_id"]: item for item in snapshot["operations"]
+    }
+    if (
+        set(current_rows) != set(reference_rows)
+        or any(
+            current_rows[operation_id]["row_digest"]
+            != reference_rows[operation_id]["row_digest"]
+            for operation_id in reference_rows
+        )
+        or snapshot["cohort_digest"] != reference_plan["cohort_digest"]
+        or snapshot["installation_authority"]
+        != reference_plan["installation_authority"]
+        or snapshot["generation_before"]
+        != snapshot["generation_after"]
+        or snapshot["generation_before"] != reference_plan["pre_generation"]
+        or snapshot["status_counts"] != reference_snapshot["status_counts"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery candidate-repair row evidence differs"
+        )
+
+    # Preserve the prior post-abort provenance and epoch.  The immutable
+    # failed exact plan and its progress/journal are authenticated source
+    # artifacts in the enclosing plan; no row mutation or epoch increment is
+    # implied by this context.
+    return {
+        "schema_version": reference_context["schema_version"],
+        "kind": "operation-recovery-exact-drain-recovery-context",
+        "origin": "post-abort",
+        "generation": snapshot["generation_before"],
+        "recovery_epoch": reference_context["recovery_epoch"],
+        "candidate_release_digest": candidate_release["release_digest"],
+        "selected_operation_ids_digest": digest(
+            sorted(
+                item["operation_id"]
+                for item in snapshot["operations"]
+                if item["current_status"] == "pending"
+            )
+        ),
+        "initial_origin_digest": None,
+        "post_abort_selected_operation_ids_digest": reference_context[
+            "post_abort_selected_operation_ids_digest"
+        ],
+        "post_abort_plan_digest": reference_context["post_abort_plan_digest"],
+        "post_abort_application_receipt_digest": reference_context[
+            "post_abort_application_receipt_digest"
+        ],
+        "post_abort_verification_receipt_digest": reference_context[
+            "post_abort_verification_receipt_digest"
+        ],
+        "retry_recovery_digest": reference_context["retry_recovery_digest"],
+        "selected_checkpoint_set_digest": reference_context[
+            "selected_checkpoint_set_digest"
+        ],
+        "preserved_row_set_digest": reference_context[
+            "preserved_row_set_digest"
+        ],
+    }
+
+
 def _operation_recovery_exact_recovery_context(
     args: argparse.Namespace,
     *,
     snapshot: Mapping[str, Any],
     candidate_release: Mapping[str, Any],
 ) -> Mapping[str, Any] | None:
+    candidate_repair_plan_path = getattr(args, "candidate_repair_plan", None)
+    if candidate_repair_plan_path is not None:
+        if getattr(args, "recovery_plan", None) is not None:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain handoff sources are ambiguous"
+            )
+        return _operation_recovery_exact_candidate_repair_context(
+            snapshot=snapshot,
+            candidate_release=candidate_release,
+            reference_plan_path=candidate_repair_plan_path,
+        )
     recovery_plan_path = getattr(args, "recovery_plan", None)
     if recovery_plan_path is None:
         return None
@@ -8966,10 +9157,15 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         None,
     )
     recovery_plan_path = getattr(args, "recovery_plan", None)
-    if (
-        checkpoint_continuation_handoff_path is not None
-        and recovery_plan_path is not None
-    ):
+    candidate_repair_plan_path = getattr(args, "candidate_repair_plan", None)
+    if sum(
+        value is not None
+        for value in (
+            checkpoint_continuation_handoff_path,
+            recovery_plan_path,
+            candidate_repair_plan_path,
+        )
+    ) > 1:
         raise OperationRecoveryError(
             "operation-recovery exact drain handoff sources are ambiguous"
         )
@@ -9062,7 +9258,34 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
                 )
             return (str(checkpoint_continuation_handoff_path),)
         if recovery_plan_path is None:
-            return ()
+            if candidate_repair_plan_path is None:
+                return ()
+            reference_plan = verify_exact_drain_plan(
+                _operation_recovery_read_private_json(
+                    candidate_repair_plan_path,
+                    "candidate-repair reference exact drain plan",
+                ),
+                allow_expired=True,
+            )
+            source_values = [str(candidate_repair_plan_path)]
+            source_values.extend(
+                value
+                for key, value in reference_plan.items()
+                if key.endswith("_path") and isinstance(value, str)
+            )
+            source_values.extend(
+                str(
+                    exact_drain_progress_archive_path(
+                        Path(reference_plan["progress_artifact_path"]),
+                        attempt,
+                    )
+                )
+                for attempt in range(
+                    1,
+                    reference_plan["worker_max_attempts"] + 1,
+                )
+            )
+            return tuple(source_values)
         recovery_plan = verify_post_abort_recovery_plan(
             _operation_recovery_read_private_json(
                 recovery_plan_path,
@@ -14468,6 +14691,7 @@ def parser() -> argparse.ArgumentParser:
     recovery_drain_plan.add_argument("--verification-receipt", required=True)
     recovery_drain_handoff = recovery_drain_plan.add_mutually_exclusive_group()
     recovery_drain_handoff.add_argument("--recovery-plan")
+    recovery_drain_handoff.add_argument("--candidate-repair-plan")
     recovery_drain_handoff.add_argument(
         "--checkpoint-continuation-handoff"
     )

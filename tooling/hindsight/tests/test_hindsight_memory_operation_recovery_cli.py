@@ -3378,6 +3378,151 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 recovery["plan_digest"],
             )
 
+    def test_preexecution_candidate_repair_reuses_epoch_without_row_activity(self):
+        helper = self.controller[
+            "_operation_recovery_exact_candidate_repair_context"
+        ]
+        globals_ = helper.__globals__
+        old_candidate = {
+            "source_commit": "1" * 40,
+            "version": "2026.08.24+1111111.operation-recovery.70",
+            "release_digest": "2" * 64,
+        }
+        new_candidate = {
+            "source_commit": "3" * 40,
+            "version": "2026.08.24+3333333.operation-recovery.71",
+            "release_digest": "4" * 64,
+        }
+        row = {
+            "operation_id": "retain-1",
+            "operation_type": "retain",
+            "row_digest": "5" * 64,
+            "current_status": "pending",
+        }
+        snapshot = {
+            "cohort_digest": "6" * 64,
+            "installation_authority": {"authority": "stable"},
+            "generation_before": "systalyze:public:7",
+            "generation_after": "systalyze:public:7",
+            "status_counts": {"pending": 1},
+            "operations": [row],
+        }
+        context = {
+            "schema_version": 2,
+            "origin": "post-abort",
+            "recovery_epoch": 2,
+            "candidate_release_digest": old_candidate["release_digest"],
+            "post_abort_selected_operation_ids_digest": "8" * 64,
+            "post_abort_plan_digest": "9" * 64,
+            "post_abort_application_receipt_digest": "a" * 64,
+            "post_abort_verification_receipt_digest": "b" * 64,
+            "retry_recovery_digest": "c" * 64,
+            "selected_checkpoint_set_digest": "d" * 64,
+            "preserved_row_set_digest": "e" * 64,
+        }
+        reference_plan = {
+            "schema_version": 12,
+            "candidate_release": old_candidate,
+            "recovery_context": context,
+            "authorization_receipt_path": "authorization.json",
+            "application_receipt_path": "application.json",
+            "progress_artifact_path": "progress.json",
+            "selected_operations": [
+                {
+                    "operation_id": row["operation_id"],
+                    "operation_type": row["operation_type"],
+                    "row_digest": row["row_digest"],
+                }
+            ],
+            "live_snapshot": snapshot,
+            "cohort_digest": snapshot["cohort_digest"],
+            "installation_authority": snapshot[
+                "installation_authority"
+            ],
+            "pre_generation": snapshot["generation_before"],
+            "selected_operation_count": 1,
+            "worker_max_attempts": 1,
+            "plan_digest": "f" * 64,
+        }
+        journal = {
+            "worker_pid": 123,
+            "worker_start_time": "darwin:7:8",
+            "worker_attempt": 1,
+        }
+        progress = {
+            "worker_pid": 123,
+            "worker_start_time": "darwin:7:8",
+            "worker_attempt": 1,
+            "worker_status": "failed",
+            "worker_stage": "failed",
+            "worker_failure_stage": "worker.imports",
+            "worker_failure": {
+                "category": "worker_initialization",
+                "retryable": False,
+            },
+            "worker_exit_code": 2,
+            "active_provider_requests": [],
+            "provider_counters": [],
+            "prior_attempts": [],
+            "cooldowns": [],
+            "selected_status_counts": {"pending": 1},
+            "tasks": [
+                {
+                    "operation_id": row["operation_id"],
+                    "operation_type": row["operation_type"],
+                    "row_digest": row["row_digest"],
+                    "status": "pending",
+                    "stage": "queued",
+                    "checkpoint": None,
+                    "failure": None,
+                    "failure_stage": None,
+                }
+            ],
+        }
+        replacements = {
+            "verify_exact_drain_plan": (
+                lambda _value, *, allow_expired: reference_plan
+            ),
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: reference_plan
+            ),
+            "_operation_recovery_post_abort_reference_artifacts": (
+                lambda _plan: ({}, journal)
+            ),
+            "_operation_recovery_exact_journal_worker_active": (
+                lambda _journal: False
+            ),
+            "read_exact_drain_progress": (
+                lambda _path, *, plan_digest, progress_schema_version: progress
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            repaired = helper(
+                snapshot=snapshot,
+                candidate_release=new_candidate,
+                reference_plan_path="reference.json",
+            )
+            self.assertEqual(repaired["schema_version"], 2)
+            self.assertEqual(repaired["recovery_epoch"], 2)
+            self.assertEqual(
+                repaired["candidate_release_digest"],
+                new_candidate["release_digest"],
+            )
+            progress["active_provider_requests"] = [{"request": "x"}]
+            with self.assertRaisesRegex(
+                Exception,
+                "candidate-repair execution evidence differs",
+            ):
+                helper(
+                    snapshot=snapshot,
+                    candidate_release=new_candidate,
+                    reference_plan_path="reference.json",
+                )
+        finally:
+            globals_.update(originals)
+
     def test_exact_drain_plan_command_hands_off_verified_recovery_sources(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__

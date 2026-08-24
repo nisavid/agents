@@ -122,17 +122,22 @@ completed, failed, or cancelled; it does not wait for a later empty claim.
 
 If that one-shot worker closes during initialization before any selected row
 or provider request begins, the failed candidate remains immutable. A repaired
-candidate may reuse the verified post-terminal row-state handoff under a new
-exact-drain plan and a new approval digest. The new recovery context binds the
-existing reconciliation-plan digest and the repaired candidate release digest.
+candidate may reuse the failed exact-drain plan as a read-only candidate-repair
+handoff under a new exact-drain plan and a new approval digest. The handoff is
+accepted only for the closed bootstrap/import stages, with a non-retryable
+worker-initialization classification, no provider activity or prior attempts,
+all selected tasks still queued, and a matching worker identity. The current
+snapshot must also match the failed plan's generation, installation authority,
+status counts, and every operation row digest.
 
-This handoff does not update rows, consume recovery epoch four, or create a
-second reconciliation cycle. The planner still proves that the reconciled row
-states, task-payload digests, result-metadata digests, checkpoint set, preserved
-rows, and installation authority match the verified reconciliation receipt. A
-stable generation advance is accepted only with that complete durable-row
-continuity, and the new plan binds the current generation. Candidate replacement
-remains forbidden for the state-mutating recovery schemas before schema 13.
+This handoff does not update rows or consume another recovery epoch. The new
+recovery context preserves the prior post-abort provenance and epoch while
+binding the repaired candidate release digest; the failed plan, journal, and
+progress artifact remain authenticated source evidence. A task that reached
+claiming, provider execution, or a durable checkpoint is not eligible for this
+path and must use the ordinary post-abort or checkpoint-continuation contract.
+The schema-13 post-terminal reconciliation path retains its separate one-cycle
+candidate-repair rules.
 
 ## Failure handling
 

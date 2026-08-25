@@ -63,7 +63,7 @@ current tree is release-qualified.
 | PlanActionSet and prepared authority | no implementation authority | resolver projection, capture, prepared state, checkpoint, adapters, and execution | dotfiles #108, #113, #115, #116 |
 | Legacy route retirement and rollback | no host mutation | install-before-remove ordering, duplicate/shadow checks, rollback, and absence evidence | agents #51 upstream; dotfiles #80, #114, #127 |
 | Live adoption and rollback decision | publishes adoption inputs/evidence requirements | performs only separately authorized host operations | agents #47; dotfiles #68, #128 |
-| Security, trust, and authorization review | supplies evidence to the review lane | consumes the approved result | agents #53/#56 and dotfiles #112/#124, using Daybreak Blue |
+| Security, trust, and authorization review | supplies evidence to the review lane | consumes the approved result | agents #53/#56; dotfiles #112/#124 own release-receipt trust, while #168/#169 own the separate repository-admission App boundary; use Daybreak Blue where a security judgment is required |
 
 The issue numbers in this table are tracker ownership, not permission to skip a
 missing prerequisite. A green check, an old approval, or a merged parent does

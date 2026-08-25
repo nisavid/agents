@@ -217,7 +217,7 @@ migration acceptance should be inferred from it.
 The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict. At the time of this checkpoint, interpretation and resolution were deferred to a Daybreak-capable thread; the current route refresh below records the resulting disposition. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
 
 At the time of this checkpoint, the planned downstream sequence included the
-the #154/#155 owner-acceptance step, followed by #113 production projection, #114
+historical #154/#155 owner-acceptance step, followed by #113 production projection, #114
 legacy projection, #115 prepared sealing, and #116 execution. Since then, #154
 has closed. The current route keeps #155 owner acceptance and #170 requalification
 as separate gates: #113 may proceed only after #155 is completed and accepted,

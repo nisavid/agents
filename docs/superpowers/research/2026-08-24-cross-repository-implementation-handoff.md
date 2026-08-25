@@ -73,9 +73,12 @@ not promote an evidence artifact into release or migration authority.
 
 The eventual consumer input is a versioned, digest-bound *release-input
 record*. Its final field names and major version are intentionally not frozen
-by this checkpoint. They must be settled jointly by agents #45/#48 and
-dotfiles #112/#124, with the independent Daybreak review where the record is
-used as a trust or authorization input.
+by this checkpoint. `agents` remains the canonical owner of that schema and
+major version; dotfiles #112/#124 co-design and accept the consumer bindings,
+but do not create a parallel schema or unilaterally change the major. The
+contract must be settled through agents #45/#48 and dotfiles #112/#124, with
+independent Daybreak review where the record is used as a trust or
+authorization input.
 
 The minimum semantic bindings to settle are:
 

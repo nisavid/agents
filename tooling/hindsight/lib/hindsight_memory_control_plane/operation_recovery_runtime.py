@@ -5014,7 +5014,7 @@ def exact_drain_runtime_evidence(
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
     }:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"

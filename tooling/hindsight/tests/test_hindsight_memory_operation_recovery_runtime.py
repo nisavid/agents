@@ -142,6 +142,29 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_schema_fifteen_runtime_evidence_reaches_path_validation(self):
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain runtime paths must be absolute",
+        ):
+            operation_recovery_runtime.exact_drain_runtime_evidence(
+                "relative-worker",
+                "relative-provider-runtime",
+                "relative-package",
+                schema_version=15,
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain runtime evidence schema version is invalid",
+        ):
+            operation_recovery_runtime.exact_drain_runtime_evidence(
+                "relative-worker",
+                "relative-provider-runtime",
+                "relative-package",
+                schema_version=16,
+            )
+
     def test_interrupted_progress_rows_bind_every_selected_row(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         plan = fixtures.drain_plan(schema_version=12)

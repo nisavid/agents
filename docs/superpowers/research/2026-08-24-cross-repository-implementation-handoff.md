@@ -13,13 +13,14 @@ tracks installed equipment, resolves host state, and owns the separately
 authorized installation and migration workflow. Neither repository is an
 alternate implementation of the other.
 
-The recovery rule is therefore one-way data flow with explicit ownership:
+The recovery rule is therefore one-way implementation and authority flow, with
+a separate evidence-return lane:
 
 ```text
 agents release candidate and receipts
         -> dotfiles catalog, lock, and host plan
         -> installed/convergence evidence
-        -> adoption evidence returned to the release tracker
+        -> separate adoption evidence return to the release tracker
 ```
 
 There is no shared mutable runtime module and no parallel installer. If a
@@ -172,7 +173,7 @@ candidate for planning, but it must not import candidate code, create a
 release receipt, authorize an apply, or infer that host migration is allowed.
 
 The downstream receipt-binding implementation belongs in dotfiles #124 after
-#112 settles the record/version. The upstream release and source evidence
+issue #112 settles the record/version. The upstream release and source evidence
 remain in `agents`; copying them into dotfiles does not transfer their
 authority or ownership.
 
@@ -192,7 +193,7 @@ authority or ownership.
    schema in either repository before this agreement.
 4. **Audit the downstream implementation frontier.** The dotfiles owner
    reviews merged PR #165 against #154 and #115, and open PR #166 against
-   #155, then proposes narrow follow-ups. This audit decides ownership and
+   issue #155, then proposes narrow follow-ups. This audit decides ownership and
    patch disposition; it does not grant a security verdict or migration
    authority.
 5. **Materialize only after both gates.** Dotfiles #80/#124 may bind the exact
@@ -208,19 +209,21 @@ authority or ownership.
 
 The authorized dotfiles read-only audit confirms that PR #165 is a legitimate
 mixed-scope accepted baseline. Its contract/schema/admission portion is the
-#154 baseline; its prepared-capture authority work is already landed groundwork
+baseline from issue #154; its prepared-capture authority work is already landed groundwork
 for the separately owned #115 lane. The accepted history should be retained,
 not rewritten or reverted, and no #113, #114, #115, #116, release, or
 migration acceptance should be inferred from it.
 
 The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict. At the time of this checkpoint, interpretation and resolution were deferred to a Daybreak-capable thread; the current route refresh below records the resulting disposition. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
 
-At the time of this checkpoint, the planned downstream sequence was #154/#155
-owner acceptance, then #113 production projection, #114 legacy projection,
-#115 prepared sealing, and #116 execution. Since then, #154 has closed; the
-current sequence is #155/#170 requalification, then #113 production
-projection, #114 legacy projection, #115 prepared sealing, and #116 execution.
-#111/#112/#127/#128 remain decision gates, while #124/#125 remain the
+At the time of this checkpoint, the planned downstream sequence included the
+the #154/#155 owner-acceptance step, followed by #113 production projection, #114
+legacy projection, #115 prepared sealing, and #116 execution. Since then, #154
+has closed. The current route keeps #155 owner acceptance and #170 requalification
+as separate gates: #113 may proceed only after #155 is completed and accepted,
+while #170 independently closes the #166 test lane. Then come #114 (with #111's
+decision gate), #115, and #116. Issues #111/#112/#127/#128 remain decision gates,
+while #124/#125 remain the
 release-boundary consumption and materialization lane.
 
 ## Current route refresh (2026-08-25)
@@ -231,13 +234,15 @@ check, not a receipt requirement for test-only PR #166, and approved the
 workflow-backed event-driven publisher route with required changes. Dotfiles
 PR #172 contains the non-privileged source slice; its remaining hosted privacy
 findings and the App credential/bootstrap deployment are owner-gated under
-#168/#169. The source-skill receipt questions in agents #53/#56 remain a
+issues #168/#169. The source-skill receipt questions in agents #53/#56 remain a
 separate Daybreak lane.
 
-This refresh does not change the authority boundary: #170 still owns #166's
-exact-head requalification for the still-open #155 lane. Once that is done,
-the downstream graph resumes at #113, then #114 (with #111's decision gate),
-#115, and #116; #154 is already closed. No receipt, branch-protection edit,
+This refresh does not change the authority boundary: #170 independently owns
+the #166 exact-head requalification, while #155 remains the prerequisite for
+issue #113. The downstream graph resumes at #113 only after #155 is completed and
+owner-accepted; #170 does not replace that gate. Then come #114 (with #111's
+decision gate), #115, and #116; #154 is already closed. No receipt,
+branch-protection edit,
 release, or host mutation is authorized by this handoff.
 
 ## Explicit non-authority and stop conditions

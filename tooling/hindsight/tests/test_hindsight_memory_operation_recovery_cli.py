@@ -3718,6 +3718,174 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         finally:
             globals_.update(originals)
 
+    def test_schema_15_candidate_repair_accepts_quiescent_claim_release(self):
+        helper = self.controller[
+            "_operation_recovery_exact_candidate_repair_context"
+        ]
+        globals_ = helper.__globals__
+        old_candidate = {
+            "source_commit": "1" * 40,
+            "version": "2026.08.25+1111111.operation-recovery.85",
+            "release_digest": "2" * 64,
+        }
+        new_candidate = {
+            "source_commit": "3" * 40,
+            "version": "2026.08.25+3333333.operation-recovery.86",
+            "release_digest": "4" * 64,
+        }
+        before = {
+            "operation_id": "retain-1",
+            "operation_type": "retain",
+            "row_digest": "5" * 64,
+            "task_payload_digest": "6" * 64,
+            "result_metadata_digest": "7" * 64,
+            "current_status": "pending",
+            "retry_count": 1,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "next_retry_at": None,
+            "error_category": "none",
+            "error_digest": None,
+        }
+        after = {
+            **before,
+            "row_digest": "8" * 64,
+        }
+        snapshot = {
+            "cohort_digest": "9" * 64,
+            "installation_authority": {"authority": "stable"},
+            "generation_before": "systalyze:public:12",
+            "generation_after": "systalyze:public:12",
+            "status_counts": {"pending": 1},
+            "operations": [after],
+        }
+        context = {
+            "schema_version": 4,
+            "origin": "post-terminal-reconciliation",
+            "recovery_epoch": 3,
+            "reconciliation_cycle": 1,
+            "candidate_release_digest": old_candidate["release_digest"],
+            "post_terminal_reconciliation_plan_digest": "a" * 64,
+            "post_terminal_reconciliation_application_receipt_digest": (
+                "b" * 64
+            ),
+            "post_terminal_reconciliation_verification_receipt_digest": (
+                "c" * 64
+            ),
+            "terminal_plan_digest": "d" * 64,
+            "terminal_authorization_receipt_digest": "e" * 64,
+            "terminal_application_receipt_digest": "f" * 64,
+            "terminal_progress_digest": "0" * 64,
+            "terminal_status_digest": "1" * 64,
+            "retry_recovery_digest": "2" * 64,
+            "selected_checkpoint_set_digest": "3" * 64,
+            "preserved_row_set_digest": "4" * 64,
+            "initial_origin_digest": None,
+        }
+        reference_plan = {
+            "schema_version": 15,
+            "candidate_release": old_candidate,
+            "recovery_context": context,
+            "authorization_receipt_path": "authorization.json",
+            "application_receipt_path": "application.json",
+            "progress_artifact_path": "progress.json",
+            "selected_operations": [
+                {
+                    "operation_id": before["operation_id"],
+                    "operation_type": before["operation_type"],
+                    "row_digest": before["row_digest"],
+                }
+            ],
+            "live_snapshot": {
+                **snapshot,
+                "generation_before": "systalyze:public:10",
+                "generation_after": "systalyze:public:10",
+                "operations": [before],
+            },
+            "cohort_digest": snapshot["cohort_digest"],
+            "installation_authority": snapshot["installation_authority"],
+            "pre_generation": "systalyze:public:10",
+            "selected_operation_count": 1,
+            "worker_max_attempts": 1,
+            "progress_schema_version": 6,
+            "plan_digest": "5" * 64,
+        }
+        journal = {
+            "worker_pid": 123,
+            "worker_start_time": "darwin:7:8",
+            "worker_attempt": 1,
+        }
+        progress = {
+            **journal,
+            "worker_status": "running",
+            "worker_stage": "worker.main",
+            "worker_failure_stage": None,
+            "worker_failure": None,
+            "worker_exit_code": None,
+            "active_provider_requests": [],
+            "provider_counters": [],
+            "prior_attempts": [],
+            "cooldowns": [],
+            "selected_status_counts": {"processing": 1},
+            "tasks": [
+                {
+                    "operation_id": before["operation_id"],
+                    "operation_type": before["operation_type"],
+                    "row_digest": before["row_digest"],
+                    "status": "processing",
+                    "stage": "batch_retain.sub_batch.1",
+                    "checkpoint": None,
+                    "failure": None,
+                    "failure_stage": None,
+                }
+            ],
+        }
+        replacements = {
+            "verify_exact_drain_plan": (
+                lambda _value, *, allow_expired: reference_plan
+            ),
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: reference_plan
+            ),
+            "_operation_recovery_post_abort_reference_artifacts": (
+                lambda _plan: ({}, journal)
+            ),
+            "_operation_recovery_exact_journal_worker_active": (
+                lambda _journal: False
+            ),
+            "read_exact_drain_progress": (
+                lambda _path, *, plan_digest, progress_schema_version: progress
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            repaired = helper(
+                snapshot=snapshot,
+                candidate_release=new_candidate,
+                reference_plan_path="reference.json",
+            )
+            self.assertEqual(repaired["schema_version"], 4)
+            self.assertEqual(repaired["recovery_epoch"], 3)
+            self.assertEqual(repaired["reconciliation_cycle"], 1)
+            self.assertEqual(
+                repaired["candidate_release_digest"],
+                new_candidate["release_digest"],
+            )
+            progress["provider_counters"] = [{"provider": "hatchery"}]
+            with self.assertRaisesRegex(
+                Exception,
+                "candidate-repair execution evidence differs",
+            ):
+                helper(
+                    snapshot=snapshot,
+                    candidate_release=new_candidate,
+                    reference_plan_path="reference.json",
+                )
+        finally:
+            globals_.update(originals)
+
     def test_exact_drain_plan_command_hands_off_verified_recovery_sources(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__

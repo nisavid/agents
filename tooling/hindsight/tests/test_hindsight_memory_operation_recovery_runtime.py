@@ -3177,8 +3177,12 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertFalse(hasattr(poller, "_exact_drain_task_errors"))
 
     def test_runtime_guard_records_claim_only_after_upstream_commit_seam(self):
+        attempts = []
         committed = []
         task = type("Task", (), {"operation_id": "operation-1"})()
+
+        class SerializationFailure(RuntimeError):
+            sqlstate = "40001"
 
         class Adapter(_ControlConnectionAdapterMixin):
             def claim_committed(self, tasks):
@@ -3193,10 +3197,15 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
             async def _claim_batch_for_schema_inner(
                 self,
-                _schema,
-                _reserved_limits,
-                _shared_limit,
+                schema,
+                reserved_limits,
+                shared_limit,
             ):
+                attempts.append((schema, reserved_limits, shared_limit))
+                if len(attempts) == 1:
+                    raise SerializationFailure(
+                        "could not serialize access due to concurrent update"
+                    )
                 return [task]
 
             async def _claim_batch_for_schema(self, schema, reserved, shared):
@@ -3218,6 +3227,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         )
 
         self.assertEqual(result, [task])
+        self.assertEqual(attempts, [(None, {}, 1), (None, {}, 1)])
         self.assertEqual(committed, [task])
 
     def test_exact_terminal_failure_never_uses_upstream_sql_reclaim(self):
@@ -3425,6 +3435,82 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             events[3][4:],
             ("provider capacity exhausted after failover", "public"),
         )
+
+    def test_serialization_abort_retries_terminal_persistence_without_shutdown(self):
+        attempts = []
+        failures = []
+        shutdown_requests = []
+
+        class SerializationFailure(RuntimeError):
+            sqlstate = "40001"
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            async def schedule_retry(
+                self,
+                backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            ):
+                attempts.append(
+                    (
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+                if len(attempts) == 1:
+                    raise SerializationFailure(
+                        "could not serialize access due to concurrent update"
+                    )
+
+            def record_upstream_failure(self, *arguments, **keywords):
+                failures.append((arguments, keywords))
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-1",
+                "canceling statement due to statement timeout",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(failures, [])
+        self.assertEqual(shutdown_requests, [])
 
     def test_swallowed_exact_terminal_failures_surface_after_public_shutdown(self):
         try:
@@ -4476,6 +4562,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         events = []
         retries = []
 
+        class SerializationFailure(RuntimeError):
+            sqlstate = "40001"
+
         class Adapter(_ControlConnectionAdapterMixin):
             operation_attempt_timeout_seconds = 0.01
             operation_attempt_timeout_disposition = (
@@ -4503,6 +4592,10 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         schema,
                     )
                 )
+                if len(retries) == 1:
+                    raise SerializationFailure(
+                        "could not serialize access due to concurrent update"
+                    )
 
         class WorkerPoller(_RunCapableWorkerPoller):
             _backend = "exact-backend"
@@ -4546,7 +4639,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertFalse(poller._shutdown.is_set())
         self.assertEqual(events, ["cancelled"])
-        self.assertEqual(len(retries), 1)
+        self.assertEqual(len(retries), 2)
+        self.assertEqual(retries[0], retries[1])
         backend, operation_id, retry_at, error_message, schema = retries[0]
         self.assertEqual(backend, "exact-backend")
         self.assertEqual(operation_id, "operation-1")

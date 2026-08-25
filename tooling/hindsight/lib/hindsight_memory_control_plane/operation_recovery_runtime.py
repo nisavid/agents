@@ -110,6 +110,7 @@ EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
 )
 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS = "3600"
 EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS = "8192"
+EXACT_DRAIN_SERIALIZATION_RETRY_ATTEMPTS = 3
 EXACT_DRAIN_PROVIDER_ORDER = (
     "work-codex",
     "personal-codex",
@@ -1954,6 +1955,22 @@ def install_exact_drain_runtime_guards(
         phase_one_statement_timeout_seconds or 0,
     )
 
+    async def retry_serializable_mutation(mutation: Callable[[], Any]) -> Any:
+        for attempt in range(EXACT_DRAIN_SERIALIZATION_RETRY_ATTEMPTS):
+            try:
+                return await mutation()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                if (
+                    getattr(error, "sqlstate", None) != "40001"
+                    or attempt + 1
+                    >= EXACT_DRAIN_SERIALIZATION_RETRY_ATTEMPTS
+                ):
+                    raise
+                await asyncio.sleep(0)
+        raise AssertionError("unreachable serialization retry state")
+
     async def claim_tasks(_ops: Any, *args: Any, **kwargs: Any) -> Any:
         return await adapter.claim_tasks(*args, **kwargs)
 
@@ -1978,7 +1995,9 @@ def install_exact_drain_runtime_guards(
         )
 
     async def recover_exact_tasks(poller: Any) -> int:
-        return await adapter.recover_own_tasks(poller._backend)
+        return await retry_serializable_mutation(
+            lambda: adapter.recover_own_tasks(poller._backend)
+        )
 
     async def suppress_upstream_processing_reclaim(
         _poller: Any,
@@ -2014,7 +2033,9 @@ def install_exact_drain_runtime_guards(
                 raise OperationRecoveryError(
                     "exact drain claim release requires worker quiescence"
                 )
-            return await adapter.release_own_tasks(poller._backend)
+            return await retry_serializable_mutation(
+                lambda: adapter.release_own_tasks(poller._backend)
+            )
 
     def request_exact_worker_shutdown(poller: Any) -> None:
         nonlocal claim_release_disabled, worker_shutdown_requested
@@ -2232,12 +2253,15 @@ def install_exact_drain_runtime_guards(
                     )
         if retry_deadline_message is not None:
             try:
-                await adapter.schedule_retry(
-                    poller._backend,
-                    task.operation_id,
-                    datetime.now(timezone.utc),
-                    retry_deadline_message,
-                    getattr(task, "schema", None),
+                retry_at = datetime.now(timezone.utc)
+                await retry_serializable_mutation(
+                    lambda: adapter.schedule_retry(
+                        poller._backend,
+                        task.operation_id,
+                        retry_at,
+                        retry_deadline_message,
+                        getattr(task, "schema", None),
+                    )
                 )
             except BaseException as error:
                 try:
@@ -2263,11 +2287,13 @@ def install_exact_drain_runtime_guards(
             shutdown_is_set = getattr(shutdown, "is_set", None)
             if callable(shutdown_is_set) and shutdown_is_set():
                 return []
-            tasks = await upstream_claim_batch_inner(
-                poller,
-                schema,
-                reserved_limits,
-                shared_limit,
+            tasks = await retry_serializable_mutation(
+                lambda: upstream_claim_batch_inner(
+                    poller,
+                    schema,
+                    reserved_limits,
+                    shared_limit,
+                )
             )
             try:
                 adapter.claim_committed(tasks)
@@ -2460,12 +2486,14 @@ def install_exact_drain_runtime_guards(
         error_message: str,
         schema: str | None,
     ) -> None:
-        await adapter.schedule_retry(
-            poller._backend,
-            operation_id,
-            retry_at,
-            error_message,
-            schema,
+        await retry_serializable_mutation(
+            lambda: adapter.schedule_retry(
+                poller._backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            )
         )
 
     async def defer_exact_operation(
@@ -2475,12 +2503,14 @@ def install_exact_drain_runtime_guards(
         reason: str,
         schema: str | None,
     ) -> None:
-        await adapter.defer_operation(
-            poller._backend,
-            operation_id,
-            exec_date,
-            reason,
-            schema,
+        await retry_serializable_mutation(
+            lambda: adapter.defer_operation(
+                poller._backend,
+                operation_id,
+                exec_date,
+                reason,
+                schema,
+            )
         )
 
     async def mark_exact_completed(
@@ -2488,10 +2518,12 @@ def install_exact_drain_runtime_guards(
         operation_id: str,
         schema: str | None,
     ) -> None:
-        await adapter.mark_completed(
-            poller._backend,
-            operation_id,
-            schema,
+        await retry_serializable_mutation(
+            lambda: adapter.mark_completed(
+                poller._backend,
+                operation_id,
+                schema,
+            )
         )
 
     async def mark_exact_failed(
@@ -2502,19 +2534,24 @@ def install_exact_drain_runtime_guards(
     ) -> None:
         try:
             if _exact_drain_error_is_transient(error_message):
-                await adapter.schedule_retry(
-                    poller._backend,
-                    operation_id,
-                    datetime.now(timezone.utc),
-                    error_message,
-                    schema,
+                retry_at = datetime.now(timezone.utc)
+                await retry_serializable_mutation(
+                    lambda: adapter.schedule_retry(
+                        poller._backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
                 )
             else:
-                await adapter.mark_failed(
-                    poller._backend,
-                    operation_id,
-                    error_message,
-                    schema,
+                await retry_serializable_mutation(
+                    lambda: adapter.mark_failed(
+                        poller._backend,
+                        operation_id,
+                        error_message,
+                        schema,
+                    )
                 )
         except asyncio.CancelledError:
             raise
@@ -2539,10 +2576,13 @@ def install_exact_drain_runtime_guards(
         engine: Any,
         operation_id: str,
     ) -> None:
-        await adapter.mark_completed(
-            await engine._get_backend(),
-            operation_id,
-            None,
+        backend = await engine._get_backend()
+        await retry_serializable_mutation(
+            lambda: adapter.mark_completed(
+                backend,
+                operation_id,
+                None,
+            )
         )
 
     async def engine_mark_exact_failed(
@@ -2551,11 +2591,14 @@ def install_exact_drain_runtime_guards(
         error_message: str,
         error_traceback: str,
     ) -> None:
-        await adapter.mark_failed(
-            await engine._get_backend(),
-            operation_id,
-            f"{error_message}\n\nTraceback:\n{error_traceback}",
-            None,
+        backend = await engine._get_backend()
+        await retry_serializable_mutation(
+            lambda: adapter.mark_failed(
+                backend,
+                operation_id,
+                f"{error_message}\n\nTraceback:\n{error_traceback}",
+                None,
+            )
         )
 
     async def engine_mark_exact_consolidation_completed(
@@ -2574,14 +2617,18 @@ def install_exact_drain_runtime_guards(
             )
         backend = await engine._get_backend()
         if status == "completed" and error_message in {None, ""}:
-            await adapter.mark_completed(backend, operation_id, schema)
+            await retry_serializable_mutation(
+                lambda: adapter.mark_completed(backend, operation_id, schema)
+            )
             return
         if status == "failed" and isinstance(error_message, str):
-            await adapter.mark_failed(
-                backend,
-                operation_id,
-                error_message,
-                schema,
+            await retry_serializable_mutation(
+                lambda: adapter.mark_failed(
+                    backend,
+                    operation_id,
+                    error_message,
+                    schema,
+                )
             )
             return
         raise OperationRecoveryError(

@@ -28,7 +28,6 @@ from tooling.hindsight.tests import (
     test_hindsight_memory_operation_recovery as recovery_fixtures,
 )
 from tooling.hindsight.tests.test_hindsight_memory_provider_runtime import (
-    four_codex_policy_data,
     four_codex_split_timeout_policy_data,
     policy_data,
 )
@@ -6990,6 +6989,15 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             repair_policy,
             plan_schema_version=14,
         )
+        operation_recovery_runtime.validate_exact_drain_provider_policy(
+            repair_policy,
+            plan_schema_version=15,
+        )
+        with self.assertRaisesRegex(Exception, "provider policy differs"):
+            operation_recovery_runtime.validate_exact_drain_provider_policy(
+                old_timeout_policy,
+                plan_schema_version=15,
+            )
 
         legacy_value = deepcopy(policy_value)
         legacy_value["schema_version"] = 1

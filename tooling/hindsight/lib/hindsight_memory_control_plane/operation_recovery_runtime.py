@@ -461,7 +461,7 @@ def validate_exact_drain_provider_policy(
             != (
                 (
                     3600
-                    if plan_schema_version in {11, 12, 13, 14}
+                    if plan_schema_version in {11, 12, 13, 14, 15}
                     else 1200
                 )
                 if member.id == "hatchery"

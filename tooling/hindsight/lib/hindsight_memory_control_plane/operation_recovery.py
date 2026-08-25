@@ -5382,8 +5382,12 @@ def verify_exact_drain_plan(
                 or phase_one_nested_stage_prefixes != ["llm."]
                 or provider_timeout_contract
                 not in (
-                    EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT,
-                    EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED,
+                    (EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED,)
+                    if schema_version == 15
+                    else (
+                        EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT,
+                        EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT_REPAIRED,
+                    )
                 )
                 or (
                     schema_version in {12, 13, 14, 15}

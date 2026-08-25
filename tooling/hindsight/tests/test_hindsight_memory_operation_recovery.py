@@ -803,7 +803,28 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan["execution_window"]["operation_attempt_timeout_seconds"],
             7_200,
         )
-        self.assertEqual(plan["execution_window"]["effective_concurrency"], 2)
+        self.assertEqual(
+            plan["execution_window"],
+            {
+                "schema_version": 2,
+                "kind": "operation-recovery-exact-drain-execution-window",
+                "anchor": "authorization-receipt-authorized-at",
+                "renewable": False,
+                "selected_operation_count": 43,
+                "remaining_attempt_count": 172,
+                "retry_wait_count": 129,
+                "effective_concurrency": 2,
+                "operation_attempt_timeout_seconds": 7_200,
+                "transaction_timeout_seconds": 120,
+                "maximum_retry_delay_seconds": 3_600,
+                "startup_margin_seconds": 28_800,
+                "transaction_margin_seconds": 41_280,
+                "shutdown_attempt_count": 4,
+                "shutdown_margin_seconds": 480,
+                "calculated_seconds": 1_154_160,
+                "maximum_seconds": 1_209_600,
+            },
+        )
         self.assertEqual(
             plan["provider_timeout_contract"]["members"][-1],
             {
@@ -839,6 +860,50 @@ class OperationRecoveryContractTest(unittest.TestCase):
                         changed,
                         now=changed["created_at"],
                     )
+
+        downgraded = deepcopy(plan)
+        downgraded["provider_timeout_contract"] = deepcopy(
+            recovery_contract.EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT
+        )
+        downgraded["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in downgraded.items()
+                if key != "plan_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain plan is invalid",
+        ):
+            recovery_contract.verify_exact_drain_plan(
+                downgraded,
+                now=downgraded["created_at"],
+            )
+
+    def test_schema_fifteen_claim_obeys_execution_budget(self):
+        _reference, grant, plan, _create_plan = self.standing_grant_fixture(
+            maximum_plan_claims=1,
+            maximum_execution_seconds=1_154_159,
+        )
+        ledger = recovery_contract.create_exact_drain_grant_ledger(
+            grant,
+            ledger_nonce="1" * 64,
+            created_at=plan["created_at"],
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain grant budget exhausted",
+        ):
+            recovery_contract.claim_exact_drain_grant(
+                ledger,
+                plan,
+                expected_ledger_digest=ledger["ledger_digest"],
+                claim_nonce="2" * 64,
+                ledger_nonce="3" * 64,
+                claimed_at=plan["created_at"],
+            )
 
     def test_exact_drain_grant_claim_is_atomic_and_crash_idempotent(self):
         created_at = 1_785_462_000

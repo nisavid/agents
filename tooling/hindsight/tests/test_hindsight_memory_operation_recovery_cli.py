@@ -3756,13 +3756,22 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "error_category": "provider_transport",
             "error_digest": "a" * 64,
         }
+        unchanged_pending = {
+            **before,
+            "operation_id": "retain-2",
+            "row_digest": "b" * 64,
+            "retry_count": 2,
+            "next_retry_at": "2026-08-25T17:40:00+00:00",
+            "error_category": "unknown",
+            "error_digest": "c" * 64,
+        }
         snapshot = {
             "cohort_digest": "9" * 64,
             "installation_authority": {"authority": "stable"},
             "generation_before": "systalyze:public:12",
             "generation_after": "systalyze:public:12",
-            "status_counts": {"pending": 1},
-            "operations": [after],
+            "status_counts": {"pending": 2},
+            "operations": [after, unchanged_pending],
         }
         context = {
             "schema_version": 4,
@@ -3799,18 +3808,23 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     "operation_id": before["operation_id"],
                     "operation_type": before["operation_type"],
                     "row_digest": before["row_digest"],
-                }
+                },
+                {
+                    "operation_id": unchanged_pending["operation_id"],
+                    "operation_type": unchanged_pending["operation_type"],
+                    "row_digest": unchanged_pending["row_digest"],
+                },
             ],
             "live_snapshot": {
                 **snapshot,
                 "generation_before": "systalyze:public:10",
                 "generation_after": "systalyze:public:10",
-                "operations": [before],
+                "operations": [before, unchanged_pending],
             },
             "cohort_digest": snapshot["cohort_digest"],
             "installation_authority": snapshot["installation_authority"],
             "pre_generation": "systalyze:public:10",
-            "selected_operation_count": 1,
+            "selected_operation_count": 2,
             "worker_max_attempts": 1,
             "progress_schema_version": 6,
             "plan_digest": "5" * 64,
@@ -3831,7 +3845,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "provider_counters": [],
             "prior_attempts": [],
             "cooldowns": [],
-            "selected_status_counts": {"processing": 1},
+            "selected_status_counts": {"pending": 1, "processing": 1},
             "tasks": [
                 {
                     "operation_id": before["operation_id"],
@@ -3842,7 +3856,17 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     "checkpoint": None,
                     "failure": None,
                     "failure_stage": None,
-                }
+                },
+                {
+                    "operation_id": unchanged_pending["operation_id"],
+                    "operation_type": unchanged_pending["operation_type"],
+                    "row_digest": unchanged_pending["row_digest"],
+                    "status": "pending",
+                    "stage": "queued",
+                    "checkpoint": None,
+                    "failure": None,
+                    "failure_stage": None,
+                },
             ],
         }
         replacements = {

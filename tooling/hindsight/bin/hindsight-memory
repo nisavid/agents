@@ -8880,13 +8880,7 @@ def _operation_recovery_exact_candidate_repair_context(
             ):
                 return False
             if observed_task_statuses[operation_id] == "pending":
-                return (
-                    current.get("retry_count")
-                    == reference.get("retry_count")
-                    and current.get("next_retry_at") is None
-                    and current.get("error_category") == "none"
-                    and current.get("error_digest") is None
-                )
+                return current.get("row_digest") == reference.get("row_digest")
             return (
                 current.get("retry_count")
                 == reference.get("retry_count") + 1

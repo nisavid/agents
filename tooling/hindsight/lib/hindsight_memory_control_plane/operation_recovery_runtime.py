@@ -950,7 +950,7 @@ def _exact_drain_failure_evidence(
     category_override: str | None = None,
     progress_schema_version: int = 5,
 ) -> dict[str, Any]:
-    if progress_schema_version not in {1, 2, 3, 4, 5}:
+    if progress_schema_version not in {1, 2, 3, 4, 5, 6}:
         raise OperationRecoveryError(
             "exact drain progress schema version is invalid"
         )
@@ -1791,7 +1791,7 @@ def install_exact_drain_runtime_guards(
     plan = getattr(adapter, "_plan", {})
     records_worker_lifecycle = (
         isinstance(plan, Mapping)
-        and plan.get("progress_schema_version") in {3, 4, 5}
+        and plan.get("progress_schema_version") in {3, 4, 5, 6}
     )
     upstream_memory_initialize = getattr(memory_engine_type, "initialize", None)
     if not callable(upstream_run) or (
@@ -5604,7 +5604,7 @@ class ExactDrainClaimAdapter:
     ) -> None:
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") in {2, 3, 4, 5}:
+        if self._plan.get("progress_schema_version") in {2, 3, 4, 5, 6}:
             self._progress_recorder.task_outcome(
                 operation_id,
                 status=status,
@@ -5623,7 +5623,7 @@ class ExactDrainClaimAdapter:
         """Persist a worker lifecycle stage when the plan binds it."""
         if (
             self._progress_recorder is not None
-            and self._plan.get("progress_schema_version") in {3, 4, 5}
+            and self._plan.get("progress_schema_version") in {3, 4, 5, 6}
         ):
             self._progress_recorder.worker_stage(
                 status=status,
@@ -5639,7 +5639,7 @@ class ExactDrainClaimAdapter:
         """Persist a closed worker-level failure without changing DB state."""
         if (
             self._progress_recorder is not None
-            and self._plan.get("progress_schema_version") in {3, 4, 5}
+            and self._plan.get("progress_schema_version") in {3, 4, 5, 6}
             and getattr(self._progress_recorder, "_worker_status", None)
             != "failed"
         ):
@@ -5837,7 +5837,7 @@ class ExactDrainClaimAdapter:
             )
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") not in {2, 3, 4, 5}:
+        if self._plan.get("progress_schema_version") not in {2, 3, 4, 5, 6}:
             self.record_upstream_stage(operation_id, stage)
             return
         message = str(error_message)

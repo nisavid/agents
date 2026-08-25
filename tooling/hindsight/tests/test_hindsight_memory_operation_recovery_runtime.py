@@ -142,6 +142,90 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_progress_schema_six_records_closed_runtime_evidence(self):
+        events = []
+
+        class Recorder:
+            _worker_status = "running"
+            _worker_stage = "worker.main"
+
+            def task_stage(self, operation_id, *, status, stage):
+                events.append(("task_stage", operation_id, status, stage))
+
+            def task_outcome(
+                self,
+                operation_id,
+                *,
+                status,
+                stage,
+                failure,
+                checkpoint,
+            ):
+                events.append(
+                    (
+                        "task_outcome",
+                        operation_id,
+                        status,
+                        stage,
+                        failure,
+                        checkpoint,
+                    )
+                )
+
+            def task_runtime_failure(
+                self,
+                operation_id,
+                *,
+                stage,
+                failure,
+            ):
+                events.append(
+                    ("task_runtime_failure", operation_id, stage, failure)
+                )
+
+            def worker_stage(self, *, status, stage):
+                events.append(("worker_stage", status, stage))
+
+            def worker_failure(self, *, exit_code, failure):
+                events.append(("worker_failure", exit_code, failure))
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {"progress_schema_version": 6}
+        adapter._progress_recorder = Recorder()
+
+        adapter._record_task_outcome(
+            "00000000-0000-4000-8000-000000000001",
+            status="failed",
+            stage="task.failed",
+            failure={"category": "provider_transport"},
+            checkpoint=None,
+        )
+        adapter.record_upstream_failure(
+            "00000000-0000-4000-8000-000000000001",
+            stage="provider.execution",
+            category="retry_ceiling",
+            retryable=True,
+            error_message=ConnectionError("private provider detail"),
+        )
+        adapter.record_worker_stage(status="running", stage="worker.main")
+        adapter.record_worker_failure(
+            RuntimeError("private worker detail"),
+            exit_code=2,
+        )
+
+        self.assertEqual(
+            [event[0] for event in events],
+            [
+                "task_outcome",
+                "task_runtime_failure",
+                "worker_stage",
+                "worker_failure",
+            ],
+        )
+        self.assertEqual(events[1][3]["category"], "retry_ceiling")
+        self.assertEqual(events[3][2]["category"], "worker_runtime_failure")
+        self.assertNotIn("private", json.dumps(events))
+
     def test_schema_fifteen_runtime_evidence_reaches_path_validation(self):
         with self.assertRaisesRegex(
             OperationRecoveryError,

@@ -52,6 +52,77 @@ installed-library rescout artifact is not yet present. The historical source
 manifest is evidence of what was previously observed, not proof that the
 current tree is release-qualified.
 
+## Public plugin release boundary (2026-08-25)
+
+This handoff concerns the first **public release of the Agent Plugins v1
+distributions**. It does not define the first private release of the dotfiles
+global-equipment tracker, catalog, or installer. The two projects meet only
+when the qualified public release is supplied as an immutable input to the
+downstream equipment system.
+
+In the language of the global-equipment contract, a *distribution* is an
+installable bundle and a *provider route* is one concrete way to expose that
+bundle to a harness. A *harness coverage record* is the result for one
+equipment identity in one harness. For this release, a review “cell” means one
+audited-host × harness/provider-route combination; it is not another package
+or another release unit.
+
+The public v1 qualification boundary is the two audited hosts and every
+meaningfully distinct supported harness route they expose. The intended
+support includes Codex, Claude, Cursor, and Cursor Agent routes on macOS and
+Linux where the host supports them. Claude Desktop is unsupported on Hatchery
+and is excluded there; it remains a supported macOS route. A route is not
+declared validated merely because its application or command is installed.
+
+For the first public release, each supported route requires a thorough local
+end-to-end smoke suite. The suite must exercise every meaningfully distinct
+path through every capability of each distribution, using the operator's
+active inference accounts on the two audited hosts. The evidence must be
+secret-free and must record the route, capability, fixture/test identity,
+result, and observed failure without retaining credentials or sensitive model
+responses. This local suite is the v1 qualification path; it is not the
+private dotfiles installation run.
+
+Automating the same suite in GitHub Actions is a future-release project. It
+requires a separate decision about inference endpoints, deterministic fixtures,
+cost/time/retry limits, and response recording. The research lane may take
+useful patterns from the T3 Code work associated with Theo and Julius, but it
+must not assume that a CI endpoint or fixture design is settled by that
+research.
+
+The current macOS marketplace route may remain a temporary pre-release route
+until the public release has a proper installation source and procedure. It
+must not be treated as a reproducible release source while it points at a
+dirty or unrelated checkout. The release qualification run uses a clean,
+pinned source checkout; installation-route repair belongs to the later
+deployment procedure.
+
+## Rescout and update workflow (2026-08-25)
+
+The final rescout is not a one-time list of whatever happens to be present.
+After the last completed rescout, the release lane must:
+
+1. enumerate all current equipment and source routes that changed;
+2. screen every changed item for apparent topical relevance or overlap with a
+   target distribution;
+3. compare each hit with the corresponding plugin-family equipment and collect
+   only update candidates supported by the diff;
+4. present the candidate table to Ivan for a sanity/gut check;
+5. apply only the accepted candidates to the owning plugin/source lane; and
+6. rerun source reconciliation, dependent locks/evidence, and the final
+   sanitized rescout after those updates.
+
+Dynamic system and plugin caches remain observations of external provider
+routes unless the release boundary explicitly includes them. Their location
+does not establish ownership, and the rescout must not silently migrate or
+drop them. The 2026-08-25 overlap scan is therefore candidate evidence only;
+it is not an accepted source update or a qualification result.
+
+The release candidate is the current `origin/main` **after** all pending
+v1-targeted tickets and their accepted pull requests are resolved and merged.
+Only then may the source identities, dependency closure, final rescout, and
+qualification evidence be refreshed for the public release.
+
 ## Ownership map
 
 | Concern | `nisavid/agents` owns | `nisavid/dotfiles` owns | Boundary evidence |
@@ -142,12 +213,15 @@ for the separately owned #115 lane. The accepted history should be retained,
 not rewritten or reverted, and no #113, #114, #115, #116, release, or
 migration acceptance should be inferred from it.
 
-The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict; interpretation and resolution remain deferred to a Daybreak-capable thread. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
+The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict. At the time of this checkpoint, interpretation and resolution were deferred to a Daybreak-capable thread; the current route refresh below records the resulting disposition. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
 
-The next downstream sequence is #154/#155 owner acceptance, then #113
-production projection, #114 legacy projection, #115 prepared sealing, and
-#116 execution. #111/#112/#127/#128 remain decision gates, while #124/#125
-remain the release-boundary consumption and materialization lane.
+At the time of this checkpoint, the planned downstream sequence was #154/#155
+owner acceptance, then #113 production projection, #114 legacy projection,
+#115 prepared sealing, and #116 execution. Since then, #154 has closed; the
+current sequence is #155/#170 requalification, then #113 production
+projection, #114 legacy projection, #115 prepared sealing, and #116 execution.
+#111/#112/#127/#128 remain decision gates, while #124/#125 remain the
+release-boundary consumption and materialization lane.
 
 ## Current route refresh (2026-08-25)
 

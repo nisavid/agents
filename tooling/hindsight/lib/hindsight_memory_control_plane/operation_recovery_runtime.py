@@ -7667,9 +7667,19 @@ def _claim_release_row_digest(row: Mapping[str, Any]) -> str:
 
 def _claim_release_expected(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     selected = plan.get("selected_rows")
+    expected_count = plan.get("selected_row_count")
     if (
         not isinstance(selected, list)
-        or len(selected) != EXPECTED_CLAIM_RELEASE_ROW_COUNT
+        or type(expected_count) is not int
+        or len(selected) != expected_count
+        or (
+            plan.get("schema_version") == 2
+            and expected_count != EXPECTED_CLAIM_RELEASE_ROW_COUNT
+        )
+        or (
+            plan.get("schema_version") == 3
+            and not 1 <= expected_count <= sum(EXPECTED_OPERATION_COUNTS.values())
+        )
     ):
         raise OperationRecoveryError(
             "operation-recovery claim-release selected set is invalid"
@@ -7696,6 +7706,12 @@ def _claim_release_permitted_expected(
     permitted_rows = plan.get("permitted_blocker_rows")
     permitted_count = plan.get("permitted_blocker_count")
     cohort_operation_ids = plan.get("reference_cohort_operation_ids")
+    if plan.get("schema_version") == 3:
+        if permitted_rows != [] or permitted_count != 0:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release permitted blocker set is invalid"
+            )
+        return {}
     if (
         not isinstance(permitted_rows, list)
         or type(permitted_count) is not int
@@ -8688,7 +8704,7 @@ async def apply_claim_release_transaction(
     plan: Mapping[str, Any],
     on_mutation_attempt: Callable[[], None] | None = None,
 ) -> tuple[str, str]:
-    """Clear only claim metadata from the exact 43 planned failed rows."""
+    """Clear only claim metadata from the exactly planned stale rows."""
     quoted_schema = _quoted_identifier(schema, "database schema")
     quoted_generation = _quoted_identifier(
         GENERATION_TABLE,
@@ -8698,7 +8714,9 @@ async def apply_claim_release_transaction(
         _claim_release_expected_sets(plan)
     )
     identifiers = _operation_identifiers(list(expected))
-    permitted_identifiers = _operation_identifiers(list(permitted))
+    permitted_identifiers = (
+        _operation_identifiers(list(permitted)) if permitted else []
+    )
     guard_identifiers = identifiers + permitted_identifiers
     expires_at = plan.get("expires_at")
     _assert_transaction_deadline(expires_at)
@@ -8744,26 +8762,31 @@ async def apply_claim_release_transaction(
             raise OperationRecoveryError(
                 "operation-recovery claim-release requires exclusive database access"
             )
-        outside_blocker = await connection.fetchval(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {quoted_schema}.async_operations
-                WHERE {QUEUE_BLOCKER_PREDICATE}
+        if plan.get("schema_version") == 2:
+            outside_blocker = await connection.fetchval(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {quoted_schema}.async_operations
+                    WHERE {QUEUE_BLOCKER_PREDICATE}
+                )
+                """,
+                guard_identifiers,
             )
-            """,
-            guard_identifiers,
-        )
-        if outside_blocker is not False:
-            raise OperationRecoveryError(
-                "operation-recovery claim-release queue guard differs"
-            )
+            if outside_blocker is not False:
+                raise OperationRecoveryError(
+                    "operation-recovery claim-release queue guard differs"
+                )
         rows = await _fetch_claim_release_evidence(
             connection,
             schema=schema,
             identifiers=guard_identifiers,
             reference_cohort_identifiers=reference_cohort_identifiers,
-            reference_selected_identifiers=permitted_identifiers,
+            reference_selected_identifiers=(
+                identifiers
+                if plan.get("schema_version") == 3
+                else permitted_identifiers
+            ),
             for_update=True,
         )
         by_id = {row.get("operation_id"): row for row in rows}
@@ -8776,6 +8799,34 @@ async def apply_claim_release_transaction(
             raise OperationRecoveryError(
                 "operation-recovery claim-release selected row drifted"
             )
+        if plan.get("schema_version") == 3:
+            ownership = await connection.fetchrow(
+                f"""
+                SELECT
+                    count(DISTINCT worker_id)::integer AS selected_worker_count,
+                    (
+                        SELECT count(*)::integer
+                        FROM {quoted_schema}.async_operations AS outside
+                        WHERE outside.worker_id = (
+                            SELECT selected.worker_id
+                            FROM {quoted_schema}.async_operations AS selected
+                            WHERE selected.operation_id = ($1::uuid[])[1]
+                        )
+                          AND outside.operation_id <> ALL($1::uuid[])
+                    ) AS outside_claim_count
+                FROM {quoted_schema}.async_operations
+                WHERE operation_id = ANY($1::uuid[])
+                """,
+                identifiers,
+            )
+            if (
+                ownership is None
+                or ownership.get("selected_worker_count") != 1
+                or ownership.get("outside_claim_count") != 0
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact-drain claim ownership differs"
+                )
         await _configure_transaction_deadline(connection, expires_at)
         if on_mutation_attempt is not None:
             on_mutation_attempt()
@@ -8785,11 +8836,12 @@ async def apply_claim_release_transaction(
             SET worker_id = NULL,
                 claimed_at = NULL
             WHERE operation_id = ANY($1::uuid[])
-              AND status = 'failed'
+              AND status = $2
               AND worker_id IS NOT NULL
               AND claimed_at IS NOT NULL
             """,
             identifiers,
+            "pending" if plan.get("schema_version") == 3 else "failed",
         )
         if result != f"UPDATE {len(expected)}":
             raise OperationRecoveryError(
@@ -8811,7 +8863,11 @@ async def apply_claim_release_transaction(
             schema=schema,
             identifiers=guard_identifiers,
             reference_cohort_identifiers=reference_cohort_identifiers,
-            reference_selected_identifiers=permitted_identifiers,
+            reference_selected_identifiers=(
+                identifiers
+                if plan.get("schema_version") == 3
+                else permitted_identifiers
+            ),
             for_update=False,
         )
         post = {row.get("operation_id"): row for row in post_rows}

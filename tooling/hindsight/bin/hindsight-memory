@@ -8064,7 +8064,11 @@ async def _claim_release_verify_live(
                 ],
                 reference_selected_operation_ids=[
                     row["operation_id"]
-                    for row in plan["permitted_blocker_rows"]
+                    for row in (
+                        plan["selected_rows"]
+                        if plan.get("schema_version") == 3
+                        else plan["permitted_blocker_rows"]
+                    )
                 ],
                 expected_generation=application["post_generation"],
             )
@@ -8798,6 +8802,7 @@ def _operation_recovery_exact_candidate_repair_context(
             for item in reference_plan["selected_operations"]
         }
         observed_tasks: dict[str, tuple[Any, Any]] = {}
+        observed_task_statuses: dict[str, str] = {}
         observed_counts: dict[str, int] = {}
         tasks = progress.get("tasks")
         tasks_valid = isinstance(tasks, list)
@@ -8832,6 +8837,7 @@ def _operation_recovery_exact_candidate_repair_context(
                     item.get("operation_type"),
                     item.get("row_digest"),
                 )
+                observed_task_statuses[item["operation_id"]] = status
                 observed_counts[status] = observed_counts.get(status, 0) + 1
         if (
             not tasks_valid
@@ -8853,10 +8859,40 @@ def _operation_recovery_exact_candidate_repair_context(
         selected_ids = set(expected_tasks)
         immutable_selected_keys = (
             "operation_type",
+            "created_at",
+            "completed_at",
             "task_payload_digest",
             "result_metadata_digest",
-            "retry_count",
         )
+        def selected_row_matches(operation_id: str) -> bool:
+            current = current_rows[operation_id]
+            reference = reference_rows[operation_id]
+            if (
+                any(
+                    current.get(key) != reference.get(key)
+                    for key in immutable_selected_keys
+                )
+                or current.get("current_status") != "pending"
+                or current.get("worker_id_present") is not False
+                or current.get("worker_id_digest") is not None
+                or current.get("claimed_at") is not None
+            ):
+                return False
+            if observed_task_statuses[operation_id] == "pending":
+                return (
+                    current.get("retry_count")
+                    == reference.get("retry_count")
+                    and current.get("next_retry_at") is None
+                    and current.get("error_category") == "none"
+                    and current.get("error_digest") is None
+                )
+            return (
+                current.get("retry_count")
+                == reference.get("retry_count") + 1
+                and current.get("next_retry_at") is not None
+                and current.get("error_category") == "provider_transport"
+                and current.get("error_digest") is not None
+            )
         if (
             set(current_rows) != set(reference_rows)
             or snapshot["cohort_digest"] != reference_plan["cohort_digest"]
@@ -8864,18 +8900,7 @@ def _operation_recovery_exact_candidate_repair_context(
             != reference_plan["installation_authority"]
             or snapshot["generation_before"] != snapshot["generation_after"]
             or any(
-                any(
-                    current_rows[operation_id].get(key)
-                    != reference_rows[operation_id].get(key)
-                    for key in immutable_selected_keys
-                )
-                or current_rows[operation_id].get("current_status") != "pending"
-                or current_rows[operation_id].get("worker_id_present") is not False
-                or current_rows[operation_id].get("worker_id_digest") is not None
-                or current_rows[operation_id].get("claimed_at") is not None
-                or current_rows[operation_id].get("next_retry_at") is not None
-                or current_rows[operation_id].get("error_category") != "none"
-                or current_rows[operation_id].get("error_digest") is not None
+                not selected_row_matches(operation_id)
                 for operation_id in selected_ids
             )
             or any(

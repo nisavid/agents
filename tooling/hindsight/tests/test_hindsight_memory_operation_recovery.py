@@ -22,6 +22,7 @@ from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
+    create_exact_drain_claim_release_plan,
     create_checkpoint_continuation_handoff,
     create_cohort_manifest,
     create_global_queue_blocker_classification,
@@ -8746,6 +8747,66 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 tampered_plan,
                 now=tampered_plan["created_at"],
             )
+
+    def test_exact_drain_claim_release_plan_binds_pending_transport_claims(self):
+        row = {
+            **self.queue_blocker_row(),
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "next_retry_at": "2026-08-25T18:40:00.000000Z",
+            "in_reference_cohort": True,
+            "in_reference_selected_set": True,
+        }
+        row = {
+            **row,
+            "row_digest": digest(row),
+            "nonclaim_state_digest": "8" * 64,
+        }
+        cohort_ids = [
+            f"00000000-0000-4000-8000-{index + 1:012d}"
+            for index in range(sum(EXPECTED_COUNTS.values()))
+        ]
+        plan = create_exact_drain_claim_release_plan(
+            selected_rows=[row],
+            reference_cohort_operation_ids=cohort_ids,
+            candidate_release=release_identity(),
+            installation_authority=installation_authority(),
+            reference_plan_digest="1" * 64,
+            reference_application_journal_digest="2" * 64,
+            reference_progress_digest="3" * 64,
+            reference_worker_identity={
+                "worker_pid": 123,
+                "worker_start_time": "darwin:123:456",
+                "worker_attempt": 1,
+            },
+            reference_live_snapshot_digest="4" * 64,
+            preserved_unselected_row_set_digest="5" * 64,
+            pre_generation="systalyze:public:123",
+            guard_contract_version=1,
+            guard_contract_digest="a" * 64,
+            rollback_encryption=rollback_encryption(),
+            rollback_bundle_path="/private/tmp/exact-claim-release.bundle",
+            authorization_receipt_path="/private/tmp/exact-claim-release.authorization",
+            application_receipt_path="/private/tmp/exact-claim-release.application",
+            verification_receipt_path="/private/tmp/exact-claim-release.verification",
+            rollback_receipt_path="/private/tmp/exact-claim-release.rollback",
+            created_at=1_785_460_800,
+        )
+        self.assertEqual(
+            verify_claim_release_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+        self.assertEqual(plan["selected_row_count"], 1)
+        self.assertEqual(plan["permitted_blocker_rows"], [])
+
+        changed = deepcopy(plan)
+        changed["selected_rows"][0]["retry_count"] = 0
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "claim-release plan is invalid|queue blocker row digest differs",
+        ):
+            verify_claim_release_plan(changed, now=plan["created_at"])
 
     def test_claim_release_permits_a_bound_cancelled_reference_row(self):
         planned_at = 1_785_460_800

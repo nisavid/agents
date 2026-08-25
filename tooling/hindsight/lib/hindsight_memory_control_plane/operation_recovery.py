@@ -1390,6 +1390,26 @@ CLAIM_RELEASE_PLAN_KEYS = frozenset(
         "plan_digest",
     }
 )
+EXACT_DRAIN_CLAIM_RELEASE_WORKER_KEYS = frozenset(
+    {"worker_pid", "worker_start_time", "worker_attempt"}
+)
+EXACT_DRAIN_CLAIM_RELEASE_PLAN_KEYS = (
+    CLAIM_RELEASE_PLAN_KEYS
+    - frozenset(
+        {
+            "predecessor_classification_digest",
+            "live_classification_digest",
+        }
+    )
+) | frozenset(
+    {
+        "reference_application_journal_digest",
+        "reference_progress_digest",
+        "reference_worker_identity",
+        "reference_live_snapshot_digest",
+        "preserved_unselected_row_set_digest",
+    }
+)
 
 
 def _normalized(value: Any) -> Any:
@@ -9810,6 +9830,7 @@ def _queue_blocker(
     *,
     include_digest: bool,
     allow_terminal_reference_selected: bool = False,
+    allow_claimed_pending_reference_selected: bool = False,
 ) -> dict[str, Any]:
     keys = QUEUE_BLOCKER_KEYS if include_digest else QUEUE_BLOCKER_INPUT_KEYS
     row = _closed(
@@ -9837,6 +9858,8 @@ def _queue_blocker(
             and not (
                 allow_terminal_reference_selected
                 and status in {"failed", "cancelled"}
+                or allow_claimed_pending_reference_selected
+                and status == "pending"
             )
         )
         or (status != "processing" and not worker_present and row["claimed_at"] is None)
@@ -10194,7 +10217,11 @@ def verify_global_queue_blocker_classification(
     return {**body, "classification_digest": classification["classification_digest"]}
 
 
-def _claim_release_row(value: Any) -> dict[str, Any]:
+def _claim_release_row(
+    value: Any,
+    *,
+    allow_pending: bool = False,
+) -> dict[str, Any]:
     row = _closed(
         _normalized(value),
         CLAIM_RELEASE_ROW_KEYS,
@@ -10203,12 +10230,14 @@ def _claim_release_row(value: Any) -> dict[str, Any]:
     blocker = _queue_blocker(
         {key: row[key] for key in QUEUE_BLOCKER_KEYS},
         include_digest=True,
+        allow_claimed_pending_reference_selected=allow_pending,
     )
     if (
-        blocker["status"] != "failed"
-        or blocker["blocker_reason"] != "claimed_failed"
-        or blocker["in_reference_cohort"]
-        or blocker["in_reference_selected_set"]
+        blocker["status"] != ("pending" if allow_pending else "failed")
+        or blocker["blocker_reason"]
+        != ("claimed_pending" if allow_pending else "claimed_failed")
+        or blocker["in_reference_cohort"] is not allow_pending
+        or blocker["in_reference_selected_set"] is not allow_pending
         or not blocker["worker_id_present"]
         or blocker["claimed_at"] is None
     ):
@@ -10549,12 +10578,310 @@ def create_claim_release_plan(
     return {**body, "plan_digest": digest(body)}
 
 
+def create_exact_drain_claim_release_plan(
+    *,
+    selected_rows: Sequence[Mapping[str, Any]],
+    reference_cohort_operation_ids: Sequence[str],
+    candidate_release: Mapping[str, Any],
+    installation_authority: Mapping[str, Any],
+    reference_plan_digest: str,
+    reference_application_journal_digest: str,
+    reference_progress_digest: str,
+    reference_worker_identity: Mapping[str, Any],
+    reference_live_snapshot_digest: str,
+    preserved_unselected_row_set_digest: str,
+    pre_generation: str,
+    guard_contract_version: int,
+    guard_contract_digest: str,
+    rollback_encryption: Mapping[str, Any],
+    rollback_bundle_path: str,
+    authorization_receipt_path: str,
+    application_receipt_path: str,
+    verification_receipt_path: str,
+    rollback_receipt_path: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Create an immutable plan to clear claims left by a quiescent exact drain."""
+    planned_at = int(time.time()) if created_at is None else _integer(
+        created_at,
+        "claim-release plan created-at",
+    )
+    rows = [_claim_release_row(row, allow_pending=True) for row in selected_rows]
+    rows.sort(key=lambda row: (row["created_at"], row["operation_id"]))
+    cohort_ids = sorted(_operation_id(value) for value in reference_cohort_operation_ids)
+    paths = _claim_release_artifact_paths(
+        {
+            "rollback_bundle_path": rollback_bundle_path,
+            "authorization_receipt_path": authorization_receipt_path,
+            "application_receipt_path": application_receipt_path,
+            "verification_receipt_path": verification_receipt_path,
+            "rollback_receipt_path": rollback_receipt_path,
+        }
+    )
+    body = {
+        "schema_version": 3,
+        "kind": "operation-recovery-exact-drain-claim-release-plan",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "candidate_release": _candidate_release(candidate_release),
+        "installation_authority": _installation_authority(installation_authority),
+        "reference_plan_digest": _sha(reference_plan_digest, "claim-release reference plan digest"),
+        "reference_application_journal_digest": _sha(
+            reference_application_journal_digest,
+            "claim-release reference application journal digest",
+        ),
+        "reference_progress_digest": _sha(
+            reference_progress_digest,
+            "claim-release reference progress digest",
+        ),
+        "reference_worker_identity": dict(reference_worker_identity),
+        "reference_live_snapshot_digest": _sha(
+            reference_live_snapshot_digest,
+            "claim-release reference live snapshot digest",
+        ),
+        "preserved_unselected_row_set_digest": _sha(
+            preserved_unselected_row_set_digest,
+            "claim-release preserved unselected row-set digest",
+        ),
+        "reference_cohort_operation_ids": cohort_ids,
+        "reference_cohort_operation_ids_digest": digest(cohort_ids),
+        "reference_selected_operation_ids_digest": digest(
+            sorted(row["operation_id"] for row in rows)
+        ),
+        "guard_contract_version": _integer(
+            guard_contract_version,
+            "claim-release guard contract version",
+            minimum=1,
+        ),
+        "guard_contract_digest": _sha(
+            guard_contract_digest,
+            "claim-release guard contract digest",
+        ),
+        "profile_id": "systalyze",
+        "schema": "public",
+        "pre_generation": _text(pre_generation, "claim-release pre-generation"),
+        "selected_rows": rows,
+        "selected_row_count": len(rows),
+        "selected_row_set_digest": _claim_release_row_set_digest(rows),
+        "permitted_blocker_rows": [],
+        "permitted_blocker_count": 0,
+        "permitted_blocker_row_set_digest": (
+            _claim_release_permitted_blocker_row_set_digest([])
+        ),
+        "guard_exclusion_set_digest": _claim_release_guard_exclusion_set_digest(rows, []),
+        "status_counts": _queue_blocker_counts(rows, "status"),
+        "bank_counts": _queue_blocker_counts(rows, "bank_id"),
+        "operation_type_counts": _queue_blocker_counts(rows, "operation_type"),
+        "rollback_encryption": _rollback_encryption(rollback_encryption),
+        **paths,
+        "created_at": planned_at,
+        "expires_at": planned_at + MAX_PLAN_LIFETIME_SECONDS,
+    }
+    plan = {**body, "plan_digest": digest(body)}
+    return _verify_exact_drain_claim_release_plan(
+        plan,
+        now=planned_at,
+        allow_expired=False,
+    )
+
+
+def _verify_exact_drain_claim_release_plan(
+    value: Any,
+    *,
+    now: int | None,
+    allow_expired: bool,
+) -> Mapping[str, Any]:
+    plan = _closed(
+        _normalized(value),
+        EXACT_DRAIN_CLAIM_RELEASE_PLAN_KEYS,
+        "operation-recovery exact-drain claim-release plan",
+    )
+    rows_value = plan["selected_rows"]
+    permitted_value = plan["permitted_blocker_rows"]
+    cohort_value = plan["reference_cohort_operation_ids"]
+    if (
+        not isinstance(rows_value, list)
+        or not isinstance(permitted_value, list)
+        or permitted_value
+        or not isinstance(cohort_value, list)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact-drain claim-release rows are invalid"
+        )
+    rows = [_claim_release_row(row, allow_pending=True) for row in rows_value]
+    identifiers = [row["operation_id"] for row in rows]
+    cohort_identifiers = [_operation_id(value) for value in cohort_value]
+    created_at = _integer(plan["created_at"], "claim-release plan created-at")
+    expires_at = _integer(plan["expires_at"], "claim-release plan expires-at")
+    observed_at = int(time.time()) if now is None else _integer(
+        now,
+        "claim-release plan verification time",
+    )
+    status_counts = _count_map(plan["status_counts"], "claim-release status counts")
+    bank_counts = _count_map(plan["bank_counts"], "claim-release bank counts")
+    type_counts = _count_map(
+        plan["operation_type_counts"],
+        "claim-release operation type counts",
+    )
+    worker = _closed(
+        _normalized(plan["reference_worker_identity"]),
+        EXACT_DRAIN_CLAIM_RELEASE_WORKER_KEYS,
+        "operation-recovery exact-drain claim-release worker identity",
+    )
+    worker_identity = {
+        "worker_pid": _integer(worker["worker_pid"], "claim-release worker PID", minimum=1),
+        "worker_start_time": _text(
+            worker["worker_start_time"],
+            "claim-release worker start identity",
+        ),
+        "worker_attempt": _integer(
+            worker["worker_attempt"],
+            "claim-release worker attempt",
+            minimum=1,
+        ),
+    }
+    selected_count = len(rows)
+    if (
+        plan["schema_version"] != 3
+        or plan["kind"]
+        != "operation-recovery-exact-drain-claim-release-plan"
+        or plan["authority"] != "unapproved-plan"
+        or plan["mutation_authorized"] is not False
+        or plan["profile_id"] != "systalyze"
+        or plan["schema"] != "public"
+        or not 1 <= selected_count <= len(cohort_identifiers)
+        or selected_count != plan["selected_row_count"]
+        or len(identifiers) != len(set(identifiers))
+        or len(cohort_identifiers) != sum(EXPECTED_OPERATION_COUNTS.values())
+        or len(cohort_identifiers) != len(set(cohort_identifiers))
+        or cohort_identifiers != sorted(cohort_identifiers)
+        or not set(identifiers).issubset(cohort_identifiers)
+        or rows
+        != sorted(rows, key=lambda row: (row["created_at"], row["operation_id"]))
+        or any(
+            row["bank_id"] != "engineering"
+            or row["operation_type"] != "retain"
+            or row["retry_count"] < 1
+            or row["next_retry_at"] is None
+            for row in rows
+        )
+        or plan["selected_row_set_digest"] != _claim_release_row_set_digest(rows)
+        or plan["permitted_blocker_count"] != 0
+        or plan["permitted_blocker_row_set_digest"]
+        != _claim_release_permitted_blocker_row_set_digest([])
+        or plan["guard_exclusion_set_digest"]
+        != _claim_release_guard_exclusion_set_digest(rows, [])
+        or plan["reference_cohort_operation_ids_digest"]
+        != digest(cohort_identifiers)
+        or plan["reference_selected_operation_ids_digest"]
+        != digest(sorted(identifiers))
+        or status_counts != _queue_blocker_counts(rows, "status")
+        or bank_counts != _queue_blocker_counts(rows, "bank_id")
+        or type_counts != _queue_blocker_counts(rows, "operation_type")
+        or expires_at - created_at != MAX_PLAN_LIFETIME_SECONDS
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact-drain claim-release plan is invalid"
+        )
+    if not allow_expired and observed_at >= expires_at:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release plan expired"
+        )
+    paths = _claim_release_artifact_paths(plan)
+    authority = _installation_authority(plan["installation_authority"])
+    _assert_installation_authority_schema(authority, plan_schema_version=15)
+    body = {
+        "schema_version": 3,
+        "kind": "operation-recovery-exact-drain-claim-release-plan",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "candidate_release": _candidate_release(plan["candidate_release"]),
+        "installation_authority": authority,
+        "reference_plan_digest": _sha(
+            plan["reference_plan_digest"],
+            "claim-release reference plan digest",
+        ),
+        "reference_application_journal_digest": _sha(
+            plan["reference_application_journal_digest"],
+            "claim-release reference application journal digest",
+        ),
+        "reference_progress_digest": _sha(
+            plan["reference_progress_digest"],
+            "claim-release reference progress digest",
+        ),
+        "reference_worker_identity": worker_identity,
+        "reference_live_snapshot_digest": _sha(
+            plan["reference_live_snapshot_digest"],
+            "claim-release reference live snapshot digest",
+        ),
+        "preserved_unselected_row_set_digest": _sha(
+            plan["preserved_unselected_row_set_digest"],
+            "claim-release preserved unselected row-set digest",
+        ),
+        "reference_cohort_operation_ids": cohort_identifiers,
+        "reference_cohort_operation_ids_digest": _sha(
+            plan["reference_cohort_operation_ids_digest"],
+            "claim-release reference cohort operation IDs digest",
+        ),
+        "reference_selected_operation_ids_digest": _sha(
+            plan["reference_selected_operation_ids_digest"],
+            "claim-release reference selected operation IDs digest",
+        ),
+        "guard_contract_version": _integer(
+            plan["guard_contract_version"],
+            "claim-release guard contract version",
+            minimum=1,
+        ),
+        "guard_contract_digest": _sha(
+            plan["guard_contract_digest"],
+            "claim-release guard contract digest",
+        ),
+        "profile_id": "systalyze",
+        "schema": "public",
+        "pre_generation": _text(plan["pre_generation"], "claim-release pre-generation"),
+        "selected_rows": rows,
+        "selected_row_count": selected_count,
+        "selected_row_set_digest": _sha(
+            plan["selected_row_set_digest"],
+            "claim-release selected-row-set digest",
+        ),
+        "permitted_blocker_rows": [],
+        "permitted_blocker_count": 0,
+        "permitted_blocker_row_set_digest": _sha(
+            plan["permitted_blocker_row_set_digest"],
+            "claim-release permitted blocker row-set digest",
+        ),
+        "guard_exclusion_set_digest": _sha(
+            plan["guard_exclusion_set_digest"],
+            "claim-release guard exclusion set digest",
+        ),
+        "status_counts": status_counts,
+        "bank_counts": bank_counts,
+        "operation_type_counts": type_counts,
+        "rollback_encryption": _rollback_encryption(plan["rollback_encryption"]),
+        **paths,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+    if _sha(plan["plan_digest"], "claim-release plan digest") != digest(body):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release plan digest differs"
+        )
+    return {**body, "plan_digest": plan["plan_digest"]}
+
+
 def verify_claim_release_plan(
     value: Any,
     *,
     now: int | None = None,
     allow_expired: bool = False,
 ) -> Mapping[str, Any]:
+    if isinstance(value, Mapping) and value.get("schema_version") == 3:
+        return _verify_exact_drain_claim_release_plan(
+            value,
+            now=now,
+            allow_expired=allow_expired,
+        )
     plan = _closed(
         _normalized(value),
         CLAIM_RELEASE_PLAN_KEYS,

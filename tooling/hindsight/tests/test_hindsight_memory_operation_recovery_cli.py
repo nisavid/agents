@@ -3740,7 +3740,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "task_payload_digest": "6" * 64,
             "result_metadata_digest": "7" * 64,
             "current_status": "pending",
-            "retry_count": 1,
+            "retry_count": 0,
             "worker_id_present": False,
             "worker_id_digest": None,
             "claimed_at": None,
@@ -3751,6 +3751,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         after = {
             **before,
             "row_digest": "8" * 64,
+            "retry_count": 1,
+            "next_retry_at": "2026-08-25T18:40:00+00:00",
+            "error_category": "provider_transport",
+            "error_digest": "a" * 64,
         }
         snapshot = {
             "cohort_digest": "9" * 64,

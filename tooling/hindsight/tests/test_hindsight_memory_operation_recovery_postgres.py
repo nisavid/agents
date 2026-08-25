@@ -29,6 +29,7 @@ if str(TESTS) not in sys.path:
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
+    create_exact_drain_claim_release_plan,
     create_cohort_manifest,
     create_exact_drain_plan,
     create_global_queue_blocker_classification,
@@ -5660,6 +5661,106 @@ asyncio.run(exercise())
                 await connection.close()
 
         asyncio.run(exercise())
+
+    def test_exact_drain_claim_release_preserves_pending_transport_state(self):
+        async def exercise(connection):
+            await self._reset(connection)
+            operation_ids = [
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000002",
+            ]
+            for operation_id in operation_ids:
+                await self._insert_operation(
+                    connection,
+                    operation_id,
+                    status="pending",
+                    worker_id="exact-drain-worker",
+                    claimed_at=CLAIMED_AT,
+                    error_message="provider transport failed",
+                )
+            await connection.execute(
+                "UPDATE public.async_operations SET retry_count = 1, "
+                "next_retry_at = '2026-08-25T18:40:00Z', "
+                "error_message = 'provider transport failed' "
+                "WHERE operation_id = ANY($1::uuid[])",
+                operation_ids,
+            )
+            cohort_ids = [
+                f"00000000-0000-4000-8000-{index + 1:012d}"
+                for index in range(sum(recovery_fixtures.EXPECTED_COUNTS.values()))
+            ]
+            _, _, evidence = await read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=operation_ids,
+                reference_cohort_operation_ids=cohort_ids,
+                reference_selected_operation_ids=operation_ids,
+                expected_generation="systalyze:public:123",
+            )
+            selected_rows = []
+            for row in evidence:
+                body = {key: row[key] for key in CLAIM_RELEASE_BLOCKER_KEYS}
+                selected_rows.append(
+                    {
+                        **body,
+                        "row_digest": recovery_fixtures.digest(body),
+                        "nonclaim_state_digest": row["nonclaim_state_digest"],
+                    }
+                )
+            plan = create_exact_drain_claim_release_plan(
+                selected_rows=selected_rows,
+                reference_cohort_operation_ids=cohort_ids,
+                candidate_release=recovery_fixtures.release_identity(),
+                installation_authority=recovery_fixtures.installation_authority(),
+                reference_plan_digest="1" * 64,
+                reference_application_journal_digest="2" * 64,
+                reference_progress_digest="3" * 64,
+                reference_worker_identity={
+                    "worker_pid": 123,
+                    "worker_start_time": "darwin:123:456",
+                    "worker_attempt": 1,
+                },
+                reference_live_snapshot_digest="4" * 64,
+                preserved_unselected_row_set_digest="5" * 64,
+                pre_generation="systalyze:public:123",
+                guard_contract_version=QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+                guard_contract_digest=QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+                rollback_encryption=recovery_fixtures.rollback_encryption(),
+                rollback_bundle_path="/private/tmp/exact-claim-release.bundle",
+                authorization_receipt_path="/private/tmp/exact-claim-release.authorization",
+                application_receipt_path="/private/tmp/exact-claim-release.application",
+                verification_receipt_path="/private/tmp/exact-claim-release.verification",
+                rollback_receipt_path="/private/tmp/exact-claim-release.rollback",
+                created_at=int(time.time()),
+            )
+            before, after = await apply_claim_release_transaction(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                plan=plan,
+            )
+            self.assertEqual(before, "systalyze:public:123")
+            self.assertEqual(after, "systalyze:public:124")
+            _, _, post = await read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=operation_ids,
+                reference_cohort_operation_ids=cohort_ids,
+                reference_selected_operation_ids=operation_ids,
+                expected_generation="systalyze:public:124",
+            )
+            self.assertTrue(all(row["worker_id_present"] is False for row in post))
+            self.assertTrue(all(row["claimed_at"] is None for row in post))
+            self.assertTrue(all(row["retry_count"] == 1 for row in post))
+            self.assertTrue(all(row["next_retry_at"] is not None for row in post))
+
+        async def run():
+            async with self._postgres() as connection:
+                await exercise(connection)
+
+        asyncio.run(run())
 
     def test_claim_release_allows_exact_43_mutations_and_20_bound_blockers(self):
         async def exercise():

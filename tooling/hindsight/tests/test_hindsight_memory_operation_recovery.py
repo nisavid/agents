@@ -6323,6 +6323,12 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for operation_id in terminal_selected_ids
             if operation_id != pending_operation_id
         )
+        released_operation_id = next(
+            operation_id
+            for operation_id in terminal_selected_ids
+            if operation_id
+            not in {pending_operation_id, completed_operation_id}
+        )
         mixed_rows = [
             next(
                 item
@@ -6332,6 +6338,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for operation_id in (
                 pending_operation_id,
                 completed_operation_id,
+                released_operation_id,
             )
         ]
         mixed_rows[0].update(
@@ -6345,6 +6352,17 @@ class OperationRecoveryContractTest(unittest.TestCase):
             current_status="completed",
             completed_at="2026-08-20T14:59:00.000000Z",
         )
+        mixed_rows[2].update(
+            next(
+                item
+                for item in epoch_three_plan["live_snapshot"]["operations"]
+                if item["operation_id"] == mixed_rows[2]["operation_id"]
+            )
+        )
+        mixed_rows[2].update(
+            updated_at="2026-08-20T14:59:30.000000Z",
+            result_metadata_digest="6" * 64,
+        )
         for row in mixed_rows:
             row["row_digest"] = digest(
                 {
@@ -6356,8 +6374,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
         mixed["status_counts"] = {
             **mixed["status_counts"],
             "completed": mixed["status_counts"]["completed"] + 1,
-            "failed": len(terminal_selected_ids) - 2,
-            "pending": 1,
+            "failed": len(terminal_selected_ids) - 3,
+            "pending": 2,
         }
         mixed["snapshot_digest"] = digest(
             {
@@ -6370,14 +6388,14 @@ class OperationRecoveryContractTest(unittest.TestCase):
             **terminal_status_body,
             "selected_status_counts": {
                 "completed": 1,
-                "failed": len(terminal_selected_ids) - 2,
-                "pending": 1,
+                "failed": len(terminal_selected_ids) - 3,
+                "pending": 2,
             },
             "failure_classifications": [
                 {
                     "cause_family": "provider_transport",
                     "error_digest": "5" * 64,
-                    "occurrence_count": len(terminal_selected_ids) - 2,
+                    "occurrence_count": len(terminal_selected_ids) - 3,
                 }
             ],
         }
@@ -6385,13 +6403,25 @@ class OperationRecoveryContractTest(unittest.TestCase):
             **mixed_status_body,
             "status_digest": digest(mixed_status_body),
         }
-        mixed_reconciliation = create_reconciliation(
-            mixed,
-            status=mixed_status,
-        )
+        with patch.object(
+            recovery_contract,
+            "_post_abort_released_operation_ids",
+            return_value=frozenset({released_operation_id}),
+        ):
+            mixed_reconciliation = create_reconciliation(
+                mixed,
+                status=mixed_status,
+            )
+            self.assertEqual(
+                verify_post_abort_recovery_plan(
+                    mixed_reconciliation,
+                    now=mixed_reconciliation["created_at"],
+                ),
+                mixed_reconciliation,
+            )
         self.assertEqual(
             mixed_reconciliation["selected_status_counts"],
-            {"failed": len(terminal_selected_ids) - 2},
+            {"failed": len(terminal_selected_ids) - 3},
         )
         self.assertEqual(
             mixed_reconciliation["preserved_status_counts"],
@@ -6399,25 +6429,23 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "completed": (
                     epoch_four_interrupted["status_counts"]["completed"] + 1
                 ),
-                "pending": 1,
+                "pending": 2,
             },
         )
         self.assertEqual(
             mixed_reconciliation["retry_recovery"]["operation_count"],
-            len(terminal_selected_ids) - 2,
+            len(terminal_selected_ids) - 3,
         )
-        self.assertEqual(
-            verify_post_abort_recovery_plan(
-                mixed_reconciliation,
-                now=mixed_reconciliation["created_at"],
-            ),
-            mixed_reconciliation,
-        )
-        with self.assertRaisesRegex(
-            OperationRecoveryError,
-            "post-terminal evidence is invalid",
+        with patch.object(
+            recovery_contract,
+            "_post_abort_released_operation_ids",
+            return_value=frozenset({released_operation_id}),
         ):
-            create_reconciliation(mixed)
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "post-terminal evidence is invalid",
+            ):
+                create_reconciliation(mixed)
 
         active_worker_body = {
             **worker_exit_body,

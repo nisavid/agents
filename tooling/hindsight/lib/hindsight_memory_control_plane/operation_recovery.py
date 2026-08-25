@@ -7905,7 +7905,7 @@ def _post_abort_v10_contract(
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
     recovery_context = reference_plan.get("recovery_context")
     released_checkpoint_capable = (
-        schema_version == 12
+        schema_version in {12, 13}
         or (
             schema_version == 11
             and reference_plan.get("schema_version") == 12

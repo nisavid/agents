@@ -6727,6 +6727,61 @@ class OperationRecoveryContractTest(unittest.TestCase):
             schema_thirteen_plan,
         )
 
+        grant_plan = (
+            recovery_contract.create_exact_drain_authorization_grant_plan(
+                schema_thirteen_plan,
+                grant_id="55555555-5555-4555-8555-555555555555",
+                maximum_recovery_epoch=3,
+                maximum_reconciliation_cycle=1,
+                maximum_plan_claims=1,
+                maximum_worker_attempts=5,
+                maximum_execution_seconds=(
+                    recovery_contract.EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS
+                ),
+                maximum_concurrent_drains=1,
+                created_at=1_786_830_401,
+                expires_at=1_787_003_201,
+            )
+        )
+        grant = recovery_contract.activate_exact_drain_authorization_grant(
+            grant_plan,
+            approval_digest=grant_plan["grant_plan_digest"],
+            approved_at=1_786_830_401,
+        )
+        schema_fifteen_plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            reconciled_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=reconciled_backup,
+            rollback_backup_path="/private/tmp/v15-drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/v15-drain-auth.json",
+            application_receipt_path="/private/tmp/v15-drain-app.json",
+            status_artifact_path="/private/tmp/v15-drain-status.json",
+            verification_receipt_path="/private/tmp/v15-drain-verify.json",
+            recovery_context=reconciliation_context,
+            hatchery_capability_receipt=capability,
+            authorization_grant=grant,
+            grant_predecessor_plan_digest=schema_thirteen_plan[
+                "plan_digest"
+            ],
+            created_at=1_786_830_402,
+            schema_version=15,
+        )
+        self.assertEqual(
+            schema_fifteen_plan["recovery_context"],
+            reconciliation_context,
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                schema_fifteen_plan,
+                now=schema_fifteen_plan["created_at"],
+            ),
+            schema_fifteen_plan,
+        )
+
         unsuccessful = deepcopy(schema_thirteen_plan)
         unsuccessful_capability = (
             recovery_contract.create_hatchery_capability_receipt(

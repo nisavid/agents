@@ -4238,7 +4238,7 @@ def _exact_drain_recovery_context(
             },
         }
         if (
-            plan_schema_version != 13
+            plan_schema_version not in {13, 15}
             or body["kind"]
             != "operation-recovery-exact-drain-recovery-context"
             or body["origin"] != "post-terminal-reconciliation"

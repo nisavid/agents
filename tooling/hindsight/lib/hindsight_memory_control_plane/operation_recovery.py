@@ -3636,6 +3636,16 @@ def _exact_drain_type_counts(
     }
 
 
+def _exact_drain_preserved_status_counts(
+    snapshot: Mapping[str, Any],
+) -> dict[str, int]:
+    preserved = {"completed": snapshot["status_counts"].get("completed", 0)}
+    failed = snapshot["status_counts"].get("failed", 0)
+    if failed:
+        preserved["failed"] = failed
+    return preserved
+
+
 def _exact_drain_row_set_digest(
     selected: Sequence[Mapping[str, Any]],
 ) -> str:
@@ -4137,38 +4147,68 @@ def _exact_drain_recovery_context(
             )
         )
 
+    def terminal_failed_evidence_is_valid(
+        item: Mapping[str, Any],
+    ) -> bool:
+        """Preserve a closed retry-exhausted failure outside selection."""
+        baseline = cohort_rows[item["operation_id"]]
+        return (
+            baseline["baseline_status"] == "pending"
+            and item["current_status"] == "failed"
+            and item["created_at"] == baseline["created_at"]
+            and item["updated_at"] == item["completed_at"]
+            and item["updated_at"] > baseline["updated_at"]
+            and item["retry_count"] == EXACT_DRAIN_WORKER_MAX_RETRIES
+            and item["next_retry_at"] is None
+            and item["worker_id_present"]
+            is (item["worker_id_digest"] is not None)
+            and item["claimed_at"] is not None
+            and item["worker_id_present"]
+            and item["task_payload_present"]
+            is baseline["task_payload_present"]
+            and item["task_payload_digest"]
+            == baseline["task_payload_digest"]
+            and item["result_metadata_digest"]
+            == baseline["result_metadata_digest"]
+            and item["error_category"] in FAILURE_CAUSE_FAMILIES
+            and item["error_digest"] is not None
+        )
+
     initial_origin_valid = (
         set(snapshot_rows) == set(cohort_rows)
         and all(
-            item["current_status"]
-            in {
-                cohort_rows[item["operation_id"]]["baseline_status"],
-                "completed",
-            }
-            and item["created_at"]
-            == cohort_rows[item["operation_id"]]["created_at"]
-            and item["updated_at"]
-            == cohort_rows[item["operation_id"]]["updated_at"]
-            and item["retry_count"]
-            == cohort_rows[item["operation_id"]]["retry_count"]
-            and item["task_payload_present"]
-            is cohort_rows[item["operation_id"]]["task_payload_present"]
-            and item["task_payload_digest"]
-            == cohort_rows[item["operation_id"]]["task_payload_digest"]
-            and item["result_metadata_digest"]
-            == cohort_rows[item["operation_id"]]["result_metadata_digest"]
-            and (
-                (item["current_status"] == "completed")
-                == (item["completed_at"] is not None)
-            )
-            and (
-                (
-                    item["next_retry_at"] is None
-                    and item["error_category"] == "none"
-                    and item["error_digest"] is None
+            terminal_failed_evidence_is_valid(item)
+            or (
+                item["current_status"]
+                in {
+                    cohort_rows[item["operation_id"]]["baseline_status"],
+                    "completed",
+                }
+                and item["created_at"]
+                == cohort_rows[item["operation_id"]]["created_at"]
+                and item["updated_at"]
+                == cohort_rows[item["operation_id"]]["updated_at"]
+                and item["retry_count"]
+                == cohort_rows[item["operation_id"]]["retry_count"]
+                and item["task_payload_present"]
+                is cohort_rows[item["operation_id"]]["task_payload_present"]
+                and item["task_payload_digest"]
+                == cohort_rows[item["operation_id"]]["task_payload_digest"]
+                and item["result_metadata_digest"]
+                == cohort_rows[item["operation_id"]]["result_metadata_digest"]
+                and (
+                    (item["current_status"] == "completed")
+                    == (item["completed_at"] is not None)
                 )
-                or initial_retry_evidence_is_valid(item)
-                or terminal_completed_evidence_is_valid(item)
+                and (
+                    (
+                        item["next_retry_at"] is None
+                        and item["error_category"] == "none"
+                        and item["error_digest"] is None
+                    )
+                    or initial_retry_evidence_is_valid(item)
+                    or terminal_completed_evidence_is_valid(item)
+                )
             )
             for item in snapshot_rows.values()
         )
@@ -4544,9 +4584,14 @@ def create_exact_drain_plan(
         or not selected
         or snapshot["status_counts"].get("pending") != len(selected)
         or snapshot["status_counts"].get("processing")
-        or snapshot["status_counts"].get("failed")
+        or (
+            snapshot["status_counts"].get("failed")
+            and schema_version not in {12, 15}
+        )
         or snapshot["status_counts"].get("cancelled")
-        or snapshot["status_counts"].get("completed", 0) + len(selected)
+        or snapshot["status_counts"].get("completed", 0)
+        + snapshot["status_counts"].get("failed", 0)
+        + len(selected)
         != sum(EXPECTED_OPERATION_COUNTS.values())
         or any(
             count > EXPECTED_OPERATION_COUNTS[operation_type]
@@ -4767,9 +4812,9 @@ def create_exact_drain_plan(
         "selected_status_counts": {"pending": len(selected)},
         "selected_type_counts": selected_type_counts,
         "selected_row_set_digest": _exact_drain_row_set_digest(selected),
-        "preserved_status_counts": {
-            "completed": snapshot["status_counts"]["completed"]
-        },
+        "preserved_status_counts": _exact_drain_preserved_status_counts(
+            snapshot
+        ),
         "rollback_backup": backup,
         **artifact_paths,
         "provider_policy_digest": _sha(
@@ -5278,13 +5323,17 @@ def verify_exact_drain_plan(
         or plan.get("selected_operation_count") != len(selected)
         or status_counts != {"pending": len(selected)}
         or type_counts != selected_type_counts
-        or preserved
-        != {"completed": snapshot["status_counts"].get("completed", 0)}
+        or preserved != _exact_drain_preserved_status_counts(snapshot)
         or snapshot["status_counts"].get("pending") != len(selected)
         or snapshot["status_counts"].get("processing")
-        or snapshot["status_counts"].get("failed")
+        or (
+            snapshot["status_counts"].get("failed")
+            and schema_version not in {12, 15}
+        )
         or snapshot["status_counts"].get("cancelled")
-        or snapshot["status_counts"].get("completed", 0) + len(selected)
+        or snapshot["status_counts"].get("completed", 0)
+        + snapshot["status_counts"].get("failed", 0)
+        + len(selected)
         != sum(EXPECTED_OPERATION_COUNTS.values())
         or any(
             count > EXPECTED_OPERATION_COUNTS[operation_type]
@@ -5813,6 +5862,16 @@ def _exact_drain_grant_scope(
     }
 
 
+def _exact_drain_current_grant_reference(
+    reference: Mapping[str, Any],
+) -> bool:
+    return reference["schema_version"] in {13, 14} or (
+        reference["schema_version"] == 12
+        and reference["phase_repair_contract_digest"]
+        == EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
+    )
+
+
 def create_exact_drain_authorization_grant_plan(
     reference_plan_value: Mapping[str, Any],
     *,
@@ -5837,7 +5896,7 @@ def create_exact_drain_authorization_grant_plan(
         reference_plan_value,
         now=planned_at,
     )
-    if reference["schema_version"] not in {13, 14}:
+    if not _exact_drain_current_grant_reference(reference):
         raise OperationRecoveryError(
             "operation-recovery exact drain grant reference is invalid"
         )
@@ -5930,7 +5989,7 @@ def verify_exact_drain_authorization_grant_plan(
         now=created_at,
         allow_expired=True,
     )
-    if reference["schema_version"] not in {13, 14}:
+    if not _exact_drain_current_grant_reference(reference):
         raise OperationRecoveryError(
             "operation-recovery exact drain grant plan is invalid"
         )

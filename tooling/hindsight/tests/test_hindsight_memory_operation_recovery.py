@@ -366,6 +366,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self,
         *,
         completed_positions: set[int] | None = None,
+        failed_positions: set[int] | None = None,
         observed_at: int = 1_785_461_000,
     ) -> dict:
         rows = operation_rows()
@@ -374,10 +375,23 @@ class OperationRecoveryContractTest(unittest.TestCase):
             if completed_positions is None
             else completed_positions
         )
+        failed_positions = set() if failed_positions is None else failed_positions
+        if completed_positions & failed_positions:
+            raise ValueError("completed and failed positions must be distinct")
         for index, row in enumerate(rows):
             if index in completed_positions:
                 row["status"] = "completed"
                 row["completed_at"] = "2026-07-29T13:00:02Z"
+            elif index in failed_positions:
+                row["status"] = "failed"
+                row["completed_at"] = "2026-07-29T13:00:03Z"
+                row["updated_at"] = "2026-07-29T13:00:03Z"
+                row["retry_count"] = 3
+                row["worker_id_present"] = True
+                row["worker_id_digest"] = f"{index + 800:064x}"
+                row["claimed_at"] = "2026-07-29T12:59:00.000000Z"
+                row["error_category"] = "provider_transport"
+                row["error_digest"] = f"{index + 900:064x}"
         return dict(
             create_live_snapshot(
                 self.cohort(),
@@ -7812,6 +7826,124 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertNotIn('"worker_id":', serialized)
         self.assertNotIn('"error_message":', serialized)
         self.assertNotIn('"result_metadata":', serialized)
+
+    def test_exact_drain_plan_preserves_retry_exhausted_failures(self):
+        planned_at = 1_785_462_000
+        snapshot = self.drain_snapshot(failed_positions={44, 45, 47})
+        plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/exhausted-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/exhausted-auth.json",
+            application_receipt_path="/private/tmp/exhausted-app.json",
+            status_artifact_path="/private/tmp/exhausted-status.json",
+            verification_receipt_path="/private/tmp/exhausted-verify.json",
+            candidate_runtime_snapshot_schema_version=8,
+            created_at=planned_at,
+            schema_version=12,
+        )
+
+        self.assertEqual(plan["selected_operation_count"], 40)
+        self.assertEqual(plan["selected_status_counts"], {"pending": 40})
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 5, "failed": 3},
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
+            plan,
+        )
+
+        grant_plan = (
+            recovery_contract.create_exact_drain_authorization_grant_plan(
+                plan,
+                grant_id="77777777-7777-4777-8777-777777777777",
+                maximum_recovery_epoch=0,
+                maximum_reconciliation_cycle=0,
+                maximum_plan_claims=1,
+                maximum_worker_attempts=5,
+                maximum_execution_seconds=(
+                    recovery_contract.EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS
+                ),
+                maximum_concurrent_drains=1,
+                created_at=planned_at,
+                expires_at=planned_at + 172_800,
+            )
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_authorization_grant_plan(
+                grant_plan,
+                now=planned_at,
+            ),
+            grant_plan,
+        )
+
+        nonexhausted_snapshot = deepcopy(snapshot)
+        failed_row = next(
+            item
+            for item in nonexhausted_snapshot["operations"]
+            if item["current_status"] == "failed"
+        )
+        failed_row["retry_count"] = 2
+        failed_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in failed_row.items()
+                if key != "row_digest"
+            }
+        )
+        nonexhausted_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in nonexhausted_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "recovery context is required",
+        ):
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                nonexhausted_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=drain_backup_evidence(),
+                rollback_backup_path="/private/tmp/nonexhausted.age",
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path="/private/tmp/nonexhausted-auth.json",
+                application_receipt_path="/private/tmp/nonexhausted-app.json",
+                status_artifact_path="/private/tmp/nonexhausted-status.json",
+                verification_receipt_path="/private/tmp/nonexhausted-verify.json",
+                candidate_runtime_snapshot_schema_version=8,
+                created_at=planned_at,
+                schema_version=12,
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "grant reference is invalid",
+        ):
+            recovery_contract.create_exact_drain_authorization_grant_plan(
+                self.drain_plan(schema_version=12),
+                grant_id="88888888-8888-4888-8888-888888888888",
+                maximum_recovery_epoch=0,
+                maximum_reconciliation_cycle=0,
+                maximum_plan_claims=1,
+                maximum_worker_attempts=5,
+                maximum_execution_seconds=(
+                    recovery_contract.EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS
+                ),
+                maximum_concurrent_drains=1,
+                created_at=planned_at,
+                expires_at=planned_at + 172_800,
+            )
 
     def test_exact_drain_worker_requires_the_exact_authorization_receipt(self):
         now = int(__import__("time").time())

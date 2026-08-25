@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence, Set
 from datetime import datetime
+import hmac
 import re
 import time
 import unicodedata
@@ -7023,6 +7024,8 @@ def _post_abort_worker_digest(reference_plan_digest: str) -> str:
 
 def _post_abort_released_operation_ids(
     reference_plan: Mapping[str, Any],
+    *,
+    expected_progress_digest: str,
 ) -> frozenset[str]:
     """Return rows durably marked released by the reference worker.
 
@@ -7047,6 +7050,23 @@ def _post_abort_released_operation_ids(
             "progress_schema_version", 1
         ),
     )
+    if not hmac.compare_digest(
+        progress["progress_digest"],
+        _sha(
+            expected_progress_digest,
+            "post-abort reference application progress digest",
+        ),
+    ) or (
+        reference_plan.get("schema_version") == 15
+        and (
+            progress.get("grant_id") != reference_plan.get("grant_id")
+            or progress.get("grant_digest")
+            != reference_plan.get("grant_digest")
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort progress differs"
+        )
     return frozenset(
         item["operation_id"]
         for item in progress["tasks"]
@@ -7522,6 +7542,8 @@ def _post_abort_v11_retry_recovery(
     selected: Sequence[Mapping[str, Any]],
     current: Mapping[str, Mapping[str, Any]],
     prior_retry_recovery_value: Mapping[str, Any] | None,
+    *,
+    reference_application_progress_digest: str,
 ) -> dict[str, Any]:
     context = reference_plan.get("recovery_context")
     if (
@@ -7568,7 +7590,12 @@ def _post_abort_v11_retry_recovery(
     # recovery is still at epoch one.  Keep the older epoch-one contract
     # strict for schema 11 and for rows without release breadcrumbs.
     released_operation_ids = (
-        _post_abort_released_operation_ids(reference_plan)
+        _post_abort_released_operation_ids(
+            reference_plan,
+            expected_progress_digest=(
+                reference_application_progress_digest
+            ),
+        )
         if reference_plan["schema_version"] == 12
         else frozenset()
     )
@@ -7894,6 +7921,7 @@ def _post_abort_v10_contract(
     *,
     schema_version: int,
     prior_retry_recovery: Mapping[str, Any] | None,
+    reference_application_progress_digest: str,
 ) -> tuple[
     list[dict[str, Any]],
     str,
@@ -7915,7 +7943,12 @@ def _post_abort_v10_contract(
         )
     )
     released_operation_ids = (
-        _post_abort_released_operation_ids(reference_plan)
+        _post_abort_released_operation_ids(
+            reference_plan,
+            expected_progress_digest=(
+                reference_application_progress_digest
+            ),
+        )
         if released_checkpoint_capable
         else frozenset()
     )
@@ -8152,6 +8185,9 @@ def _post_abort_v10_contract(
             selected,
             current,
             prior_retry_recovery,
+            reference_application_progress_digest=(
+                reference_application_progress_digest
+            ),
         )
     )
     derived = {
@@ -8197,6 +8233,7 @@ def _post_abort_contract(
     *,
     schema_version: int,
     prior_retry_recovery: Mapping[str, Any] | None = None,
+    reference_application_progress_digest: str,
 ) -> tuple[
     list[dict[str, Any]],
     str,
@@ -8274,6 +8311,9 @@ def _post_abort_contract(
             snapshot,
             schema_version=schema_version,
             prior_retry_recovery=prior_retry_recovery,
+            reference_application_progress_digest=(
+                reference_application_progress_digest
+            ),
         )
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
     selected = _post_abort_selected(snapshot)
@@ -8704,6 +8744,7 @@ def create_post_abort_recovery_plan(
         snapshot,
         schema_version=schema_version,
         prior_retry_recovery=prior_retry_recovery,
+        reference_application_progress_digest=reference_progress_digest,
     )
     authority = snapshot["installation_authority"]
     backup = _backup(
@@ -9007,6 +9048,7 @@ def verify_post_abort_recovery_plan(
             and isinstance(plan["retry_recovery"], Mapping)
             else None
         ),
+        reference_application_progress_digest=reference_progress_digest,
     )
     selected_value = plan["selected_operations"]
     if not isinstance(selected_value, list):

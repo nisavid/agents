@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,10 @@ if str(LIB) not in sys.path:
 
 from hindsight_memory_control_plane.canonical import digest  # noqa: E402
 import hindsight_memory_control_plane.operation_recovery as recovery_contract  # noqa: E402
+from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
+    ExactDrainProgressRecorder,
+    read_exact_drain_progress,
+)
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
@@ -834,6 +839,90 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "max_concurrent": 2,
             },
         )
+
+    def test_schema_fifteen_released_rows_bind_progress_and_grant(self):
+        _reference, _grant, plan, _create_plan = (
+            self.standing_grant_fixture()
+        )
+        released_id = plan["selected_operations"][0]["operation_id"]
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            reference = deepcopy(plan)
+            reference["progress_artifact_path"] = str(progress_path)
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest=plan["plan_digest"],
+                worker_pid=4321,
+                worker_start_time="darwin:1:2",
+                worker_attempt=1,
+                selected_operations=plan["selected_operations"],
+                progress_schema_version=plan["progress_schema_version"],
+                grant_id=plan["grant_id"],
+                grant_digest=plan["grant_digest"],
+                clock=lambda: plan["created_at"],
+            )
+            recorder.task_stage(
+                released_id,
+                status="pending",
+                stage="released",
+            )
+            progress = read_exact_drain_progress(
+                progress_path,
+                plan_digest=plan["plan_digest"],
+                progress_schema_version=plan["progress_schema_version"],
+            )
+            self.assertEqual(
+                recovery_contract._post_abort_released_operation_ids(
+                    reference,
+                    expected_progress_digest=progress["progress_digest"],
+                ),
+                frozenset({released_id}),
+            )
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "post-abort progress differs",
+            ):
+                recovery_contract._post_abort_released_operation_ids(
+                    reference,
+                    expected_progress_digest="0" * 64,
+                )
+
+            mismatched_path = Path(directory) / "mismatched-progress.json"
+            mismatched = deepcopy(reference)
+            mismatched["progress_artifact_path"] = str(mismatched_path)
+            mismatched_recorder = ExactDrainProgressRecorder(
+                path=mismatched_path,
+                plan_digest=plan["plan_digest"],
+                worker_pid=4321,
+                worker_start_time="darwin:1:2",
+                worker_attempt=1,
+                selected_operations=plan["selected_operations"],
+                progress_schema_version=plan["progress_schema_version"],
+                grant_id="44444444-4444-4444-8444-444444444444",
+                grant_digest="e" * 64,
+                clock=lambda: plan["created_at"],
+            )
+            mismatched_recorder.task_stage(
+                released_id,
+                status="pending",
+                stage="released",
+            )
+            mismatched_progress = read_exact_drain_progress(
+                mismatched_path,
+                plan_digest=plan["plan_digest"],
+                progress_schema_version=plan["progress_schema_version"],
+            )
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "post-abort progress differs",
+            ):
+                recovery_contract._post_abort_released_operation_ids(
+                    mismatched,
+                    expected_progress_digest=mismatched_progress[
+                        "progress_digest"
+                    ],
+                )
         self.assertEqual(
             recovery_contract.verify_exact_drain_plan(
                 plan,
@@ -1764,6 +1853,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ],
                 current,
                 prior,
+                reference_application_progress_digest="f" * 64,
             )
         self.assertEqual(retry["schema_version"], 2)
         self.assertEqual(retry["recovery_epoch_before"], 1)
@@ -1820,6 +1910,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 chained_snapshot,
                 schema_version=11,
                 prior_retry_recovery=prior,
+                reference_application_progress_digest="f" * 64,
             )
         self.assertEqual(len(chained[0]), 1)
         self.assertEqual(
@@ -6250,6 +6341,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             *,
             status=terminal_status,
             exit_evidence=worker_exit,
+            progress_digest="6" * 64,
         ):
             return create_post_abort_recovery_plan(
                 epoch_three_plan,
@@ -6271,7 +6363,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_authorization(epoch_three_plan)
                 ),
                 reference_application_journal=terminal_journal,
-                reference_application_progress_digest="6" * 64,
+                reference_application_progress_digest=progress_digest,
                 reference_application_receipt_digest="7" * 64,
                 reference_terminal_status=status,
                 reference_worker_exit=exit_evidence,
@@ -6403,14 +6495,36 @@ class OperationRecoveryContractTest(unittest.TestCase):
             **mixed_status_body,
             "status_digest": digest(mixed_status_body),
         }
-        with patch.object(
-            recovery_contract,
-            "_post_abort_released_operation_ids",
-            return_value=frozenset({released_operation_id}),
+        progress_path = Path(epoch_three_plan["progress_artifact_path"])
+        released_progress = {
+            "progress_digest": "6" * 64,
+            "tasks": [
+                {
+                    "operation_id": released_operation_id,
+                    "status": "pending",
+                    "stage": "released",
+                }
+            ],
+        }
+        original_exists = Path.exists
+
+        def progress_exists(path):
+            if path == progress_path:
+                return True
+            return original_exists(path)
+
+        with (
+            patch.object(Path, "exists", progress_exists),
+            patch(
+                "hindsight_memory_control_plane."
+                "operation_recovery_progress.read_exact_drain_progress",
+                return_value=released_progress,
+            ),
         ):
             mixed_reconciliation = create_reconciliation(
                 mixed,
                 status=mixed_status,
+                progress_digest=released_progress["progress_digest"],
             )
             self.assertEqual(
                 verify_post_abort_recovery_plan(
@@ -6419,6 +6533,15 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ),
                 mixed_reconciliation,
             )
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "post-abort progress differs",
+            ):
+                create_reconciliation(
+                    mixed,
+                    status=mixed_status,
+                    progress_digest="7" * 64,
+                )
         self.assertEqual(
             mixed_reconciliation["selected_status_counts"],
             {"failed": len(terminal_selected_ids) - 3},
@@ -6436,16 +6559,22 @@ class OperationRecoveryContractTest(unittest.TestCase):
             mixed_reconciliation["retry_recovery"]["operation_count"],
             len(terminal_selected_ids) - 3,
         )
-        with patch.object(
-            recovery_contract,
-            "_post_abort_released_operation_ids",
-            return_value=frozenset({released_operation_id}),
+        with (
+            patch.object(Path, "exists", progress_exists),
+            patch(
+                "hindsight_memory_control_plane."
+                "operation_recovery_progress.read_exact_drain_progress",
+                return_value=released_progress,
+            ),
         ):
             with self.assertRaisesRegex(
                 OperationRecoveryError,
                 "post-terminal evidence is invalid",
             ):
-                create_reconciliation(mixed)
+                create_reconciliation(
+                    mixed,
+                    progress_digest=released_progress["progress_digest"],
+                )
 
         active_worker_body = {
             **worker_exit_body,

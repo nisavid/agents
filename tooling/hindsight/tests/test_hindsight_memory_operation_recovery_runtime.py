@@ -334,6 +334,52 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             authorization_bytes,
         )
 
+    def test_schema_fifteen_adapter_uses_the_plan_bound_deadlines(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        _reference, grant, plan, _create_plan = fixtures.standing_grant_fixture(
+            created_at=planned_at,
+            expires_at=planned_at + 1_200_000,
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+        )
+        ledger = (
+            recovery_fixtures.recovery_contract.create_exact_drain_grant_ledger(
+                grant,
+                ledger_nonce="1" * 64,
+                created_at=planned_at,
+            )
+        )
+        _ledger, use = (
+            recovery_fixtures.recovery_contract.claim_exact_drain_grant(
+                ledger,
+                plan,
+                expected_ledger_digest=ledger["ledger_digest"],
+                claim_nonce="2" * 64,
+                ledger_nonce="3" * 64,
+                claimed_at=planned_at,
+            )
+        )
+        authorization = (
+            recovery_fixtures.recovery_contract.create_exact_drain_grant_authorization_receipt(
+                plan,
+                use,
+            )
+        )
+
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            clock=lambda: planned_at,
+        )
+
+        self.assertEqual(adapter.phase_one_timeout_seconds, 7_200)
+        self.assertEqual(adapter.operation_attempt_timeout_seconds, 7_200)
+        self.assertEqual(
+            adapter._execution_deadline,
+            authorization["authorized_at"]
+            + plan["execution_window"]["calculated_seconds"],
+        )
+
     def test_schema_thirteen_and_fourteen_initialize_lease_for_retry_persistence(
         self,
     ):

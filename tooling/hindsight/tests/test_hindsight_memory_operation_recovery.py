@@ -501,7 +501,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             else maximum_worker_attempts
         )
         execution_budget = (
-            reference["execution_window"]["calculated_seconds"]
+            recovery_contract.EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS
             * maximum_plan_claims
             if maximum_execution_seconds is None
             else maximum_execution_seconds
@@ -789,6 +789,56 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     grant,
                     predecessor_plan_digest=reference["plan_digest"],
                 )
+
+    def test_schema_fifteen_separates_request_and_operation_deadlines(self):
+        reference, _grant, plan, _create_plan = self.standing_grant_fixture()
+
+        self.assertEqual(reference["schema_version"], 13)
+        self.assertEqual(reference["phase_one_timeout_seconds"], 3_600)
+        self.assertEqual(reference["operation_attempt_timeout_seconds"], 3_600)
+        self.assertEqual(plan["schema_version"], 15)
+        self.assertEqual(plan["phase_one_timeout_seconds"], 7_200)
+        self.assertEqual(plan["operation_attempt_timeout_seconds"], 7_200)
+        self.assertEqual(
+            plan["execution_window"]["operation_attempt_timeout_seconds"],
+            7_200,
+        )
+        self.assertEqual(plan["execution_window"]["effective_concurrency"], 2)
+        self.assertEqual(
+            plan["provider_timeout_contract"]["members"][-1],
+            {
+                "provider_id": "hatchery",
+                "queue_timeout_seconds": 3_600,
+                "execution_timeout_seconds": 3_600,
+                "max_concurrent": 2,
+            },
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                plan,
+                now=plan["created_at"],
+            ),
+            plan,
+        )
+        for key in (
+            "phase_one_timeout_seconds",
+            "operation_attempt_timeout_seconds",
+        ):
+            with self.subTest(key=key):
+                changed = deepcopy(plan)
+                changed[key] = 3_600
+                changed["plan_digest"] = digest(
+                    {
+                        item_key: item_value
+                        for item_key, item_value in changed.items()
+                        if item_key != "plan_digest"
+                    }
+                )
+                with self.assertRaises(OperationRecoveryError):
+                    recovery_contract.verify_exact_drain_plan(
+                        changed,
+                        now=changed["created_at"],
+                    )
 
     def test_exact_drain_grant_claim_is_atomic_and_crash_idempotent(self):
         created_at = 1_785_462_000

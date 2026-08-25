@@ -60,12 +60,15 @@ EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS = 120
 EXACT_DRAIN_EXECUTION_LEASE_SECONDS = 86_400
 EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS = 14 * 24 * 60 * 60
 EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY = 1
+EXACT_DRAIN_SCHEMA_15_EXECUTION_EFFECTIVE_CONCURRENCY = 2
 EXACT_DRAIN_LEGACY_HATCHERY_MAX_CONCURRENT = 1
 EXACT_DRAIN_HATCHERY_MAX_CONCURRENT = 2
 EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS = 120
 EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS = 125
 EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS = 3_600
 EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS = 3_600
+EXACT_DRAIN_SCHEMA_15_PHASE_ONE_TIMEOUT_SECONDS = 7_200
+EXACT_DRAIN_SCHEMA_15_OPERATION_ATTEMPT_TIMEOUT_SECONDS = 7_200
 EXACT_DRAIN_PROVIDER_QUEUE_TIMEOUT_SECONDS = 3_600
 EXACT_DRAIN_MAXIMUM_RETRY_DELAY_SECONDS = 3_600
 EXACT_DRAIN_STARTUP_MARGIN_SECONDS = (
@@ -3649,11 +3652,14 @@ def _exact_drain_execution_window(
             EXACT_DRAIN_WORKER_MAX_RETRIES - retry_count + 1
         )
     retry_wait_count = remaining_attempt_count - selected_operation_count
+    effective_concurrency = (
+        EXACT_DRAIN_SCHEMA_15_EXECUTION_EFFECTIVE_CONCURRENCY
+        if schema_version == 15
+        else EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
+    )
     execution_waves = (
-        remaining_attempt_count
-        + EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
-        - 1
-    ) // EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
+        remaining_attempt_count + effective_concurrency - 1
+    ) // effective_concurrency
     transaction_margin_seconds = (
         2
         * remaining_attempt_count
@@ -3663,15 +3669,25 @@ def _exact_drain_execution_window(
         EXACT_DRAIN_WORKER_MAX_ATTEMPTS
         * EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
     )
-    attempt_timeout_seconds = (
-        EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
-        if schema_version in {11, 12, 13, 14, 15}
+    phase_one_timeout_seconds = (
+        EXACT_DRAIN_SCHEMA_15_PHASE_ONE_TIMEOUT_SECONDS
+        if schema_version == 15
         else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+    )
+    attempt_timeout_seconds = (
+        EXACT_DRAIN_SCHEMA_15_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+        if schema_version == 15
+        else EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+        if schema_version in {11, 12, 13, 14}
+        else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+    )
+    startup_margin_seconds = (
+        EXACT_DRAIN_WORKER_MAX_ATTEMPTS * phase_one_timeout_seconds
     )
     calculated_seconds = (
         execution_waves * attempt_timeout_seconds
         + retry_wait_count * EXACT_DRAIN_MAXIMUM_RETRY_DELAY_SECONDS
-        + EXACT_DRAIN_STARTUP_MARGIN_SECONDS
+        + startup_margin_seconds
         + transaction_margin_seconds
         + shutdown_margin_seconds
     )
@@ -3687,13 +3703,11 @@ def _exact_drain_execution_window(
         "selected_operation_count": selected_operation_count,
         "remaining_attempt_count": remaining_attempt_count,
         "retry_wait_count": retry_wait_count,
-        "effective_concurrency": (
-            EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
-        ),
+        "effective_concurrency": effective_concurrency,
         **(
             {
                 "operation_attempt_timeout_seconds": (
-                    EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+                    attempt_timeout_seconds
                 )
             }
             if schema_version in {11, 12, 13, 14, 15}
@@ -3709,7 +3723,7 @@ def _exact_drain_execution_window(
         "maximum_retry_delay_seconds": (
             EXACT_DRAIN_MAXIMUM_RETRY_DELAY_SECONDS
         ),
-        "startup_margin_seconds": EXACT_DRAIN_STARTUP_MARGIN_SECONDS,
+        "startup_margin_seconds": startup_margin_seconds,
         "transaction_margin_seconds": transaction_margin_seconds,
         "shutdown_attempt_count": EXACT_DRAIN_WORKER_MAX_ATTEMPTS,
         "shutdown_margin_seconds": shutdown_margin_seconds,
@@ -4794,13 +4808,19 @@ def create_exact_drain_plan(
         "phase_one_client_timeout_seconds": (
             EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS
         ),
-        "phase_one_timeout_seconds": EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS,
+        "phase_one_timeout_seconds": (
+            EXACT_DRAIN_SCHEMA_15_PHASE_ONE_TIMEOUT_SECONDS
+            if schema_version == 15
+            else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+        ),
         **(
             {}
             if schema_version == 10
             else {
                 "operation_attempt_timeout_seconds": (
-                    EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+                    EXACT_DRAIN_SCHEMA_15_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+                    if schema_version == 15
+                    else EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
                 ),
                 "phase_one_deadline_anchor": "first-phase-one-entry",
                 "phase_one_nested_stage_prefixes": ["llm."],
@@ -4824,12 +4844,11 @@ def create_exact_drain_plan(
         ),
         "phase_repair_contract_digest": (
             EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
-            if schema_version in {13, 14}
+            if schema_version in {13, 14, 15}
             or (
                 schema_version == 12
                 and candidate_runtime_snapshot_schema_version == 8
             )
-            or schema_version == 15
             else (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
                 if schema_version == 12
@@ -5354,7 +5373,11 @@ def verify_exact_drain_plan(
             schema_version in {11, 12, 13, 14, 15}
             and (
                 operation_attempt_timeout_seconds
-                != EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+                != (
+                    EXACT_DRAIN_SCHEMA_15_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+                    if schema_version == 15
+                    else EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_SECONDS
+                )
                 or phase_one_deadline_anchor != "first-phase-one-entry"
                 or phase_one_nested_stage_prefixes != ["llm."]
                 or provider_timeout_contract
@@ -5389,7 +5412,11 @@ def verify_exact_drain_plan(
                 phase_one_statement_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
                 or phase_one_timeout_seconds
-                != EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+                != (
+                    EXACT_DRAIN_SCHEMA_15_PHASE_ONE_TIMEOUT_SECONDS
+                    if schema_version == 15
+                    else EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+                )
                 or phase_repair_contract_digest
                 not in (
                     (

@@ -297,65 +297,67 @@ def exact_drain_platform_environment() -> dict[str, str]:
     }
 
 
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("pbi_rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _darwin_process_bsd_info(pid: int) -> _DarwinProcBsdInfo | None:
+    if sys.platform != "darwin" or type(pid) is not int or pid <= 1:
+        return None
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        info = _DarwinProcBsdInfo()
+        result = proc_pidinfo(
+            pid,
+            3,
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+    except (AttributeError, OSError):
+        return None
+    return info if result == ctypes.sizeof(info) else None
+
+
 def process_start_time(pid: int) -> str | None:
     """Return the cross-platform process start token used by exact journals."""
     if type(pid) is not int or pid <= 1:
         return None
-    if sys.platform == "darwin":
-
-        class ProcBsdInfo(ctypes.Structure):
-            _fields_ = [
-                ("pbi_flags", ctypes.c_uint32),
-                ("pbi_status", ctypes.c_uint32),
-                ("pbi_xstatus", ctypes.c_uint32),
-                ("pbi_pid", ctypes.c_uint32),
-                ("pbi_ppid", ctypes.c_uint32),
-                ("pbi_uid", ctypes.c_uint32),
-                ("pbi_gid", ctypes.c_uint32),
-                ("pbi_ruid", ctypes.c_uint32),
-                ("pbi_rgid", ctypes.c_uint32),
-                ("pbi_svuid", ctypes.c_uint32),
-                ("pbi_svgid", ctypes.c_uint32),
-                ("pbi_rfu_1", ctypes.c_uint32),
-                ("pbi_comm", ctypes.c_char * 16),
-                ("pbi_name", ctypes.c_char * 32),
-                ("pbi_nfiles", ctypes.c_uint32),
-                ("pbi_pgid", ctypes.c_uint32),
-                ("pbi_pjobc", ctypes.c_uint32),
-                ("e_tdev", ctypes.c_uint32),
-                ("e_tpgid", ctypes.c_uint32),
-                ("pbi_nice", ctypes.c_int32),
-                ("pbi_start_tvsec", ctypes.c_uint64),
-                ("pbi_start_tvusec", ctypes.c_uint64),
-            ]
-
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            proc_pidinfo = libproc.proc_pidinfo
-            proc_pidinfo.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            ]
-            proc_pidinfo.restype = ctypes.c_int
-            info = ProcBsdInfo()
-            result = proc_pidinfo(
-                pid,
-                3,
-                0,
-                ctypes.byref(info),
-                ctypes.sizeof(info),
-            )
-        except (AttributeError, OSError):
-            pass
-        else:
-            if result == ctypes.sizeof(info):
-                return (
-                    f"darwin:{info.pbi_start_tvsec}:"
-                    f"{info.pbi_start_tvusec}"
-                )
+    info = _darwin_process_bsd_info(pid)
+    if info is not None:
+        return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
 
     try:
         raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
@@ -381,6 +383,40 @@ def process_start_time(pid: int) -> str | None:
     if not value or len(value) > 128:
         return None
     return value
+
+
+def postgres_peer_pid_matches(
+    peer_pid: int,
+    binding: Mapping[str, Any],
+) -> bool:
+    """Accept the postmaster or its stable Darwin backend child as peer."""
+    expected_pid = binding.get("pid")
+    if type(peer_pid) is not int or type(expected_pid) is not int:
+        return False
+    if peer_pid == expected_pid:
+        return True
+    started_at = binding.get("started_at")
+    if type(started_at) is not int or started_at <= 0:
+        return False
+    first = _darwin_process_bsd_info(peer_pid)
+    second = _darwin_process_bsd_info(peer_pid)
+    if first is None or second is None:
+        return False
+    first_name = bytes(first.pbi_comm).split(b"\0", 1)[0]
+    second_name = bytes(second.pbi_comm).split(b"\0", 1)[0]
+    return (
+        first.pbi_pid == peer_pid
+        and second.pbi_pid == peer_pid
+        and first.pbi_ppid == expected_pid
+        and second.pbi_ppid == expected_pid
+        and first.pbi_uid == os.geteuid()
+        and second.pbi_uid == os.geteuid()
+        and first.pbi_start_tvsec >= started_at
+        and second.pbi_start_tvsec == first.pbi_start_tvsec
+        and second.pbi_start_tvusec == first.pbi_start_tvusec
+        and first_name == b"postgres"
+        and second_name == first_name
+    )
 
 
 def exact_drain_start_message(
@@ -1356,7 +1392,6 @@ async def connect_verified_local_postgres(
     ):
         raise OperationRecoveryError("pg0 connection authority is invalid")
     expected_path = binding["socket_path"]
-    expected_pid = binding["pid"]
     loop = asyncio.get_running_loop()
     original_connector = loop.create_unix_connection
     observed_peer_pids: list[int] = []
@@ -1387,7 +1422,7 @@ async def connect_verified_local_postgres(
                 "i",
                 peer_socket.getsockopt(0, 2, struct.calcsize("i")),
             )[0]
-            if peer_pid != expected_pid:
+            if not postgres_peer_pid_matches(peer_pid, binding):
                 raise OperationRecoveryError(
                     "PostgreSQL Unix peer PID differs"
                 )
@@ -1423,7 +1458,10 @@ async def connect_verified_local_postgres(
         )
     finally:
         loop.create_unix_connection = original_connector  # type: ignore[method-assign]
-    if observed_peer_pids != [expected_pid]:
+    if (
+        len(observed_peer_pids) != 1
+        or not postgres_peer_pid_matches(observed_peer_pids[0], binding)
+    ):
         if connection is not None:
             await connection.close()
         raise OperationRecoveryError("PostgreSQL Unix peer was not verified")

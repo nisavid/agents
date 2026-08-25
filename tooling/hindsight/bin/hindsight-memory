@@ -232,6 +232,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     exact_drain_worker_hindsight_version,
     exact_drain_worker_interpreter_path,
     live_row_digest,
+    postgres_peer_pid_matches,
     process_start_time,
     read_claim_release_evidence,
     read_claim_release_preimage,
@@ -5801,7 +5802,7 @@ def _verified_postgres_proxy(
             "i",
             upstream.getsockopt(0, 2, struct.calcsize("i")),
         )[0]
-        if peer_pid != binding["pid"]:
+        if not postgres_peer_pid_matches(peer_pid, binding):
             raise OperationRecoveryError(
                 "PostgreSQL backup peer PID differs"
             )

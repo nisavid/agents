@@ -48,6 +48,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     exact_drain_worker_failure_evidence,
     install_exact_drain_runtime_guards,
     live_row_digest,
+    postgres_peer_pid_matches,
     read_global_queue_blockers,
     read_failure_classifications,
     read_claim_release_evidence,
@@ -8157,6 +8158,38 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "peer PID differs",
         ):
             asyncio.run(exercise(os.getpid() + 1))
+
+    def test_postgres_peer_accepts_stable_postmaster_child(self):
+        def info(*, ppid=41, started_at=101, usec=7, name=b"postgres"):
+            value = operation_recovery_runtime._DarwinProcBsdInfo()
+            value.pbi_pid = 42
+            value.pbi_ppid = ppid
+            value.pbi_uid = 501
+            value.pbi_start_tvsec = started_at
+            value.pbi_start_tvusec = usec
+            value.pbi_comm = name
+            return value
+
+        binding = {"pid": 41, "started_at": 100}
+        with (
+            patch.object(
+                operation_recovery_runtime,
+                "_darwin_process_bsd_info",
+                side_effect=(info(), info()),
+            ),
+            patch.object(operation_recovery_runtime.os, "geteuid", return_value=501),
+        ):
+            self.assertTrue(postgres_peer_pid_matches(42, binding))
+
+        with (
+            patch.object(
+                operation_recovery_runtime,
+                "_darwin_process_bsd_info",
+                side_effect=(info(), info(usec=8)),
+            ),
+            patch.object(operation_recovery_runtime.os, "geteuid", return_value=501),
+        ):
+            self.assertFalse(postgres_peer_pid_matches(42, binding))
 
 
 if __name__ == "__main__":

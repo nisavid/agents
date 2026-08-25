@@ -92,11 +92,14 @@ deliberately asymmetric:
 | Runtime | Can a causal path disprove correctness, security, compatibility, operability, or the claimed verification? |
 | Structure | Can deletion, consolidation, repaired ownership, or a smaller coherent shape reduce reader and maintenance burden? |
 
-The critics receive the same frozen candidate and governing sources but form
-their conclusions independently. Synthesis verifies claims against source; it
-does not average reports or treat agreement as truth. Consequence-triggered
-specialists add security, migration, accessibility, performance, deployment,
-or other domain scrutiny without turning every review into an unbounded panel.
+Each critic receives the same frozen candidate and governing contract in a
+distinct context. It does not receive sibling reports, the author's rationale,
+expected findings, or later adjudication. A harness that cannot provide this
+isolation must label the review's assurance as degraded. Synthesis receives the
+preserved reports and verifies their claims against source; it does not average
+reports or treat agreement as truth. Consequence-triggered specialists add
+security, migration, accessibility, performance, deployment, or other domain
+scrutiny without turning every review into an unbounded panel.
 
 Requirements and specifications primarily ground Intent. Repository standards
 and semantically triggered skill contracts are common evidence for every
@@ -161,13 +164,14 @@ source to make it conform to this suite. Once replacement behavior is proved,
 retire or disable the superseded broad route so users and agents still have one
 general owner.
 
-Before release, rescout every in-scope instruction source that changed since
-its last completed rescout, including global instructions, plugin-provided,
+Before release, screen the entire currently installed instruction library that
+changed since its last completed rescout for apparent relevance or overlap.
+This first-pass boundary includes global instructions, plugin-provided,
 managed, external-tool-managed, and standalone skills, plus their conditional
-references and supporting material. Reconcile each hit across the historical
-import, current source, and current plugin. End with one behavior-level
-disposition: retain with its existing owner, migrate to a named owner, or drop
-with a reason.
+references and supporting material. Only then select the hits for deeper
+comparison. Reconcile each hit across the historical import, current source,
+and current plugin. End with one behavior-level disposition: retain with its
+existing owner, migrate to a named owner, or drop with a reason.
 
 ## Treat evaluation as part of design
 
@@ -176,6 +180,11 @@ Compare no-guidance, incumbent, candidate, and composed workflows in blinded,
 repeated runs. Use ablations to test the mechanisms under debate: critic
 priming, independent contexts, source verification, smell vocabulary, model
 heterogeneity, and synthesis rules.
+
+An execution context receives only the raw prompt or fixture and, for a guided
+run, the candidate equipment. Graders receive expectations only after execution.
+Keep execution, grading, adjudication, and revision in distinct contexts; no
+grader revises the output it judged in the same context.
 
 Fixtures need true opportunities and traps: wrong requirements implemented
 cleanly, runtime regressions hidden by green tests, needless compatibility
@@ -204,12 +213,19 @@ This page owns durable design rationale. The
 [source contribution ledger](../../release/source-skill-lineage/contribution-ledger.json)
 and
 [disposition ledger](../../release/source-skill-disposition/disposition-ledger.json)
-are the structured owners of behavior-level provenance and migration
-decisions. The
+are intended to be the structured owners of behavior-level provenance and
+migration decisions. They are currently pre-reconciliation. Until the
+first-release reconciliation makes them conform to this page and revalidates
+their enforcement, this page controls plugin-family ownership and replacement
+direction; the ledgers remain evidence inputs, not authority to retain or
+retire routes. The
 [source-skill disposition and release-refresh contract](../superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md)
 owns source freshness and qualification prerequisites. Package references own
 their current runtime behavior and limitations.
 
-Historical plans and transcripts remain research inputs. Promote their durable
-principles, evidence, and unsettled work into the owners above; do not make a
-historical execution ledger a second current specification.
+This synthesis was reconstructed from the initial Systalyze PR-body review
+effort, its successor plugin-overhaul work, and the July 20 PR publication and
+review skill-stack closeout plan. Their raw transcripts and plan remain research
+inputs while archive ownership is unsettled. Promote their durable principles,
+evidence, and unsettled work into the owners above; do not make a historical
+execution ledger a second current specification.

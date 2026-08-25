@@ -139,15 +139,27 @@ for the separately owned #115 lane. The accepted history should be retained,
 not rewritten or reverted, and no #113, #114, #116, release, or migration
 acceptance should be inferred from it.
 
-The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the required App-published `Owner-signed age admission` context. Daybreak has confirmed that this is a real App-ID-pinned branch-protection check, not a receipt requirement for this test-only diff, and has approved the secure event-driven publisher route under dotfiles #168 with required implementation changes. Draft dotfiles PR #172 contains the non-privileged source slice; #169 owns installation and deployment evidence; #170 owns exact-head requalification. Do not mint a receipt for #166, substitute Actions, or edit branch protection. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
+The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict; interpretation and resolution remain deferred to a Daybreak-capable thread. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
 
-The next downstream sequence is to deploy and validate the #168 publisher
-through #169, qualify and merge the contract/source stack (#171 then #172),
-and use the live App result to complete #170 for #166. Only after that do the
-separately owned #154/#155 acceptance and #113 production projection,
-#114 legacy projection, #115 prepared sealing, and #116 execution proceed.
-#111/#112/#127/#128 remain decision gates, while #124/#125 remain the
-release-boundary consumption and materialization lane.
+The next downstream sequence is #154/#155 owner acceptance, then #113
+production projection, #114 legacy projection, #115 prepared sealing, and
+#116 execution. #111/#112/#127/#128 remain decision gates, while #124/#125
+remain the release-boundary consumption and materialization lane.
+
+## Current route refresh (2026-08-25)
+
+The App-admission interpretation is now settled: Daybreak confirmed that the
+`Owner-signed age admission` requirement is an App-ID-pinned branch-protection
+check, not a receipt requirement for test-only PR #166, and approved the
+workflow-backed event-driven publisher route with required changes. Dotfiles
+PR #172 contains the non-privileged source slice; its remaining hosted privacy
+findings and the App credential/bootstrap deployment are owner-gated under
+#168/#169. The source-skill receipt questions in agents #53/#56 remain a
+separate Daybreak lane.
+
+This refresh does not change the authority boundary: #170 still owns #166's
+exact-head requalification, and no receipt, branch-protection edit, release,
+or host mutation is authorized by this handoff.
 
 ## Explicit non-authority and stop conditions
 

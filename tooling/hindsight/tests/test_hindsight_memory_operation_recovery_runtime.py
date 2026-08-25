@@ -4346,7 +4346,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(shutdowns, [])
         self.assertEqual(len(retries), 1)
 
-    def test_schema_twelve_completed_task_wins_at_deadline_boundary(self):
+    def test_schema_twelve_completed_task_before_deadline_wins(self):
         class Adapter(_ControlConnectionAdapterMixin):
             operation_attempt_timeout_seconds = 0.5
             operation_attempt_timeout_disposition = (
@@ -4401,7 +4401,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 patch(
                     "hindsight_memory_control_plane."
                     "operation_recovery_runtime.time.monotonic",
-                    side_effect=[10.0, 11.0],
+                    side_effect=[10.0, 10.25],
                 ),
             ):
                 poller = WorkerPoller()
@@ -4414,6 +4414,82 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         poller, result = asyncio.run(exercise())
         self.assertEqual(result, "completed")
         self.assertFalse(poller._shutdown.is_set())
+
+    def test_schema_twelve_completed_task_after_deadline_is_retried(self):
+        retries = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.5
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *arguments):
+                retries.append(arguments)
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                return "completed"
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: None,
+        )
+
+        def completed_task(coroutine):
+            coroutine.close()
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("completed")
+            return future
+
+        async def exercise():
+            with (
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.asyncio.create_task",
+                    side_effect=completed_task,
+                ),
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.time.monotonic",
+                    side_effect=[10.0, 11.0],
+                ),
+            ):
+                poller = WorkerPoller()
+                result = await poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1", schema=None),
+                    SimpleNamespace(stage="retain.phase2.insert_facts"),
+                )
+                return poller, result
+
+        poller, result = asyncio.run(exercise())
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(
+            retries[0][3],
+            operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
+        )
 
     def test_schema_twelve_phase_one_deadline_retries_after_quiescence(self):
         retries = []

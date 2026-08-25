@@ -2034,17 +2034,6 @@ def install_exact_drain_runtime_guards(
             while True:
                 stage = getattr(holder, "stage", None)
                 now = time.monotonic()
-                if execution.done():
-                    if isinstance(stage, str) and stage != last_stage:
-                        try:
-                            adapter.record_upstream_stage(
-                                task.operation_id,
-                                stage,
-                            )
-                        except BaseException:
-                            request_exact_worker_shutdown(poller)
-                            raise
-                    return await execution
                 if (
                     operation_attempt_deadline is not None
                     and now >= operation_attempt_deadline
@@ -2086,6 +2075,17 @@ def install_exact_drain_runtime_guards(
                     raise OperationRecoveryError(
                         EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
                     )
+                if execution.done():
+                    if isinstance(stage, str) and stage != last_stage:
+                        try:
+                            adapter.record_upstream_stage(
+                                task.operation_id,
+                                stage,
+                            )
+                        except BaseException:
+                            request_exact_worker_shutdown(poller)
+                            raise
+                    return await execution
                 if isinstance(stage, str) and stage != last_stage:
                     try:
                         adapter.record_upstream_stage(

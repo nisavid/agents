@@ -2091,7 +2091,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     return_value=SimpleNamespace(
                         returncode=0,
                         stdout=(
-                            b"4242 /candidate/bin/"
+                            b"4242 999 /candidate/bin/"
                             b"hindsight-exact-drain-worker --resume\n"
                         ),
                     )
@@ -2766,6 +2766,48 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(observed, expected)
         self.assertEqual(progress_reader.call_count, 3)
         self.assertEqual(sleep.call_args_list, [call(0.01)] * 2)
+
+    def test_recovery_process_census_ignores_marker_in_ancestor_command(self):
+        check = self.controller["_assert_recovery_services_stopped"]
+        globals_ = check.__globals__
+
+        class Probe:
+            def settimeout(self, _timeout):
+                return None
+
+            def connect_ex(self, _address):
+                return 1
+
+            def close(self):
+                return None
+
+        replacements = {
+            "socket": SimpleNamespace(
+                AF_INET=2,
+                SOCK_STREAM=1,
+                socket=lambda *_arguments: Probe(),
+            ),
+            "subprocess": SimpleNamespace(
+                DEVNULL=-3,
+                PIPE=-1,
+                run=Mock(
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout=(
+                            b"100 99 /bin/zsh -c hindsight-exact-drain-worker\n"
+                            b"99 1 /bin/zsh hindsight-exact-drain-worker\n"
+                        ),
+                    )
+                ),
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            with patch.object(os, "getpid", return_value=100):
+                check(SimpleNamespace(config=SimpleNamespace(services=[])))
+        finally:
+            globals_.update(originals)
 
     def test_exact_drain_plan_command_is_unapproved_and_payload_free(self):
         command = self.controller["operation_recovery_drain_plan_command"]
@@ -4317,6 +4359,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "CODEX_HOME": "/private/tmp/codex-home",
             "HINDSIGHT_API_LLM_API_KEY": "provider-secret",
             "HINDSIGHT_API_LLM_1_BASE_URL": "https://provider.invalid",
+            "HINDSIGHT_API_RETAIN_BATCH_ENABLED": "1",
             "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS": "9",
             "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS": "8",
             "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "7",
@@ -4383,6 +4426,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(environment["HINDSIGHT_API_RETAIN_LLM_TIMEOUT"], "3600")
         self.assertEqual(
             environment["HINDSIGHT_API_RETAIN_MAX_CONCURRENT"], "2"
+        )
+        self.assertEqual(
+            environment["HINDSIGHT_API_RETAIN_BATCH_ENABLED"], "0"
         )
         self.assertEqual(
             environment["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"],

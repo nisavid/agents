@@ -1039,6 +1039,7 @@ class _ProviderRuntime:
                 return await invoke_legacy()
 
         if gate is not None:
+            queue_deadline = self._clock() + member.queue_timeout_seconds
             try:
                 async with asyncio.timeout(member.queue_timeout_seconds):
                     await gate.acquire(
@@ -1046,14 +1047,23 @@ class _ProviderRuntime:
                     )
             except TimeoutError as error:
                 raise ProviderQueueTimeout() from error
+            if self._clock() >= queue_deadline:
+                gate.release()
+                raise ProviderQueueTimeout()
         progress_recorder = self._progress_recorder
         request_digest = _PROVIDER_REQUEST_DIGEST.get()
         if progress_recorder is not None and request_digest is not None:
             progress_recorder.provider_executing(request_digest)
         try:
+            execution_deadline = (
+                self._clock() + member.execution_timeout_seconds
+            )
             try:
                 async with asyncio.timeout(member.execution_timeout_seconds):
-                    return await execute()
+                    result = await execute()
+                if self._clock() >= execution_deadline:
+                    raise ProviderExecutionTimeout()
+                return result
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError):
                     raise

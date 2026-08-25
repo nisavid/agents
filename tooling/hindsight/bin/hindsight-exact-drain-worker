@@ -187,6 +187,10 @@ def _validate_worker_environment(
             "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "2",
+            # Batch retain submits directly through the provider implementation,
+            # bypassing managed failover and queue/execution deadlines.  Exact
+            # drain always uses the guarded per-request path instead.
+            "HINDSIGHT_API_RETAIN_BATCH_ENABLED": "0",
             "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
                 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
             ),

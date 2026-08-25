@@ -5067,7 +5067,7 @@ def _assert_recovery_services_stopped(
         finally:
             probe.close()
     process_list = subprocess.run(
-        ("/bin/ps", "-axo", "pid=,command="),
+        ("/bin/ps", "-axo", "pid=,ppid=,command="),
         check=False,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -5092,13 +5092,31 @@ def _assert_recovery_services_stopped(
         "hindsight-memory sidecar",
         "hindsight-memory service",
     )
+    rows: list[tuple[int, int | None, str]] = []
     for line in process_list.stdout.decode("utf-8", errors="replace").splitlines():
-        fields = line.strip().split(maxsplit=1)
-        if (
-            len(fields) == 2
-            and fields[0].isdigit()
-            and int(fields[0]) != os.getpid()
-            and any(marker in fields[1] for marker in worker_markers)
+        fields = line.strip().split(maxsplit=2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            rows.append((int(fields[0]), int(fields[1]), fields[2]))
+        elif len(fields) == 2 and fields[0].isdigit():
+            # Keep compatibility with the narrow mocked census used by older
+            # callers; real macOS ps output always includes PPID above.
+            rows.append((int(fields[0]), None, fields[1]))
+
+    parent_by_pid = {
+        pid: ppid for pid, ppid, _command in rows if ppid is not None
+    }
+    ignored_pids = {os.getpid()}
+    current = os.getpid()
+    while current in parent_by_pid:
+        parent = parent_by_pid[current]
+        if parent in ignored_pids:
+            break
+        ignored_pids.add(parent)
+        current = parent
+
+    for pid, _ppid, command in rows:
+        if pid not in ignored_pids and any(
+            marker in command for marker in worker_markers
         ):
             raise OperationRecoveryError(
                 "orphan or manual Hindsight process remains active"
@@ -10208,6 +10226,10 @@ def _operation_recovery_exact_worker_environment(
             "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
             "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "2",
+            # Batch retain submits directly through the provider implementation,
+            # bypassing managed failover and queue/execution deadlines.  Exact
+            # drain always uses the guarded per-request path instead.
+            "HINDSIGHT_API_RETAIN_BATCH_ENABLED": "0",
             "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
                 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
             ),

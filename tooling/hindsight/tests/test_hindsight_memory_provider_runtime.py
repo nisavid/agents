@@ -1725,6 +1725,29 @@ print("accepted")
         with self.assertRaises(provider_runtime.ProviderExecutionTimeout):
             asyncio.run(member.call())
 
+    def test_split_execution_deadline_rejects_late_completion(self) -> None:
+        policy = ProviderRuntimePolicy.load(split_timeout_policy_data())
+        clock_values = iter((100.0, 100.0, 100.0, 1_301.0))
+        runtime = provider_runtime._ProviderRuntime(
+            policy,
+            credential_resolver=lambda _locator: "/tmp/oauth",
+            logger=logging.getLogger("test-provider-runtime-deadline"),
+            clock=lambda: next(clock_values),
+        )
+        member = StaticMember(
+            "lmstudio",
+            "private-fallback-model",
+            "http://inference.example.test:13305/v1",
+            "",
+            "done-after-deadline",
+        )
+
+        async def completed(**_kwargs):
+            return "done"
+
+        with self.assertRaises(provider_runtime.ProviderExecutionTimeout):
+            asyncio.run(runtime.call(member, completed))
+
     def test_fallback_verification_timeout_does_not_block_startup(self) -> None:
         _LLMProvider, _CodexLLM, MultiLLMProvider = self.install()
 

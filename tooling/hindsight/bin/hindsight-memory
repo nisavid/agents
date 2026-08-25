@@ -11569,8 +11569,12 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             != reference["cohort_digest"]
             or prior_recovery_plan["installation_authority"]
             != reference["installation_authority"]
-            or prior_recovery_plan["candidate_release"]
-            != reference["candidate_release"]
+            # The prior post-abort plan names the candidate that performed
+            # the cleanup.  The reference exact-drain plan is a later
+            # immutable descendant and therefore normally names a different
+            # candidate release.  The chained digests, receipts, cohort, and
+            # installation authority above bind the handoff; requiring the
+            # two release identities to be equal rejects valid descendants.
             or prior_recovery_application["receipt_digest"]
             != reference_context[
                 "post_abort_application_receipt_digest"

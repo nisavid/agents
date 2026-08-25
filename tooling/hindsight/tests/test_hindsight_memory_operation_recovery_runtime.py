@@ -7664,12 +7664,26 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "error_category": "none",
             "error_digest": None,
         }
+        preserved = {
+            **before,
+            "operation_id": "00000000-0000-4000-8000-000000000002",
+            "status": "pending",
+            "updated_at": "2026-07-29T13:30:00.000000Z",
+            "completed_at": None,
+            "retry_count": 1,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+        }
 
         class PostAbortConnection(FakeConnection):
             def __init__(self):
                 super().__init__()
                 self.fetchval_results = [123, 0, False, 124]
-                self.fetch_results = [[before], [after]]
+                self.fetch_results = [
+                    [before, preserved],
+                    [after, preserved],
+                ]
 
             async def fetchval(self, query, *arguments):
                 if "set_config" in query:
@@ -7698,7 +7712,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     {
                         "operation_id": before["operation_id"],
                         "row_digest": live_row_digest(before),
-                    }
+                    },
+                    {
+                        "operation_id": preserved["operation_id"],
+                        "row_digest": live_row_digest(preserved),
+                    },
                 ]
             },
             "retry_recovery": {
@@ -7715,7 +7733,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "transaction_timeout_seconds": 120,
             "expires_at": int(time.time()) + 60,
         }
-        for schema_version in (10, 11):
+        for schema_version in (10, 11, 13):
             with (
                 self.subTest(schema_version=schema_version),
                 patch.object(

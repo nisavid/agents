@@ -7748,7 +7748,13 @@ def _post_terminal_reconciliation_retry_recovery(
     current: Mapping[str, Mapping[str, Any]],
     prior_retry_recovery_value: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Authorize one bounded cycle without inventing recovery epoch four."""
+    """Reconcile failed rows once after the epoch-three worker is inactive.
+
+    Completed rows and wholly unowned pending rows have already reached safe
+    boundaries, so they remain preserved.  Only the failed subset receives a
+    fresh ordinary retry budget; this consumes reconciliation cycle one
+    without inventing recovery epoch four.
+    """
     context = reference_plan.get("recovery_context")
     if (
         reference_plan.get("schema_version") not in {12, 15}
@@ -7787,7 +7793,7 @@ def _post_terminal_reconciliation_retry_recovery(
         or prior["ordinary_attempt_ceiling"] != ordinary_attempt_ceiling
         or prior["maximum_cumulative_attempts"]
         != ordinary_attempt_ceiling * 4
-        or selected_ids != set(reference_selected)
+        or not selected_ids.issubset(reference_selected)
         or any(item["expected_status"] != "failed" for item in selected)
     ):
         raise OperationRecoveryError(
@@ -8790,13 +8796,31 @@ def create_post_abort_recovery_plan(
             reference_application_receipt_digest,
             "post-terminal reference application receipt digest",
         )
+        reference_selected_ids = {
+            item["operation_id"] for item in reference["selected_operations"]
+        }
+        current_rows = {
+            item["operation_id"]: item for item in snapshot["operations"]
+        }
+        expected_terminal_selected_status_counts = {
+            status: sum(
+                current_rows[operation_id]["current_status"] == status
+                for operation_id in reference_selected_ids
+            )
+            for status in OPERATION_STATUSES
+        }
+        expected_terminal_selected_status_counts = {
+            status: count
+            for status, count in expected_terminal_selected_status_counts.items()
+            if count
+        }
         if (
             terminal_status["generation_before"]
             != snapshot["generation_before"]
             or terminal_status["selected_status_counts"]
-            != {"failed": reference["selected_operation_count"]}
+            != expected_terminal_selected_status_counts
             or terminal_status["preserved_status_counts"]
-            != {"completed": snapshot["status_counts"].get("completed", 0)}
+            != reference["preserved_status_counts"]
             or terminal_status["status_digest"]
             != digest(
                 {
@@ -9101,6 +9125,24 @@ def verify_post_abort_recovery_plan(
                 "post-terminal reference worker-exit digest",
             ),
         }
+        reference_selected_ids = {
+            item["operation_id"] for item in reference["selected_operations"]
+        }
+        current_rows = {
+            item["operation_id"]: item for item in snapshot["operations"]
+        }
+        expected_terminal_selected_status_counts = {
+            status: sum(
+                current_rows[operation_id]["current_status"] == status
+                for operation_id in reference_selected_ids
+            )
+            for status in OPERATION_STATUSES
+        }
+        expected_terminal_selected_status_counts = {
+            status: count
+            for status, count in expected_terminal_selected_status_counts.items()
+            if count
+        }
     authority = _installation_authority(plan["installation_authority"])
     backup = _backup(
         plan["rollback_backup"],
@@ -9202,7 +9244,11 @@ def verify_post_abort_recovery_plan(
                 or terminal_fields["reference_terminal_status"][
                     "selected_status_counts"
                 ]
-                != {"failed": reference["selected_operation_count"]}
+                != expected_terminal_selected_status_counts
+                or terminal_fields["reference_terminal_status"][
+                    "preserved_status_counts"
+                ]
+                != reference["preserved_status_counts"]
                 or terminal_fields["reference_worker_exit"]["observed_at"]
                 > created_at
             )

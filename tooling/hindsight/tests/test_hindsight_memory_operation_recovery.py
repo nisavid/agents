@@ -6311,43 +6311,113 @@ class OperationRecoveryContractTest(unittest.TestCase):
             reconciliation,
         )
 
-        nonterminal = deepcopy(epoch_four_interrupted)
-        nonterminal_row = next(
-            item
-            for item in nonterminal["operations"]
+        mixed = deepcopy(epoch_four_interrupted)
+        pending_operation_id = next(
+            item["operation_id"]
+            for item in epoch_three_plan["live_snapshot"]["operations"]
             if item["operation_id"] in terminal_selected_ids
+            and item["next_retry_at"] is None
         )
-        nonterminal_row.update(
-            current_status="pending",
-            completed_at=None,
-            worker_id_present=False,
-            worker_id_digest=None,
-            claimed_at=None,
+        completed_operation_id = next(
+            operation_id
+            for operation_id in terminal_selected_ids
+            if operation_id != pending_operation_id
         )
-        nonterminal_row["row_digest"] = digest(
-            {
-                key: value
-                for key, value in nonterminal_row.items()
-                if key != "row_digest"
-            }
+        mixed_rows = [
+            next(
+                item
+                for item in mixed["operations"]
+                if item["operation_id"] == operation_id
+            )
+            for operation_id in (
+                pending_operation_id,
+                completed_operation_id,
+            )
+        ]
+        mixed_rows[0].update(
+            next(
+                item
+                for item in epoch_three_plan["live_snapshot"]["operations"]
+                if item["operation_id"] == mixed_rows[0]["operation_id"]
+            )
         )
-        nonterminal["status_counts"] = {
-            **nonterminal["status_counts"],
-            "failed": len(terminal_selected_ids) - 1,
+        mixed_rows[1].update(
+            current_status="completed",
+            completed_at="2026-08-20T14:59:00.000000Z",
+        )
+        for row in mixed_rows:
+            row["row_digest"] = digest(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "row_digest"
+                }
+            )
+        mixed["status_counts"] = {
+            **mixed["status_counts"],
+            "completed": mixed["status_counts"]["completed"] + 1,
+            "failed": len(terminal_selected_ids) - 2,
             "pending": 1,
         }
-        nonterminal["snapshot_digest"] = digest(
+        mixed["snapshot_digest"] = digest(
             {
                 key: value
-                for key, value in nonterminal.items()
+                for key, value in mixed.items()
                 if key != "snapshot_digest"
             }
         )
+        mixed_status_body = {
+            **terminal_status_body,
+            "selected_status_counts": {
+                "completed": 1,
+                "failed": len(terminal_selected_ids) - 2,
+                "pending": 1,
+            },
+            "failure_classifications": [
+                {
+                    "cause_family": "provider_transport",
+                    "error_digest": "5" * 64,
+                    "occurrence_count": len(terminal_selected_ids) - 2,
+                }
+            ],
+        }
+        mixed_status = {
+            **mixed_status_body,
+            "status_digest": digest(mixed_status_body),
+        }
+        mixed_reconciliation = create_reconciliation(
+            mixed,
+            status=mixed_status,
+        )
+        self.assertEqual(
+            mixed_reconciliation["selected_status_counts"],
+            {"failed": len(terminal_selected_ids) - 2},
+        )
+        self.assertEqual(
+            mixed_reconciliation["preserved_status_counts"],
+            {
+                "completed": (
+                    epoch_four_interrupted["status_counts"]["completed"] + 1
+                ),
+                "pending": 1,
+            },
+        )
+        self.assertEqual(
+            mixed_reconciliation["retry_recovery"]["operation_count"],
+            len(terminal_selected_ids) - 2,
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(
+                mixed_reconciliation,
+                now=mixed_reconciliation["created_at"],
+            ),
+            mixed_reconciliation,
+        )
         with self.assertRaisesRegex(
             OperationRecoveryError,
-            "row set is invalid",
+            "post-terminal evidence is invalid",
         ):
-            create_reconciliation(nonterminal)
+            create_reconciliation(mixed)
 
         active_worker_body = {
             **worker_exit_body,

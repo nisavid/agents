@@ -12208,6 +12208,8 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
                 authorization=reference_authorization,
                 terminal_status=terminal_status,
             )
+            if _operation_recovery_exact_status_is_terminal(terminal_status)
+            else reference_journal
         )
         worker_exit_body = {
             "schema_version": 1,
@@ -12408,6 +12410,10 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
                 authorization=current_reference_authorization,
                 terminal_status=current_terminal_status,
             )
+            if _operation_recovery_exact_status_is_terminal(
+                current_terminal_status
+            )
+            else current_reference_journal
         )
         if (
             current_terminal_status != terminal_status

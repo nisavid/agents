@@ -8636,6 +8636,112 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     "verify-body" in events or "status-write" in events
                 )
 
+    def test_interrupted_status_rejects_a_missing_progress_artifact(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = fixtures.drain_plan(schema_version=12)
+        journal = {
+            "kind": "operation-recovery-exact-drain-application-journal",
+            "worker_pid": 4242,
+            "worker_start_time": "inactive-worker",
+            "worker_attempt": 2,
+        }
+        reader = self.controller[
+            "_operation_recovery_read_exact_drain_status"
+        ]
+        globals_ = reader.__globals__
+        replacements = {
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: journal
+            ),
+            "_operation_recovery_exact_authorization": (
+                lambda *_arguments, **_keywords: {"authorized": True}
+            ),
+            "_operation_recovery_exact_journal": (
+                lambda *_arguments, **_keywords: journal
+            ),
+            "_operation_recovery_exact_journal_worker_active": (
+                lambda _journal: False
+            ),
+            "_operation_recovery_connect_live": (
+                lambda _args: (_ for _ in ()).throw(
+                    AssertionError("database opened without progress evidence")
+                )
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        original_exists = Path.exists
+
+        def fixture_exists(path):
+            if str(path) == plan["application_receipt_path"]:
+                return True
+            if str(path) == plan["progress_artifact_path"]:
+                return False
+            return original_exists(path)
+
+        try:
+            with (
+                patch.object(Path, "exists", fixture_exists),
+                self.assertRaisesRegex(
+                    self.controller["OperationRecoveryError"],
+                    "interrupted progress is unavailable",
+                ),
+            ):
+                asyncio.run(reader(SimpleNamespace(), plan))
+        finally:
+            globals_.update(originals)
+
+    def test_post_abort_descendant_materializes_missing_reference_status(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = fixtures.drain_plan(schema_version=12)
+        live = {
+            "plan_digest": plan["plan_digest"],
+            "selected_status_counts": {"failed": 1, "pending": 42},
+            "status_digest": "6" * 64,
+        }
+        helper = self.controller[
+            "_operation_recovery_post_abort_reference_status"
+        ]
+        globals_ = helper.__globals__
+        writes = []
+        replacements = {
+            "_operation_recovery_read_exact_drain_status": (
+                lambda _args, _plan: _immediate(live)
+            ),
+            "verify_exact_drain_status": (
+                lambda value, *, plan: (
+                    value
+                    if plan["plan_digest"] == value["plan_digest"]
+                    else (_ for _ in ()).throw(AssertionError("wrong plan"))
+                )
+            ),
+            "write_private": (
+                lambda path, value, *, create_only=False: writes.append(
+                    (str(path), value, create_only)
+                )
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            with patch.object(Path, "exists", lambda _path: False):
+                observed = helper(SimpleNamespace(), plan)
+                globals_["write_private"] = (
+                    lambda *_arguments, **_keywords: (
+                        _ for _ in ()
+                    ).throw(FileExistsError("concurrent status winner"))
+                )
+                with self.assertRaises(FileExistsError):
+                    helper(SimpleNamespace(), plan)
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(observed, live)
+        self.assertEqual(
+            writes,
+            [(plan["status_artifact_path"], live, True)],
+        )
+
     def test_exact_drain_status_reuses_the_outer_installer_lock(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())

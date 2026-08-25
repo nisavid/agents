@@ -4227,6 +4227,82 @@ asyncio.run(exercise())
 
         asyncio.run(exercise())
 
+    def test_exact_drain_status_accepts_worker_transitions_bound_to_progress(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                selected = plan["selected_operations"]
+                completed, failed, released = selected[:3]
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'completed', worker_id = $1, "
+                    "claimed_at = NOW(), completed_at = NOW(), "
+                    "updated_at = NOW() WHERE operation_id = $2::uuid",
+                    worker_id,
+                    completed["operation_id"],
+                )
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'failed', worker_id = $1, "
+                    "claimed_at = NOW(), completed_at = NOW(), "
+                    "updated_at = NOW() WHERE operation_id = $2::uuid",
+                    worker_id,
+                    failed["operation_id"],
+                )
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'pending', worker_id = NULL, "
+                    "claimed_at = NULL, retry_count = retry_count + 1, "
+                    "updated_at = NOW() WHERE operation_id = $1::uuid",
+                    released["operation_id"],
+                )
+                tasks = [
+                    {
+                        "operation_id": item["operation_id"],
+                        "status": "pending",
+                        "stage": "pending",
+                        "row_digest": item["row_digest"],
+                    }
+                    for item in selected
+                ]
+                tasks[0].update(status="completed", stage="completed")
+                tasks[1].update(status="failed", stage="failed")
+                tasks[2]["stage"] = "released"
+                progress = {
+                    "plan_digest": plan["plan_digest"],
+                    "selected_status_counts": {
+                        "completed": 1,
+                        "failed": 1,
+                        "pending": len(selected) - 2,
+                    },
+                    "tasks": tasks,
+                }
+
+                status = await read_exact_drain_status(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    plan=plan,
+                    interrupted_progress=progress,
+                )
+
+                self.assertEqual(
+                    status["selected_status_counts"],
+                    {
+                        "pending": len(selected) - 2,
+                        "completed": 1,
+                        "failed": 1,
+                    },
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
     def test_exact_drain_claim_rejects_drift_on_a_preserved_row(self):
         async def exercise():
             connection = await self._connect()

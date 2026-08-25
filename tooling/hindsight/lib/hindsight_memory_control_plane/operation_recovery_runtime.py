@@ -7267,12 +7267,87 @@ class ExactDrainClaimAdapter:
         return chosen
 
 
+def _interrupted_progress_rows(
+    plan: Mapping[str, Any],
+    progress: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Bind an inactive worker's frozen progress to every selected row."""
+    selected_by_id = {
+        item["operation_id"]: item
+        for item in plan["selected_operations"]
+    }
+    selected_ids = set(selected_by_id)
+    tasks = progress.get("tasks")
+    observed_counts: dict[str, int] = {}
+    evidence: dict[str, dict[str, Any]] = {}
+    if (
+        plan.get("schema_version") not in {12, 13, 14, 15}
+        or progress.get("plan_digest") != plan.get("plan_digest")
+        or (
+            plan.get("schema_version") == 15
+            and (
+                progress.get("grant_id") != plan.get("grant_id")
+                or progress.get("grant_digest") != plan.get("grant_digest")
+            )
+        )
+        or not isinstance(tasks, list)
+        or not isinstance(progress.get("selected_status_counts"), Mapping)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery interrupted progress evidence differs"
+        )
+    for task in tasks:
+        if not isinstance(task, Mapping):
+            raise OperationRecoveryError(
+                "operation-recovery interrupted progress evidence differs"
+            )
+        operation_id = task.get("operation_id")
+        status = task.get("status")
+        row_digest = task.get("row_digest")
+        selected = selected_by_id.get(operation_id)
+        if (
+            operation_id not in selected_ids
+            or operation_id in evidence
+            or status
+            not in {"pending", "processing", "completed", "failed", "cancelled"}
+            or not isinstance(row_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", row_digest) is None
+            or selected is None
+            or row_digest != selected["row_digest"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery interrupted progress evidence differs"
+            )
+        evidence[operation_id] = {
+            "status": status,
+            "row_digest": row_digest,
+            "stage": task.get("stage"),
+        }
+        summary_status = (
+            "retrying"
+            if status == "pending" and task.get("stage") == "retrying"
+            else status
+        )
+        observed_counts[summary_status] = (
+            observed_counts.get(summary_status, 0) + 1
+        )
+    if (
+        set(evidence) != selected_ids
+        or observed_counts != dict(progress["selected_status_counts"])
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery interrupted progress evidence differs"
+        )
+    return evidence
+
+
 async def read_exact_drain_status(
     connection: Any,
     *,
     profile_id: str,
     schema: str,
     plan: Mapping[str, Any],
+    interrupted_progress: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Read stable, payload-free exact-drain and outside-queue evidence."""
     verified = verify_exact_drain_plan(plan, allow_expired=True)
@@ -7286,6 +7361,11 @@ async def read_exact_drain_status(
     selected = {
         item["operation_id"]: item for item in verified["selected_operations"]
     }
+    interrupted_rows = (
+        None
+        if interrupted_progress is None
+        else _interrupted_progress_rows(verified, interrupted_progress)
+    )
     selected_ids = list(selected)
     worker_digest = hashlib.sha256(
         exact_drain_worker_id(verified["plan_digest"]).encode("utf-8")
@@ -7347,15 +7427,33 @@ async def read_exact_drain_status(
             raise OperationRecoveryError(
                 "operation-recovery exact drain cohort row drifted"
             )
-        if (
-            operation_id in selected
-            and live_row_digest(row)
-            != snapshot_by_id[operation_id]["row_digest"]
-            and row["worker_id_digest"] != worker_digest
-        ):
-            raise OperationRecoveryError(
-                "operation-recovery exact drain selected row ownership drifted"
-            )
+        if operation_id in selected:
+            row_digest = live_row_digest(row)
+            if interrupted_rows is not None:
+                interrupted = interrupted_rows[operation_id]
+                if (
+                    row["status"] != interrupted["status"]
+                    or (
+                        row_digest
+                        != snapshot_by_id[operation_id]["row_digest"]
+                        and row["worker_id_digest"] != worker_digest
+                        and not (
+                            row["status"] == "pending"
+                            and row["worker_id_digest"] is None
+                            and interrupted["stage"] == "released"
+                        )
+                    )
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain selected row ownership drifted"
+                    )
+            elif (
+                row_digest != snapshot_by_id[operation_id]["row_digest"]
+                and row["worker_id_digest"] != worker_digest
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain selected row ownership drifted"
+                )
         if (
             operation_id not in selected
             and live_row_digest(row)

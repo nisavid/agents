@@ -142,6 +142,125 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_interrupted_progress_rows_bind_every_selected_row(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = fixtures.drain_plan(schema_version=12)
+        tasks = [
+            {
+                "operation_id": item["operation_id"],
+                "status": "pending",
+                "row_digest": item["row_digest"],
+            }
+            for item in plan["selected_operations"]
+        ]
+        tasks[0]["stage"] = "retrying"
+        progress = {
+            "plan_digest": plan["plan_digest"],
+            "selected_status_counts": {
+                "pending": plan["selected_operation_count"] - 1,
+                "retrying": 1,
+            },
+            "tasks": tasks,
+        }
+
+        evidence = operation_recovery_runtime._interrupted_progress_rows(
+            plan,
+            progress,
+        )
+
+        self.assertEqual(set(evidence), {
+            item["operation_id"] for item in plan["selected_operations"]
+        })
+        self.assertEqual(
+            evidence[tasks[0]["operation_id"]],
+            {
+                "status": "pending",
+                "row_digest": tasks[0]["row_digest"],
+                "stage": "retrying",
+            },
+        )
+
+    def test_interrupted_progress_rows_reject_stale_or_incomplete_evidence(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = fixtures.drain_plan(schema_version=12)
+        tasks = [
+            {
+                "operation_id": item["operation_id"],
+                "status": "pending",
+                "row_digest": item["row_digest"],
+            }
+            for item in plan["selected_operations"]
+        ]
+        progress = {
+            "plan_digest": plan["plan_digest"],
+            "selected_status_counts": {
+                "pending": plan["selected_operation_count"]
+            },
+            "tasks": tasks,
+        }
+
+        for changed in (
+            {**progress, "plan_digest": "0" * 64},
+            {**progress, "tasks": tasks[:-1]},
+            {
+                **progress,
+                "tasks": [
+                    {**tasks[0], "row_digest": "0" * 64},
+                    *tasks[1:],
+                ],
+            },
+            {
+                **progress,
+                "selected_status_counts": {
+                    "completed": plan["selected_operation_count"]
+                },
+            },
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "interrupted progress evidence differs",
+                ):
+                    operation_recovery_runtime._interrupted_progress_rows(
+                        plan,
+                        changed,
+                    )
+
+    def test_schema_15_interrupted_progress_rows_bind_the_grant(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        _reference, _grant, plan, _create_plan = (
+            fixtures.standing_grant_fixture()
+        )
+        tasks = [
+            {
+                "operation_id": item["operation_id"],
+                "status": "pending",
+                "stage": "pending",
+                "row_digest": item["row_digest"],
+            }
+            for item in plan["selected_operations"]
+        ]
+        progress = {
+            "plan_digest": plan["plan_digest"],
+            "grant_id": plan["grant_id"],
+            "grant_digest": plan["grant_digest"],
+            "selected_status_counts": {
+                "pending": plan["selected_operation_count"]
+            },
+            "tasks": tasks,
+        }
+
+        operation_recovery_runtime._interrupted_progress_rows(plan, progress)
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "interrupted progress evidence differs",
+        ):
+            operation_recovery_runtime._interrupted_progress_rows(
+                plan,
+                {**progress, "grant_digest": "0" * 64},
+            )
+
     def test_worker_failure_classifies_exact_drain_execution_lease_expiry(self):
         evidence = exact_drain_worker_failure_evidence(
             OperationRecoveryError(

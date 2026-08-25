@@ -9719,6 +9719,57 @@ async def _operation_recovery_read_exact_drain_status(
     plan: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     """Read exact-drain state while the caller holds the installer lock."""
+    interrupted_progress = None
+    application_path = Path(plan["application_receipt_path"])
+    progress_path = Path(plan["progress_artifact_path"])
+    if (
+        plan.get("schema_version") in {12, 13, 14, 15}
+        and application_path.exists()
+    ):
+        application_value = _operation_recovery_read_private_json(
+            application_path,
+            "exact drain application record",
+        )
+        if (
+            isinstance(application_value, Mapping)
+            and application_value.get("kind")
+            == "operation-recovery-exact-drain-application-journal"
+        ):
+            manager = (
+                _portable_manager(args)
+                if plan.get("schema_version") == 15
+                else None
+            )
+            authorization = _operation_recovery_exact_authorization(
+                plan,
+                manager=manager,
+                require_active_grant=False,
+            )
+            journal = _operation_recovery_exact_journal(
+                application_value,
+                plan=plan,
+                authorization=authorization,
+            )
+            if not _operation_recovery_exact_journal_worker_active(journal):
+                if not progress_path.exists():
+                    raise OperationRecoveryError(
+                        "exact drain interrupted progress is unavailable"
+                    )
+                interrupted_progress = _operation_recovery_read_monitor_progress(
+                    plan,
+                    freeze_ages_at_observed_at=True,
+                )
+                if any(
+                    interrupted_progress[key] != journal[key]
+                    for key in (
+                        "worker_pid",
+                        "worker_start_time",
+                        "worker_attempt",
+                    )
+                ):
+                    raise OperationRecoveryError(
+                        "exact drain interrupted progress identity differs"
+                    )
     connection = await _operation_recovery_connect_live(args)
     try:
         system_identifier_before = await connection.fetchval(
@@ -9734,6 +9785,7 @@ async def _operation_recovery_read_exact_drain_status(
             profile_id="systalyze",
             schema="public",
             plan=plan,
+            interrupted_progress=interrupted_progress,
         )
         system_identifier_after = await connection.fetchval(
             "SELECT system_identifier::text FROM pg_control_system()"
@@ -9750,9 +9802,43 @@ async def _operation_recovery_read_exact_drain_status(
             raise OperationRecoveryError(
                 "operation-recovery exact drain authority drifted"
             )
+        if interrupted_progress is not None:
+            current_progress = _operation_recovery_read_monitor_progress(
+                plan,
+                freeze_ages_at_observed_at=True,
+            )
+            if (
+                current_progress["progress_digest"]
+                != interrupted_progress["progress_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "exact drain interrupted progress changed while reading"
+                )
         return status_value
     finally:
         await connection.close()
+
+
+def _operation_recovery_post_abort_reference_status(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Read a missing inactive-reference status through the descendant."""
+    status_path = Path(plan["status_artifact_path"])
+    if status_path.exists():
+        return verify_exact_drain_status(
+            _operation_recovery_read_private_json(
+                status_path,
+                "reference exact drain terminal status",
+            ),
+            plan=plan,
+        )
+    status = asyncio.run(
+        _operation_recovery_read_exact_drain_status(args, plan)
+    )
+    verified = verify_exact_drain_status(status, plan=plan)
+    write_private(status_path, verified, create_only=True)
+    return verified
 
 
 def _operation_recovery_exact_receipt(
@@ -12191,12 +12277,9 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
         isinstance(reference_context, Mapping)
         and reference_context.get("schema_version") == 3
     ):
-        terminal_status = verify_exact_drain_status(
-            _operation_recovery_read_private_json(
-                reference["status_artifact_path"],
-                "reference exact drain terminal status",
-            ),
-            plan=reference,
+        terminal_status = _operation_recovery_post_abort_reference_status(
+            args,
+            reference,
         )
         terminal_application = (
             _operation_recovery_terminal_application_evidence(

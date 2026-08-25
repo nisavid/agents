@@ -9,6 +9,8 @@ Git and worktree provenance (Versionkeeping), pull-request lifecycles
 third-party component assessment, adoption, and maintenance (Artifact Customs).
 For Task Witness's package role, release eligibility, and authority limits, see
 the [package reference](plugins/task-witness/README.md).
+For the principles that govern the suite as one system, see
+[Plugin system design principles](docs/plugin-system/design-principles.md).
 
 ## Layout
 

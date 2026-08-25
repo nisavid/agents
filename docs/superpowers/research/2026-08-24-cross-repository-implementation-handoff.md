@@ -139,8 +139,8 @@ The authorized dotfiles read-only audit confirms that PR #165 is a legitimate
 mixed-scope accepted baseline. Its contract/schema/admission portion is the
 #154 baseline; its prepared-capture authority work is already landed groundwork
 for the separately owned #115 lane. The accepted history should be retained,
-not rewritten or reverted, and no #113, #114, #116, release, or migration
-acceptance should be inferred from it.
+not rewritten or reverted, and no #113, #114, #115, #116, release, or
+migration acceptance should be inferred from it.
 
 The audit also confirms that PR #166 stays within #155: it is a test-only physical-target matrix change, review-approved with no unresolved review threads, and does not claim production PlanActionSet projection. Its current merge state is blocked by the repository's missing required `Owner-signed age admission` context. That is a merge-gate fact, not a security or admission verdict; interpretation and resolution remain deferred to a Daybreak-capable thread. The uncommitted fixture edit in the separate target-matrix worktree is preserved and is not part of PR #166.
 
@@ -161,8 +161,10 @@ findings and the App credential/bootstrap deployment are owner-gated under
 separate Daybreak lane.
 
 This refresh does not change the authority boundary: #170 still owns #166's
-exact-head requalification, and no receipt, branch-protection edit, release,
-or host mutation is authorized by this handoff.
+exact-head requalification for the still-open #155 lane. Once that is done,
+the downstream graph resumes at #113, then #114 (with #111's decision gate),
+#115, and #116; #154 is already closed. No receipt, branch-protection edit,
+release, or host mutation is authorized by this handoff.
 
 ## Explicit non-authority and stop conditions
 

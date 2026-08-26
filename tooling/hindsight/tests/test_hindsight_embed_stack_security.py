@@ -353,6 +353,40 @@ class StackCredentialBindingTest(unittest.TestCase):
                     result.stderr,
                 )
 
+    def test_profile_preflight_rejects_an_unapproved_api_version(self):
+        self.profile.write_text(
+            "HINDSIGHT_EMBED_API_VERSION=0.9.1\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_stack(
+            "hindsight_stack_load_config; "
+            "hindsight_stack_preflight_runtime_credentials"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "must use the managed Hindsight API version",
+            result.stderr,
+        )
+
+    def test_profile_preflight_accepts_the_effective_managed_api_version(self):
+        for value in (None, "", "0.9.2"):
+            with self.subTest(value=value):
+                content = (
+                    "# no profile override\n"
+                    if value is None
+                    else f"HINDSIGHT_EMBED_API_VERSION={value}\n"
+                )
+                self.profile.write_text(content, encoding="utf-8")
+
+                result = self.run_stack(
+                    "hindsight_stack_load_config; "
+                    "hindsight_stack_preflight_runtime_credentials"
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_harness_reconciliation_bindings_are_all_or_nothing(self):
         for variable in (
             "HINDSIGHT_MEMORY_HARNESS_RECONCILER",

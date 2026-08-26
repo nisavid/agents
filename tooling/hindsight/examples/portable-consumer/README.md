@@ -32,9 +32,14 @@ Before use:
 
 Set every `HINDSIGHT_EMBED_UVX` binding to
 `release://bin/hindsight-embed-uvx`. The release-owned wrapper keeps managed
-stack commands on exactly `hindsight-embed==0.8.4`; upgrading the Hindsight
-server remains an explicit, separately validated release decision. The
-top-level `uvx_executable` selects the protected absolute `uvx` runtime; the
+stack commands on exactly `hindsight-embed==0.8.4`, defaults and allowlists the
+nested API runtime to `hindsight-api==0.9.2`, and leaves the UI runtime at
+`0.8.4`; upgrading any component remains an explicit, separately validated
+release decision. An installation environment may bind
+`HINDSIGHT_EMBED_API_VERSION` only to `0.9.2`. A managed profile must omit that
+key or bind the same value because upstream profile configuration takes
+precedence, and the existing daemon must be stopped before changing versions.
+The top-level `uvx_executable` selects the protected absolute `uvx` runtime; the
 installer validates it and the managed launcher injects it without consulting
 ambient `PATH`. The top-level `npx_executable` selects the protected UI package
 runner. The launcher supplies both exact executable bindings to the

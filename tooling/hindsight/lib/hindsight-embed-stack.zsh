@@ -1303,7 +1303,7 @@ hindsight_stack_validate_profile_credential_isolation() {
   local path="$HOME/.hindsight/profiles/${profile}.env"
   [[ -f "$path" && -r "$path" ]] || return 1
 
-  local line key
+  local line key value
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line##[[:space:]]#}"
     [[ -n "$line" && "$line" != \#* ]] || continue
@@ -1314,7 +1314,16 @@ hindsight_stack_validate_profile_credential_isolation() {
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
     key="${key%%[[:space:]]#}"
+    value="${line#*=}"
+    value="${value##[[:space:]]#}"
+    value="${value%%[[:space:]]#}"
     case "$key" in
+      HINDSIGHT_EMBED_API_VERSION)
+        [[ -z "$value" || "$value" == 0.9.2 ]] || {
+          print -ru2 -- "hindsight-embed-stack: profile '${profile}' must use the managed Hindsight API version"
+          return 1
+        }
+        ;;
       HINDSIGHT_MEMORY_INVENTORY|\
       HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE|\
       HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV|\

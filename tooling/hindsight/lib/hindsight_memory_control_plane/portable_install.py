@@ -66,6 +66,7 @@ SYSTEMD_STOP_TIMEOUT_SECONDS = 330
 LAUNCHD_EXIT_TIMEOUT_SECONDS = 330
 LAUNCHD_SERVICE_START_TIMEOUT_SECONDS = 10.0
 LAUNCHD_SERVICE_START_POLL_SECONDS = 0.1
+MANAGED_HINDSIGHT_API_VERSION = "0.9.2"
 RESOLVER_ENVIRONMENT_BINDINGS = frozenset(
     {
         "HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV",
@@ -338,6 +339,14 @@ def _environment(value: Any, label: str) -> tuple[tuple[str, str], ...]:
                 f"{label} PATH must contain only protected system directories"
             )
         text = _text(raw, f"{label} value", maximum=8192)
+        if (
+            name == "HINDSIGHT_EMBED_API_VERSION"
+            and text != MANAGED_HINDSIGHT_API_VERSION
+        ):
+            raise PortableInstallError(
+                f"{label} HINDSIGHT_EMBED_API_VERSION must equal "
+                f"{MANAGED_HINDSIGHT_API_VERSION}"
+            )
         secret_named = SECRET_NAME.search(name) is not None
         protected_marker = (
             name in NON_SECRET_POLICY_MARKER_ENVIRONMENTS
@@ -878,6 +887,33 @@ def _snapshot_regular_file(path: Path, label: str) -> bytes:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _managed_profile_api_version(path: Path, label: str) -> str | None:
+    """Read the profile override using hindsight-embed's effective precedence."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PortableInstallError(f"{label} is unavailable") from error
+    try:
+        text = _snapshot_regular_file(path, label).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise PortableInstallError(f"{label} is not valid UTF-8") from error
+    version: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "HINDSIGHT_EMBED_API_VERSION":
+            version = value.strip()
+    return version
 
 
 def _regular_file(
@@ -2520,6 +2556,30 @@ class PortableInstallationManager:
                 "systemd-user service_root is not searched by the user manager"
             )
 
+    def _preflight_managed_profile_api_versions(self) -> None:
+        binding = self._component_desired_state_binding()
+        if binding is None:
+            return
+        _root, profiles, _daemon_state, _ui_state = binding
+        try:
+            account = pwd.getpwuid(os.geteuid())
+        except KeyError as error:
+            raise PortableInstallError(
+                "managed account identity is unavailable"
+            ) from error
+        home = Path(account.pw_dir)
+        if not home.is_absolute() or ".." in home.parts:
+            raise PortableInstallError("managed account home is invalid")
+        for profile in profiles:
+            version = _managed_profile_api_version(
+                home / ".hindsight" / "profiles" / f"{profile}.env",
+                f"managed profile {profile}",
+            )
+            if version not in {None, "", MANAGED_HINDSIGHT_API_VERSION}:
+                raise PortableInstallError(
+                    "managed profile API version differs"
+                )
+
     def _disable_harness_authority_for_rollback(self) -> None:
         bindings: set[tuple[str, str]] = set()
         surfaces = (
@@ -3647,6 +3707,7 @@ class PortableInstallationManager:
         *,
         retry_bootstrap_after_stop: bool = False,
     ) -> None:
+        self._preflight_managed_profile_api_versions()
         if self.config.platform == "launchd":
             domain = f"gui/{os.getuid()}"
             self._preflight_service_manager(absent_ok=True)
@@ -3714,6 +3775,7 @@ class PortableInstallationManager:
                 )
 
     def _start_services_idempotently(self) -> None:
+        self._preflight_managed_profile_api_versions()
         self._preflight_service_manager(absent_ok=True)
         if self.config.platform == "launchd":
             domain = f"gui/{os.getuid()}"
@@ -4651,6 +4713,7 @@ class PortableInstallationManager:
         expected_current_binding_generation_digest: str | None = None,
         verified_rebind_plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._preflight_managed_profile_api_versions()
         self._validate_external_bindings()
         with self._lock():
             self._recover_pending_locked()
@@ -6678,6 +6741,7 @@ class PortableInstallationManager:
 
     def verify(self) -> dict[str, Any]:
         self._preflight_lifecycle()
+        self._preflight_managed_profile_api_versions()
         self._validate_config_source()
         with self._lock():
             self._recover_pending_locked()
@@ -6755,6 +6819,7 @@ class PortableInstallationManager:
                 raise PortableInstallError("installation is absent")
             verification = self._verify_locked(state)
             installed = self._installed_manager(state)
+            installed._preflight_managed_profile_api_versions()
             prior = installed._service_manager_prestate()
             component_preimage = installed._reset_component_desired_state()
             try:

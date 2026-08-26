@@ -107,6 +107,71 @@ class HindsightEmbedUvxTest(unittest.TestCase):
             self.assertEqual(result.returncode, 69)
             self.assertIn("HINDSIGHT_EMBED_UVX_EXECUTABLE", result.stderr)
 
+    def test_wrapper_preserves_the_approved_explicit_api_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "api-version.txt"
+            fake_uvx = root / "uvx"
+            fake_npx = root / "npx"
+            fake_uvx.write_text(
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$HINDSIGHT_EMBED_API_VERSION" >"$CAPTURE"\n',
+                encoding="utf-8",
+            )
+            fake_uvx.chmod(0o700)
+            fake_npx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_npx.chmod(0o700)
+
+            result = subprocess.run(
+                [str(WRAPPER), "hindsight-embed", "daemon", "status"],
+                check=False,
+                capture_output=True,
+                env={
+                    "CAPTURE": str(capture),
+                    "HINDSIGHT_EMBED_API_VERSION": "0.9.2",
+                    "HINDSIGHT_EMBED_NPX_EXECUTABLE": str(fake_npx),
+                    "HINDSIGHT_EMBED_UVX_EXECUTABLE": str(fake_uvx),
+                    "PATH": "/usr/bin:/bin",
+                },
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(capture.read_text(encoding="utf-8"), "0.9.2\n")
+
+    def test_wrapper_rejects_an_unapproved_explicit_api_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "uvx-ran"
+            fake_uvx = root / "uvx"
+            fake_npx = root / "npx"
+            fake_uvx.write_text(
+                "#!/bin/sh\n"
+                'touch "$CAPTURE"\n',
+                encoding="utf-8",
+            )
+            fake_uvx.chmod(0o700)
+            fake_npx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_npx.chmod(0o700)
+
+            result = subprocess.run(
+                [str(WRAPPER), "hindsight-embed", "daemon", "status"],
+                check=False,
+                capture_output=True,
+                env={
+                    "CAPTURE": str(capture),
+                    "HINDSIGHT_EMBED_API_VERSION": "0.9.1",
+                    "HINDSIGHT_EMBED_NPX_EXECUTABLE": str(fake_npx),
+                    "HINDSIGHT_EMBED_UVX_EXECUTABLE": str(fake_uvx),
+                    "PATH": "/usr/bin:/bin",
+                },
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("unsupported Hindsight API version", result.stderr)
+            self.assertFalse(capture.exists())
+
     def test_wrapper_rejects_a_colon_in_the_configured_uvx_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             unsafe = Path(temporary) / "unsafe:path"

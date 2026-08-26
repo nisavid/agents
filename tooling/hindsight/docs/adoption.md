@@ -43,7 +43,7 @@ managed_python="$("$uv_executable" python find --managed-python --resolve-links 
 embed_python="$("$uv_executable" tool dir)/hindsight-embed/bin/python3"
 "$managed_python" -I -c 'import sys; assert sys.version_info >= (3, 11)'
 "$embed_python" -I -c 'import hindsight_embed'
-"$uvx_executable" 'hindsight-api@0.8.4' --help >/dev/null
+"$uvx_executable" 'hindsight-api@0.9.2' --help >/dev/null
 ```
 
 Wait for the Command Line Tools installer to finish before running the remaining
@@ -270,7 +270,7 @@ embed_python="$(uv tool dir)/hindsight-embed/bin/python3"
 uvx_executable=/usr/bin/uvx
 "$managed_python" -I -c 'import sys; assert sys.version_info >= (3, 11)'
 "$embed_python" -I -c 'import hindsight_embed'
-"$uvx_executable" 'hindsight-api@0.8.4' --help >/dev/null
+"$uvx_executable" 'hindsight-api@0.9.2' --help >/dev/null
 npx_executable=/usr/bin/npx
 "$npx_executable" -y '@vectorize-io/hindsight-control-plane@0.8.4' --help >/dev/null
 ```
@@ -280,9 +280,14 @@ linger with `loginctl enable-linger "$USER"` only when services must remain
 available after logout. A container PID 1 or a root system manager is not a
 substitute for the account's user manager.
 
-Keep the staged Embed, API, and UI versions aligned at `0.8.4`. Changing any of
-these versions is a separate server or integration upgrade and requires an
-explicit plan.
+Keep the staged Embed and UI versions at `0.8.4` and the API version at `0.9.2`.
+This intentional split is the managed compatibility contract: the release-owned
+wrapper defaults and allowlists the nested API runtime to `0.9.2`. A profile
+`.env` value has higher precedence inside `hindsight-embed`, so a managed
+profile must omit `HINDSIGHT_EMBED_API_VERSION` or bind it to exactly `0.9.2`.
+Stop the existing daemon before changing the API version. Changing any of these
+versions is a separate server or integration upgrade and requires an explicit
+plan.
 
 After installing and configuring the consumer, run the native gated lifecycle
 test on the target host. It creates isolated manifests and data, exercises the
@@ -340,14 +345,18 @@ The installer validates a closed JSON schema. Use paths such as
 `bin/hindsight-memory`, never absolute paths or `release://` values, for
 release-owned entrypoints. Use `release://bin/hindsight-embed-uvx` for the
 `HINDSIGHT_EMBED_UVX` environment binding; that protected wrapper always runs
-`hindsight-embed==0.8.4`. The managed launcher supplies both validated runtime
-bindings: `HINDSIGHT_EMBED_UVX_EXECUTABLE` for the pinned server package runner
-and `HINDSIGHT_EMBED_NPX_EXECUTABLE` for the UI's Node package runner. The
+`hindsight-embed==0.8.4` and defaults and allowlists its nested API runtime to
+`hindsight-api==0.9.2`. The managed launcher supplies both validated runtime
+bindings: `HINDSIGHT_EMBED_UVX_EXECUTABLE` for the pinned package runner and
+`HINDSIGHT_EMBED_NPX_EXECUTABLE` for the `0.8.4` UI's Node package runner. The
 wrapper reconstructs a closed child `PATH` from those two executable
-directories and protected system directories. `release://` environment values
-resolve only inside the verified active release. The credential resolver must
-match its declared SHA-256 digest and implement the request and response
-protocol in the portable consumer example.
+directories and protected system directories. An installation environment may
+bind `HINDSIGHT_EMBED_API_VERSION` explicitly only to `0.9.2`; reject a managed
+profile whose `.env` binds another value, because upstream profile configuration
+has higher precedence. `release://` environment values resolve only inside the
+verified active release. The credential resolver must match its declared
+SHA-256 digest and implement the request and response protocol in the portable
+consumer example.
 
 The installer queries the systemd user manager for its `XDG_CONFIG_HOME` and
 requires `service_root` to match that manager-visible unit directory before any

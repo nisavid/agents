@@ -159,7 +159,12 @@ Services, timers, and health checks name `bin/...` release-relative
 entrypoints. A `release://` environment value resolves within the
 digest-verified active release. The example stack binds
 `HINDSIGHT_EMBED_UVX=release://bin/hindsight-embed-uvx`; this release-owned
-wrapper pins managed server commands to `hindsight-embed==0.8.4`.
+wrapper pins managed server commands to `hindsight-embed==0.8.4`, defaults and
+allowlists the nested API runtime to `hindsight-api==0.9.2`, and leaves the UI
+runtime at `0.8.4`. A managed profile must not bind
+`HINDSIGHT_EMBED_API_VERSION` to another value; upstream profile configuration
+has higher precedence than the wrapper environment. Stop the existing daemon
+before applying an API-version change.
 The installer requires a working Python 3.11 or newer and validates the
 configured absolute Python, `npx`, `uvx`, and Zsh executables' ownership, mode,
 ancestry, and ACLs. The managed launcher binds those exact paths to release

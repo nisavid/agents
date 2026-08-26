@@ -648,6 +648,59 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 "running\n",
             )
 
+    def test_service_start_rejects_profile_api_version_drift_before_mutation(
+        self,
+    ) -> None:
+        data = self.config_data()
+        stack_state = self.state_root / "embed"
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(stack_state),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "work",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True), encoding="utf-8"
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        home = self.root / "home"
+        profile = home / ".hindsight" / "profiles" / "work.env"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "HINDSIGHT_EMBED_API_VERSION=0.9.2\n",
+            encoding="utf-8",
+        )
+        account = mock.Mock(pw_dir=str(home))
+
+        with mock.patch(
+            "hindsight_memory_control_plane.portable_install.pwd.getpwuid",
+            return_value=account,
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+            manager.stop_services()
+            self.runner.calls.clear()
+            profile.write_text(
+                "HINDSIGHT_EMBED_API_VERSION=0.9.1\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                PortableInstallError,
+                "managed profile API version differs",
+            ):
+                manager.start_services()
+
+        self.assertEqual(self.runner.calls, [])
+        self.assertFalse(
+            any((stack_state / "desired").glob("profiles/work/*"))
+        )
+
     def test_failed_service_start_restores_the_intentional_stop(self) -> None:
         manager = self.manager(health_runner=lambda _check, _release: True)
         manager.install(self.release("1.0.0"), version="1.0.0")
@@ -5646,6 +5699,100 @@ class PortableInstallationManagerTest(unittest.TestCase):
             PortableInstallError, "health_checks must be a non-empty list"
         ):
             InstallationConfig.load(data, source_path=self.config_path)
+
+    def test_config_accepts_the_approved_hindsight_api_version(self) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"]["HINDSIGHT_EMBED_API_VERSION"] = (
+            "0.9.2"
+        )
+
+        config = InstallationConfig.load(data, source_path=self.config_path)
+
+        self.assertEqual(
+            dict(config.services[0].environment)["HINDSIGHT_EMBED_API_VERSION"],
+            "0.9.2",
+        )
+
+    def test_config_rejects_an_unapproved_hindsight_api_version(self) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"]["HINDSIGHT_EMBED_API_VERSION"] = (
+            "0.9.1"
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "HINDSIGHT_EMBED_API_VERSION must equal 0.9.2",
+        ):
+            InstallationConfig.load(data, source_path=self.config_path)
+
+    def test_install_rejects_a_profile_api_version_override_before_mutation(
+        self,
+    ) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_root / "embed"),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True), encoding="utf-8"
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+        )
+        home = self.root / "home"
+        profile = home / ".hindsight" / "profiles" / "core.env"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "HINDSIGHT_EMBED_API_VERSION=0.9.1\n",
+            encoding="utf-8",
+        )
+        account = mock.Mock(pw_dir=str(home))
+
+        with (
+            mock.patch(
+                "hindsight_memory_control_plane.portable_install.pwd.getpwuid",
+                return_value=account,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError,
+                "managed profile API version differs",
+            ),
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertFalse(self.install_root.exists())
+        self.assertEqual(self.runner.calls, [])
+
+    def test_profile_api_version_preflight_accepts_an_absent_override(
+        self,
+    ) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_root / "embed"),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+        )
+        home = self.root / "home"
+        home.mkdir()
+        account = mock.Mock(pw_dir=str(home))
+
+        with mock.patch(
+            "hindsight_memory_control_plane.portable_install.pwd.getpwuid",
+            return_value=account,
+        ):
+            manager._preflight_managed_profile_api_versions()
 
     def test_service_launcher_rejects_duplicate_and_oversized_resolver_output(
         self,

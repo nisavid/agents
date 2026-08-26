@@ -12208,6 +12208,76 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             application=application,
         )
 
+    def test_age_encrypt_preimage_requires_exact_native_age_header(self):
+        encrypt = self.controller["_age_encrypt_preimage"]
+        globals_ = encrypt.__globals__
+        subprocess_calls = []
+
+        def run_private_subprocess(*arguments, **_keywords):
+            subprocess_calls.append(arguments[0])
+            return SimpleNamespace(
+                stdout=b"age-encryption.org/v2\nciphertext"
+            )
+
+        replacements = {
+            "_operation_recovery_validate_recipient": (
+                lambda _value, _label: None
+            ),
+            "_operation_recovery_preimage_bytes": (
+                lambda *_arguments, **_keywords: b"{}"
+            ),
+            "_private_identity_descriptor": (
+                lambda _path: os.open(os.devnull, os.O_RDONLY)
+            ),
+            "_stage_operation_recovery_tools": (
+                lambda _tools: (
+                    object(),
+                    {
+                        "age": SimpleNamespace(
+                            path=Path("/private/tmp/pinned-age")
+                        )
+                    },
+                )
+            ),
+            "_run_private_subprocess": run_private_subprocess,
+            "_remove_operation_recovery_tools": lambda _root: None,
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            with tempfile.TemporaryDirectory(
+                dir="/private/tmp",
+                prefix="hindsight-age-header-",
+            ) as directory:
+                identity_path = Path(directory) / "identity.txt"
+                identity_path.write_text("test-only", encoding="utf-8")
+                identity_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    Exception,
+                    "rollback bundle encryption failed",
+                ):
+                    encrypt(
+                        age_path=Path("/private/tmp/age"),
+                        age_identity_path=identity_path,
+                        recipient="age1test",
+                        preimage=[],
+                        plan_digest="a" * 64,
+                    )
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(
+            subprocess_calls,
+            [
+                (
+                    "/private/tmp/pinned-age",
+                    "--encrypt",
+                    "--recipient",
+                    "age1test",
+                )
+            ],
+        )
+
     def test_toolchain_rejects_a_caller_selected_executable(self):
         resolver = self.controller["_operation_recovery_tool"]
         with self.assertRaisesRegex(Exception, "path differs"):

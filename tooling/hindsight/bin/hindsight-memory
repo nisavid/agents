@@ -14204,7 +14204,7 @@ def _age_encrypt_preimage(
         )
         if (
             not result.stdout
-            or not result.stdout.startswith(b"age-encryption.org/")
+            or result.stdout[: len(AGE_HEADER)] != AGE_HEADER
         ):
             raise OperationRecoveryError("rollback bundle encryption failed")
         ciphertext = result.stdout

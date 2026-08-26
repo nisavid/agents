@@ -409,6 +409,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 if index in evolved_completed_positions:
                     row["updated_at"] = "2026-07-29T13:00:02Z"
                     row["retry_count"] += 1
+                    row["result_metadata_digest"] = f"{index + 1000:064x}"
             elif index in failed_positions:
                 row["status"] = "failed"
                 row["completed_at"] = "2026-07-29T13:00:03Z"
@@ -419,14 +420,17 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 row["claimed_at"] = "2026-07-29T12:59:00.000000Z"
                 row["error_category"] = "provider_transport"
                 row["error_digest"] = f"{index + 900:064x}"
+                row["result_metadata_digest"] = f"{index + 1100:064x}"
             elif index in retry_pending_positions:
                 row["updated_at"] = "2026-07-29T12:59:00.000000Z"
                 row["retry_count"] = retry_pending_positions[index]
                 row["next_retry_at"] = "2026-07-29T12:59:30.000000Z"
                 row["error_category"] = "unknown"
                 row["error_digest"] = f"{index + 950:064x}"
+                row["result_metadata_digest"] = f"{index + 1200:064x}"
             elif index in quiescent_pending_positions:
                 row["updated_at"] = "2026-07-29T12:59:00.000000Z"
+                row["result_metadata_digest"] = f"{index + 1300:064x}"
         return dict(
             create_live_snapshot(
                 self.cohort(),

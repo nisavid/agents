@@ -4109,8 +4109,6 @@ def _exact_drain_recovery_context(
             is baseline["task_payload_present"]
             and item["task_payload_digest"]
             == baseline["task_payload_digest"]
-            and item["result_metadata_digest"]
-            == baseline["result_metadata_digest"]
             and item["error_category"] in FAILURE_CAUSE_FAMILIES
             and item["error_digest"] is not None
             and retry_at is not None
@@ -4136,8 +4134,6 @@ def _exact_drain_recovery_context(
             is baseline["task_payload_present"]
             and item["task_payload_digest"]
             == baseline["task_payload_digest"]
-            and item["result_metadata_digest"]
-            == baseline["result_metadata_digest"]
             and item["next_retry_at"] is None
             and item["error_category"] == "none"
             and item["error_digest"] is None
@@ -4173,8 +4169,6 @@ def _exact_drain_recovery_context(
             is not baseline["task_payload_present"]
             or item["task_payload_digest"]
             != baseline["task_payload_digest"]
-            or item["result_metadata_digest"]
-            != baseline["result_metadata_digest"]
         ):
             return False
         retry_at = _post_abort_timestamp(item["next_retry_at"])
@@ -4212,8 +4206,6 @@ def _exact_drain_recovery_context(
             is baseline["task_payload_present"]
             and item["task_payload_digest"]
             == baseline["task_payload_digest"]
-            and item["result_metadata_digest"]
-            == baseline["result_metadata_digest"]
             and item["error_category"] in FAILURE_CAUSE_FAMILIES
             and item["error_digest"] is not None
         )

@@ -1069,17 +1069,57 @@
   "non_disposition_release_gaps": [
     {
       "id": "thermos-behavior-partition-and-ablation",
-      "owner_id": "tricritical-source-reconciliation",
+      "owner_id": "issue-56",
+      "release_phase": "v1",
+      "gating": true,
       "remaining_evidence": [
         "bind the refreshed Thermos source revision and license evidence",
         "partition material behaviors into migrated, retained-external, or dropped-with-reason outcomes",
         "compare and ablate disputed behaviors on supported frontier models and harnesses"
       ],
-      "note": "If issue 56 remains the tracker, reframe it around behavior-level evidence. A one-to-one clause or rule map is not the desired strategy."
+      "note": "Issue 56 owns this behavior-level evidence and explicitly rejects one-to-one clause, rule, phrase, or document preservation."
+    },
+    {
+      "id": "lineage-artifact-refresh-and-ci-closure",
+      "owner_id": "coordinated-release-contract-issue-45",
+      "release_phase": "v1",
+      "gating": true,
+      "remaining_evidence": [
+        "after candidate bytes settle, refresh the Rolecasting and Versionkeeping candidate identity artifacts that currently drift from their lineage manifest records",
+        "rerun the source-lineage validator over the final candidate",
+        "make disposition CI exercise the lineage validator instead of allowing the two evidence systems to drift independently"
+      ],
+      "note": "Do not refresh pins early; a later accepted plugin change would invalidate them again."
+    },
+    {
+      "id": "supported-client-smoke-qualification",
+      "owner_id": "coordinated-release-qualification",
+      "release_phase": "v1",
+      "gating": true,
+      "remaining_evidence": [
+        "run the thorough local capability smoke suite on the supported ChatGPT Codex, Codex, Claude Desktop, Claude Code, Cursor, and Cursor Agent routes on Mac and Hatchery",
+        "record unsupported combinations explicitly, including Claude Desktop on Hatchery",
+        "bind every receipt to the tested candidate, route, capability, host, client, and inference account class"
+      ],
+      "note": "Deterministic checks and local probes do not substitute for the requested live capability smoke paths."
+    },
+    {
+      "id": "post-v1-hosted-qualification-research",
+      "owner_id": "issue-59",
+      "release_phase": "post-v1",
+      "gating": false,
+      "remaining_evidence": [
+        "after the public v1 local qualification and release, design the hosted route and capability matrix",
+        "separate deterministic fixtures, local probes, and live inference claims",
+        "define bounded metadata-only CI evidence, inference authority, adapters, cancellation, cost, retry, and nondeterminism policies"
+      ],
+      "note": "This preserves the T3-derived research as a post-v1 owner; it is not a first-release gate."
     },
     {
       "id": "task-witness-runtime-qualification-and-promotion",
       "owner_id": "task-witness-release-lane",
+      "release_phase": "v1",
+      "gating": true,
       "remaining_evidence": [
         "producer and issuer reachability",
         "two native-host receipts",
@@ -1091,6 +1131,8 @@
     {
       "id": "versionkeeping-conflict-route-coverage",
       "owner_id": "versionkeeping",
+      "release_phase": "v1",
+      "gating": true,
       "remaining_evidence": ["add resolving-merge-conflicts to the shared behavior and routing coverage inventories"],
       "note": "This is a qualification gap, not a new behavior owner."
     }

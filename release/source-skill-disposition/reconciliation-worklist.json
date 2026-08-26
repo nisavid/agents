@@ -1,0 +1,1105 @@
+{
+  "schema_version": 1,
+  "contract": "coordinated-plugin-v1-reconciliation-worklist-v1",
+  "status": "draft-awaiting-final-rescout-and-source-partitions",
+  "authority": {
+    "candidate_mutation": "not-authorized-by-this-worklist",
+    "host_mutation": "not-authorized",
+    "managed_source_mutation": "not-authorized",
+    "release_eligibility": "not-asserted",
+    "route_retirement": "not-authorized"
+  },
+  "basis": {
+    "repository_base_commit_sha1": "3e8787ef8cb70db659125133c03027c703ed8233",
+    "design_principles_path": "docs/plugin-system/design-principles.md",
+    "historical_contribution_ledger_path": "release/source-skill-lineage/contribution-ledger.json",
+    "historical_disposition_ledger_path": "release/source-skill-disposition/disposition-ledger.json",
+    "historical_source_manifest_path": "release/source-skill-lineage/source-manifest.json",
+    "installed_library_rescout": "pending-accepted-two-host-capture"
+  },
+  "terminal_outcomes": [
+    "retain-as-is",
+    "migrate-to-named-owner",
+    "drop-with-reason"
+  ],
+  "source_reference_contract": {
+    "canonical": "An unprefixed source reference names a record in release/source-skill-lineage/source-manifest.json.",
+    "component": "A component:<id> reference names a public component whose source identity must be bound separately from its aggregate or private overlay.",
+    "observed": "An observed:<id> or observed-route:<id> reference is provisional installed-library evidence. It must be replaced or augmented with an accepted source and discovery binding before a terminal disposition is promoted.",
+    "source_and_route_are_independent": "Retaining immutable source evidence does not retain a live route; retiring a live route does not authorize deleting, editing, or forking its upstream source."
+  },
+  "promotion_requirements": {
+    "source_identity": "Every provisional source reference has an accepted immutable revision and content identity.",
+    "license_and_attribution": "Every imported behavior has per-source revision, license, attribution requirement, and destination NOTICE or non-derivative evidence.",
+    "behavior_partition": "Every retiring route has an accepted exhaustive partition of its material source behaviors into migrated, retained-external, or dropped-with-reason outcomes.",
+    "route_identity": "Every live route is bound by source or provider, route id, discovery precedence, and supported client.",
+    "qualification": "Every required replacement owner and capability is qualified before install-before-remove retirement begins."
+  },
+  "coverage": {
+    "historical_sources": "screened",
+    "known_changed_personal_routes": "provisionally-screened",
+    "current_macos_library": "pending-final-rescout",
+    "current_hatchery_library": "pending-final-rescout",
+    "per_source_contribution_maps": "pending-for-composite-candidates",
+    "completeness_claim": "not-asserted"
+  },
+  "source_artifacts": [
+    {
+      "id": "canonical-lineage-records",
+      "source_refs": [
+        "cursor-thermos",
+        "firecrawl-cli",
+        "firecrawl-skill-set",
+        "firecrawl-workflows",
+        "heredotnow-here-now",
+        "heygen-hyperframes",
+        "ivan-artifact-customs",
+        "ivan-mergecraft",
+        "ivan-rolecasting",
+        "ivan-task-witness",
+        "ivan-tricritical",
+        "ivan-versionkeeping",
+        "matt-pocock-skill-set",
+        "obra-elements-of-style",
+        "openai-github-specialists",
+        "review-atlas-private",
+        "superpowers-skill-set",
+        "vectorize-hindsight",
+        "vercel-labs-skill-set",
+        "withgraphite-agent-skills",
+        "yeet"
+      ],
+      "retention_required": true,
+      "source_evidence_policy": "Retain the manifest records, immutable comparison identities, revisions, and license evidence. Coordinated packages remain canonical candidate sources; managed and upstream records remain immutable evidence even when a live route is later retired.",
+      "identity_state": "historical-bindings-require-last-responsible-moment-refresh",
+      "operator_review": "pending"
+    },
+    {
+      "id": "provisional-external-and-personal-source-bindings",
+      "source_refs": [
+        "observed:anthropic-code-review",
+        "observed:current-personal-mergecraft-source",
+        "observed:current-personal-rolecasting-source",
+        "observed:current-personal-versionkeeping-source",
+        "observed:keystone-plugin",
+        "component:matt-pocock-skill-set/resolving-merge-conflicts",
+        "component:review-atlas-public-core"
+      ],
+      "retention_required": true,
+      "source_evidence_policy": "Bind exact immutable upstream or personal-source identities, revisions, licenses, attribution requirements, and destination NOTICE or non-derivative evidence before using these references as import authority. Keep Review Atlas public-core provenance separate from the opaque private overlay. Preserve personal comparison identities even if their installed projections are later removed.",
+      "identity_state": "requires-accepted-final-rescout-and-source-refresh",
+      "operator_review": "pending"
+    }
+  ],
+  "candidate_distribution_routes": {
+    "source_refs": [
+      "ivan-artifact-customs",
+      "ivan-mergecraft",
+      "ivan-rolecasting",
+      "ivan-task-witness",
+      "ivan-tricritical",
+      "ivan-versionkeeping"
+    ],
+    "route_ids_from": "release/source-skill-lineage/source-manifest.json#sources[*].skill_ids",
+    "state": "release-candidate-output-not-installed-library-input",
+    "note": "These are the destinations being prepared for release, not source candidates for inclusion into themselves. Their source, qualification, installation, and adoption gates are tracked separately."
+  },
+  "behavior_candidates": [
+    {
+      "id": "artifact-customs-owner-issued-route-evidence",
+      "source_refs": ["observed-route:extending-managed-skills"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "artifact-customs",
+      "behavior": "Treat cache, projection, lock, or byte-equal-copy presence as insufficient proof of active discovery or ownership; consume evidence issued by the route owner.",
+      "implementation_state": "gap",
+      "evidence_paths": ["plugins/artifact-customs/references/component-clearance-contract.md"],
+      "source_evidence_state": "pending-accepted-final-rescout-binding",
+      "remaining_evidence": [
+        "one narrow contract rule and behavior evaluation",
+        "proof that host inventory and installation authority remain downstream"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "global-pre-change-failure-provenance",
+      "source_refs": ["superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "global-agent-instructions",
+      "behavior": "Require a failing pre-change observation to be tied to the intended behavior before implementation claims a red-green result.",
+      "implementation_state": "pending-external-owner-proof",
+      "evidence_paths": ["docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"],
+      "remaining_evidence": ["global-policy and behavior-evaluation evidence"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "honing-agent-instruction-failure-shape",
+      "source_refs": ["superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "honing-agent-facing-docs",
+      "behavior": "Preserve only the accepted failure-shape and causal-pressure refinements for agent-facing instruction review.",
+      "implementation_state": "pending-external-owner-proof",
+      "evidence_paths": ["docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"],
+      "remaining_evidence": ["personal honing-source update and behavior evaluation"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "mergecraft-chat-only-and-source-shape",
+      "source_refs": ["ivan-mergecraft", "observed:current-personal-mergecraft-source"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "mergecraft",
+      "behavior": "Preserve chat-only drafting, inert literal PR-number handling, one source line per prose block, intentional break markup, and disclosure separation without weakening guarded publication.",
+      "implementation_state": "partial-existing-owner",
+      "evidence_paths": ["plugins/mergecraft/skills/writing-reviewable-pr-descriptions/SKILL.md"],
+      "remaining_evidence": [
+        "exact three-way source comparison",
+        "behavior evaluations for every accepted delta"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "mergecraft-graphite-stack-semantics",
+      "source_refs": ["withgraphite-agent-skills"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "mergecraft",
+      "behavior": "Retain stack topology and transport semantics behind Mergecraft's guarded PR repair and publication boundary.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": ["plugins/mergecraft/skills/graphite/SKILL.md"],
+      "remaining_evidence": ["live Graphite route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "mergecraft-pr-lifecycle-from-review-wrappers",
+      "source_refs": ["observed:current-personal-route-library", "superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "mergecraft",
+      "behavior": "Preserve current-head and thread acquisition, author-actionable feedback presentation, chat-only default, posting authority, review readiness, and terminal handoff. Semantic review and fixed-point repetition remain Tricritical-owned.",
+      "implementation_state": "partial-existing-owner",
+      "evidence_paths": [
+        "plugins/mergecraft/topology.json",
+        "plugins/mergecraft/skills/addressing-pr-review-feedback/references/feedback-flow.md"
+      ],
+      "remaining_evidence": [
+        "five route-level semantic diffs",
+        "one composed immutable PR input to Tricritical findings to Mergecraft lifecycle fixture"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "mergecraft-review-atlas-public-core",
+      "source_refs": ["component:review-atlas-public-core"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "mergecraft",
+      "behavior": "Preserve the public reviewer-navigation contract, changed-seam coverage, and immutable forge-history acquisition when provenance is needed.",
+      "implementation_state": "partial-existing-owner",
+      "evidence_paths": [
+        "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/review-atlas-reference-design.md",
+        "release/mergecraft/review-atlas-contribution-ledger.json"
+      ],
+      "remaining_evidence": [
+        "refresh public source identity",
+        "prove that the private overlay remains external"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "mergecraft-reviewer-decision-and-readiness",
+      "source_refs": ["ivan-mergecraft", "observed:current-personal-mergecraft-source"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "mergecraft",
+      "behavior": "Preserve reviewer decision paths, truthful readiness, manual operational-test classification and cleanup, temporal or visual explanation, and issue-closure provenance.",
+      "implementation_state": "partial-existing-owner",
+      "evidence_paths": ["plugins/mergecraft/topology.json"],
+      "remaining_evidence": [
+        "exact three-way source comparison",
+        "behavior evaluations for every accepted delta"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "mergecraft-text-mutation-routing",
+      "source_refs": ["ivan-mergecraft", "observed:current-personal-mergecraft-source"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "mergecraft",
+      "behavior": "Keep text mutation with the writer and publisher, ready-only changes with the publisher, and chat-only drafting with the writer.",
+      "implementation_state": "partial-existing-owner",
+      "evidence_paths": ["plugins/mergecraft/topology.json"],
+      "remaining_evidence": [
+        "exact three-way source comparison",
+        "routing evaluations for accepted deltas"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "rolecasting-current-personal-deltas",
+      "source_refs": ["ivan-rolecasting", "observed:current-personal-rolecasting-source"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "rolecasting",
+      "behavior": "Import only proven deltas in task and model classification, mixed-task splitting, harness routing, lifecycle distinctions, handoff guidance, and prompt requirements while preserving the plugin's stronger topology, authority, assurance, and evidence contracts.",
+      "implementation_state": "pending-three-way-comparison",
+      "evidence_paths": ["plugins/rolecasting/topology.json"],
+      "remaining_evidence": [
+        "exact three-way source comparison",
+        "behavior evaluations for every accepted delta",
+        "live adapter and receipt qualification"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "rolecasting-same-shape-delegation-and-reconciliation",
+      "source_refs": ["superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "rolecasting",
+      "behavior": "Preserve same-shape batching, useful local work, bounded waits, and live-child reconciliation.",
+      "implementation_state": "partial-existing-owner",
+      "evidence_paths": ["plugins/rolecasting/skills/delegating-cross-agent-work/SKILL.md"],
+      "remaining_evidence": ["destination behavior-evaluation binding"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "task-witness-source-stage-validation-boundary",
+      "source_refs": ["ivan-task-witness"],
+      "proposed_outcome": "retain-as-is",
+      "destination_owner_id": "task-witness",
+      "behavior": "Retain the current code-only, fail-closed source-stage validation boundary without adding a skill route or inferring runtime or release authority.",
+      "implementation_state": "existing-owner",
+      "evidence_paths": [
+        "plugins/task-witness/README.md",
+        "release/task-witness/source-shape-review.json"
+      ],
+      "remaining_evidence": [],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-adjudication",
+      "source_refs": ["cursor-thermos", "observed:keystone-plugin", "superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:adjudicate",
+      "behavior": "Verify internal and external findings against source, preserve causal distinctions, and give each finding one evidence-bound disposition without mutation.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "plugins/tricritical/skills/adjudicate/SKILL.md",
+        "plugins/tricritical/skills/adjudicate/references/dispositions.md"
+      ],
+      "remaining_evidence": ["supported-route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-causal-recurrence",
+      "source_refs": ["observed-route:ralph-review-until-clean"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:loop",
+      "behavior": "Track a corrected causal claim or seam across distinct successors. When the same cause returns or a second distinct counterexample exposes it, require a materially new boundary: narrow the claim, redesign, explicitly bind residual risk, or obtain an operator decision.",
+      "implementation_state": "gap",
+      "evidence_paths": [
+        "plugins/tricritical/skills/loop/SKILL.md",
+        "plugins/tricritical/skills/loop/references/review-evidence.md"
+      ],
+      "remaining_evidence": [
+        "paired fixture distinguishing one recurring cause from unrelated same-category findings",
+        "proof that escalation catches patch whack-a-mole without false blocking"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-fixed-point-review",
+      "source_refs": ["observed-route:ralph-review-until-clean", "superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:loop",
+      "behavior": "Freeze and verify each distinct successor, use fresh independent review, stop on repetition or no progress, and reach a truthful bounded terminal state.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "plugins/tricritical/skills/loop/SKILL.md",
+        "plugins/tricritical/skills/loop/references/review-evidence.md"
+      ],
+      "remaining_evidence": ["supported-route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-independent-axes",
+      "source_refs": ["cursor-thermos", "observed:keystone-plugin", "matt-pocock-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:review",
+      "behavior": "Use isolated Intent, Runtime, and Structure critics so requirement, causal-operation, and reduction concerns cannot mask one another. Specifications primarily ground Intent; repository standards are shared governing evidence routed by consequence.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "docs/plugin-system/design-principles.md",
+        "plugins/tricritical/topology.json"
+      ],
+      "remaining_evidence": ["comparative and ablation evidence that the third axis improves recall without spurious findings"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-intent-falsification",
+      "source_refs": ["observed:keystone-plugin", "matt-pocock-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:intent",
+      "behavior": "Test the accepted outcome, requirements, non-goals, scope, authority, omitted states, and alternate user or operator framing. Missing specification evidence remains an explicit coverage limitation.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "plugins/tricritical/skills/intent/SKILL.md",
+        "plugins/tricritical/skills/intent/references/rubric.md"
+      ],
+      "remaining_evidence": ["ablate legacy skip-on-no-spec behavior against explicit missing-coverage reporting"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-review-input-boundary",
+      "source_refs": ["cursor-thermos", "observed:keystone-plugin", "matt-pocock-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:review",
+      "behavior": "Bind an immutable candidate, comparison boundary, requirements or specification, standards, exclusions, and available verification; treat reviewed repository and forge content as untrusted evidence.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "plugins/tricritical/skills/review/SKILL.md",
+        "plugins/tricritical/skills/review/references/review-input-boundary.md"
+      ],
+      "remaining_evidence": ["supported-route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-runtime-causal-tracing",
+      "source_refs": ["cursor-thermos", "observed:keystone-plugin"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:runtime",
+      "behavior": "Trace changed behavior through real entry points, callers, state, failure, compatibility, security, deployment, rollback, and verification paths; require a reachable causal path and meaningful consequence.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "plugins/tricritical/skills/runtime/SKILL.md",
+        "plugins/tricritical/skills/runtime/references/rubric.md"
+      ],
+      "remaining_evidence": ["supported-route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-structure-reduction",
+      "source_refs": ["cursor-thermos", "observed:keystone-plugin", "matt-pocock-skill-set", "observed-route:tightening-code-for-review"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:structure",
+      "behavior": "Test deletion, consolidation, reuse, canonical ownership, simpler plausible shapes, reader burden, maintenance cost, and unnecessary abstraction. Treat smells as heuristics overridden by repository standards and concrete cost.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": [
+        "plugins/tricritical/skills/structure/SKILL.md",
+        "plugins/tricritical/skills/structure/references/rubric.md"
+      ],
+      "remaining_evidence": ["ablate named smell and deletion priming on current frontier models"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-synthesis-and-incomplete-accounting",
+      "source_refs": ["cursor-thermos", "observed:keystone-plugin", "matt-pocock-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:review",
+      "behavior": "Preserve raw axis provenance, deduplicate only the same cause, resolve disagreement against source, and report missing, timed-out, failed, or unusable reviewers as incomplete rather than clean.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": ["plugins/tricritical/skills/review/references/completeness-and-synthesis.md"],
+      "remaining_evidence": ["compare provenance-preserving synthesis against rigid side-by-side output"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-targeted-history-consumption",
+      "source_refs": ["observed:anthropic-code-review", "component:review-atlas-public-core"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:runtime",
+      "behavior": "When caller-supplied current and immutable historical evidence leaves behavior causally or contractually ambiguous, follow the ambiguity, record provenance, and return to current source. Do not scan history by default or acquire or post forge comments.",
+      "implementation_state": "candidate-gap",
+      "evidence_paths": [
+        "docs/plugin-system/design-principles.md",
+        "plugins/tricritical/skills/runtime/references/rubric.md"
+      ],
+      "remaining_evidence": [
+        "confirm source identity in the final rescout",
+        "paired ambiguous-contract and irrelevant-history fixtures",
+        "retain only if recall improves without material latency or false-positive cost"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "tricritical-authorized-revision",
+      "source_refs": ["superpowers-skill-set"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "tricritical:revise",
+      "behavior": "Apply only accepted findings under the original mutation authority, test deletion alternatives, verify the successor, and preserve clarified requirements as a separate bound identity.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": ["plugins/tricritical/skills/revise/SKILL.md"],
+      "remaining_evidence": ["supported-route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "versionkeeping-checkpoint-and-publication-provenance",
+      "source_refs": ["yeet"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "versionkeeping",
+      "behavior": "Retain bounded checkpoint, exact-lease publication, and provenance-aware cleanup behavior without unbound PR creation or raw command shortcuts.",
+      "implementation_state": "existing-equivalent-or-stronger",
+      "evidence_paths": ["plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/SKILL.md"],
+      "remaining_evidence": ["live Git route qualification"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "versionkeeping-conflict-derivative",
+      "source_refs": ["component:matt-pocock-skill-set/resolving-merge-conflicts"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "versionkeeping:resolving-merge-conflicts",
+      "behavior": "Maintain intent-aware conflict interpretation, authorized resolve or abort outcomes, and terminal checkpointing handoff as an attributed personal derivative.",
+      "implementation_state": "existing-derivative-missing-provenance",
+      "evidence_paths": ["plugins/versionkeeping/skills/resolving-merge-conflicts/SKILL.md"],
+      "remaining_evidence": [
+        "bind the imported upstream revision",
+        "add MIT attribution and correct provenance",
+        "add conflict routing coverage",
+        "run live resolve and abort smoke cases"
+      ],
+      "operator_review": "pending"
+    },
+    {
+      "id": "versionkeeping-fork-readiness",
+      "source_refs": ["observed-route:onboarding-forks-for-agent-maintenance"],
+      "proposed_outcome": "migrate-to-named-owner",
+      "destination_owner_id": "versionkeeping",
+      "behavior": "Before synchronization, discover remotes and baseline, inventory divergence, identify generated-artifact ownership, establish validation gates, and hand repository-specific policy back to its owner.",
+      "implementation_state": "gap",
+      "evidence_paths": ["plugins/versionkeeping/skills/syncing-forks-with-upstream/SKILL.md"],
+      "source_evidence_state": "pending-accepted-final-rescout-binding",
+      "remaining_evidence": ["define the smallest portable reference and evaluation without absorbing repository-policy authoring"],
+      "operator_review": "pending"
+    },
+    {
+      "id": "drop-exhaustive-review-ceremony",
+      "source_refs": ["observed:anthropic-code-review", "observed:keystone-plugin", "superpowers-skill-set"],
+      "proposed_outcome": "drop-with-reason",
+      "destination_owner_id": null,
+      "behavior": "Drop exhaustive mandatory pass checklists, fixed reviewer panels, and mandatory multi-loop cadence.",
+      "implementation_state": "proposed-drop",
+      "evidence_paths": ["docs/plugin-system/design-principles.md"],
+      "remaining_evidence": ["retain only if a comparative ablation demonstrates a material frontier-model benefit"],
+      "operator_review": "pending",
+      "reason": "They create checklist theater and human cost without strengthening causal evidence."
+    },
+    {
+      "id": "drop-hidden-review-attempts",
+      "source_refs": ["cursor-thermos"],
+      "proposed_outcome": "drop-with-reason",
+      "destination_owner_id": null,
+      "behavior": "Drop silent or implicit reviewer retries.",
+      "implementation_state": "proposed-drop",
+      "evidence_paths": ["plugins/tricritical/skills/review/references/completeness-and-synthesis.md"],
+      "remaining_evidence": [],
+      "operator_review": "pending",
+      "reason": "Explicit failure and incomplete accounting is more truthful than a hidden extra attempt."
+    },
+    {
+      "id": "drop-review-lifecycle-policy-duplication",
+      "source_refs": ["observed:keystone-plugin", "superpowers-skill-set"],
+      "proposed_outcome": "drop-with-reason",
+      "destination_owner_id": null,
+      "behavior": "Drop reviewer-owned shipping, merge, readiness, response, and social scripts after their useful non-review behavior is owned by Mergecraft.",
+      "implementation_state": "proposed-drop",
+      "evidence_paths": ["docs/plugin-system/design-principles.md", "plugins/mergecraft/topology.json"],
+      "remaining_evidence": ["composed Tricritical to Mergecraft lifecycle evidence"],
+      "operator_review": "pending",
+      "reason": "A semantic reviewer should not become a competing PR lifecycle or social-response owner."
+    },
+    {
+      "id": "drop-rigid-review-aggregation",
+      "source_refs": ["matt-pocock-skill-set"],
+      "proposed_outcome": "drop-with-reason",
+      "destination_owner_id": null,
+      "behavior": "Drop no-spec success, rigid no-synthesis or no-reranking rules, and arbitrary report word caps.",
+      "implementation_state": "proposed-drop",
+      "evidence_paths": ["plugins/tricritical/skills/review/references/completeness-and-synthesis.md"],
+      "remaining_evidence": ["compare provenance-preserving synthesis against rigid side-by-side output"],
+      "operator_review": "pending",
+      "reason": "These rules can hide missing coverage or prevent evidence-based cross-axis severity while adding no stronger authority boundary."
+    },
+    {
+      "id": "drop-review-setup-and-cycle-ceremony",
+      "source_refs": ["matt-pocock-skill-set", "observed-route:ralph-review-until-clean", "superpowers-skill-set"],
+      "proposed_outcome": "drop-with-reason",
+      "destination_owner_id": null,
+      "behavior": "Drop issue-tracker setup coupling, mandatory cycle labels, blanket praise or thanking instructions, and other response-style ceremony.",
+      "implementation_state": "proposed-drop",
+      "evidence_paths": ["docs/plugin-system/design-principles.md"],
+      "remaining_evidence": [],
+      "operator_review": "pending",
+      "reason": "These controls are brittle, duplicative, or stylistic rather than outcome-changing evidence contracts."
+    },
+    {
+      "id": "drop-structure-numeric-and-perfection-heuristics",
+      "source_refs": ["cursor-thermos"],
+      "proposed_outcome": "drop-with-reason",
+      "destination_owner_id": null,
+      "behavior": "Drop fixed large-file blockers, presumptive dramatic simplification, and unbounded perfection pressure.",
+      "implementation_state": "proposed-drop",
+      "evidence_paths": ["plugins/tricritical/skills/structure/references/rubric.md"],
+      "remaining_evidence": ["retain only if a comparative ablation demonstrates a material frontier-model benefit"],
+      "operator_review": "pending",
+      "reason": "Repository standards and concrete reader, maintenance, operational, and security costs should decide; numeric thresholds and presumed ideal forms create false blockers."
+    }
+  ],
+  "route_binding_contract": {
+    "identity": "A route is identified by the pair (source_ref, route_id) until the accepted rescout supplies its provider, discovery precedence, and supported-client binding.",
+    "uniqueness": "Each exact (source_ref, route_id) pair appears in at most one route candidate; equal route names from different providers remain distinct.",
+    "source_binding": "Each route names its source reference; provisional observed references require accepted source and discovery identities before retirement.",
+    "candidate_behavior_binding": "candidate_behavior_ids and candidate_drop_behavior_ids are proposal inputs, not an exhaustive source map or retirement receipt.",
+    "replacement_binding": "A route can be retired only after its material source behaviors have an accepted exhaustive migrated, retained-external, or dropped-with-reason partition and every required owner and capability is qualified on the supported clients.",
+    "source_evidence": "Source-evidence retention and live-route retirement remain separate decisions."
+  },
+  "route_candidates": [
+    {
+      "id": "mine-and-retain-personal-routes",
+      "routes": [
+        {
+          "route_id": "extending-managed-skills",
+          "source_ref": "observed-route:extending-managed-skills",
+          "candidate_behavior_ids": ["artifact-customs-owner-issued-route-evidence"]
+        },
+        {
+          "route_id": "onboarding-forks-for-agent-maintenance",
+          "source_ref": "observed-route:onboarding-forks-for-agent-maintenance",
+          "candidate_behavior_ids": ["versionkeeping-fork-readiness"]
+        }
+      ],
+      "proposed_outcome": "retain-as-is",
+      "source_evidence_policy": "retain-with-existing-owner",
+      "identity_state": "pending-accepted-final-rescout-binding",
+      "operator_review": "pending"
+    },
+    {
+      "id": "managed-general-review-routes",
+      "routes": [
+        {
+          "route_id": "code-review",
+          "source_ref": "matt-pocock-skill-set",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:review"],
+          "candidate_behavior_ids": [
+            "tricritical-adjudication",
+            "tricritical-independent-axes",
+            "tricritical-intent-falsification",
+            "tricritical-review-input-boundary",
+            "tricritical-runtime-causal-tracing",
+            "tricritical-structure-reduction",
+            "tricritical-synthesis-and-incomplete-accounting"
+          ]
+        },
+        {
+          "route_id": "code-review",
+          "source_ref": "observed:anthropic-code-review",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:review"],
+          "candidate_behavior_ids": [
+            "tricritical-review-input-boundary",
+            "tricritical-targeted-history-consumption"
+          ],
+          "behavior_partition_state": "pending-exact-source-diff"
+        },
+        {
+          "route_id": "keystone:change-review",
+          "source_ref": "observed:keystone-plugin",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:review"],
+          "candidate_behavior_ids": [
+            "tricritical-adjudication",
+            "tricritical-independent-axes",
+            "tricritical-intent-falsification",
+            "tricritical-review-input-boundary",
+            "tricritical-runtime-causal-tracing",
+            "tricritical-structure-reduction",
+            "tricritical-synthesis-and-incomplete-accounting"
+          ]
+        },
+        {
+          "route_id": "thermo-nuclear-code-quality-review",
+          "source_ref": "cursor-thermos",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:review"],
+          "candidate_behavior_ids": [],
+          "behavior_partition_state": "pending-behavior-level-source-partition-comparative-mapping-and-ablation"
+        },
+        {
+          "route_id": "thermo-nuclear-review",
+          "source_ref": "cursor-thermos",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:review", "tricritical:adjudicate"],
+          "candidate_behavior_ids": [],
+          "behavior_partition_state": "pending-behavior-level-source-partition-comparative-mapping-and-ablation"
+        },
+        {
+          "route_id": "thermos",
+          "source_ref": "cursor-thermos",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:review"],
+          "candidate_behavior_ids": [],
+          "behavior_partition_state": "pending-behavior-level-source-partition-comparative-mapping-and-ablation"
+        }
+      ],
+      "proposed_outcome": "drop-with-reason",
+      "candidate_family_behavior_ids": [
+        "tricritical-adjudication",
+        "tricritical-independent-axes",
+        "tricritical-intent-falsification",
+        "tricritical-review-input-boundary",
+        "tricritical-runtime-causal-tracing",
+        "tricritical-structure-reduction",
+        "tricritical-synthesis-and-incomplete-accounting"
+      ],
+      "candidate_drop_behavior_ids": [
+        "drop-exhaustive-review-ceremony",
+        "drop-hidden-review-attempts",
+        "drop-rigid-review-aggregation",
+        "drop-review-lifecycle-policy-duplication",
+        "drop-review-setup-and-cycle-ceremony",
+        "drop-structure-numeric-and-perfection-heuristics"
+      ],
+      "behavior_partition_state": "provisional-non-exhaustive; Thermos still requires a behavior-level source partition, comparative mapping, and ablation evidence",
+      "source_evidence_policy": "retain immutable managed and upstream source bytes, revisions, licenses, and contribution evidence; do not mutate Matt Pocock, Anthropic, Thermos, or Keystone sources",
+      "identity_state": "anthropic-keystone-and-live-discovery-bindings-pending-final-rescout",
+      "retirement_prerequisites": [
+        "every route has an accepted exhaustive behavior partition and per-source contribution map",
+        "Thermos behavior-level source partition, comparative mapping, and ablation evidence are accepted",
+        "every accepted behavior has one qualified Tricritical owner",
+        "Tricritical is installed and qualified on every supported route",
+        "install-before-remove, rollback, duplicate, shadow, and absence evidence is complete"
+      ],
+      "operator_review": "pending",
+      "reason": "Tricritical becomes the sole general code-review entry point; the upstream sources remain immutable evidence rather than mutation targets."
+    },
+    {
+      "id": "managed-conflict-route",
+      "routes": [
+        {
+          "route_id": "resolving-merge-conflicts",
+          "source_ref": "matt-pocock-skill-set",
+          "replacement_owner_ids": ["versionkeeping:resolving-merge-conflicts"],
+          "required_capability_ids": ["versionkeeping:resolving-merge-conflicts"],
+          "candidate_behavior_ids": ["versionkeeping-conflict-derivative"]
+        }
+      ],
+      "proposed_outcome": "drop-with-reason",
+      "behavior_partition_state": "pending exact upstream component revision, derivative comparison, license attribution, and route qualification",
+      "source_evidence_policy": "retain the immutable managed Matt Pocock source and component revision; retire only the competing live managed route after the attributed Versionkeeping derivative is qualified",
+      "identity_state": "provider-and-discovery-binding-pending-final-rescout",
+      "retirement_prerequisites": [
+        "the upstream component revision and MIT attribution are bound",
+        "the maintained derivative's behavior partition is accepted",
+        "Versionkeeping conflict resolve and abort paths are qualified",
+        "install-before-remove, rollback, duplicate, shadow, and absence evidence is complete"
+      ],
+      "operator_review": "pending",
+      "reason": "Versionkeeping should own the maintained conflict workflow without mutating or deleting Matt Pocock's upstream source."
+    },
+    {
+      "id": "personal-general-review-routes",
+      "routes": [
+        {
+          "route_id": "pr-review-orchestration",
+          "source_ref": "observed-route:pr-review-orchestration",
+          "replacement_owner_ids": ["mergecraft", "tricritical"],
+          "required_capability_ids": ["mergecraft:pr-lifecycle", "tricritical:loop", "tricritical:review"],
+          "candidate_behavior_ids": [
+            "mergecraft-pr-lifecycle-from-review-wrappers",
+            "tricritical-review-input-boundary",
+            "tricritical-fixed-point-review"
+          ]
+        },
+        {
+          "route_id": "ralph-review-until-clean",
+          "source_ref": "observed-route:ralph-review-until-clean",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:loop", "tricritical:review"],
+          "candidate_behavior_ids": ["tricritical-causal-recurrence", "tricritical-fixed-point-review"]
+        },
+        {
+          "route_id": "reviewing-before-finalizing",
+          "source_ref": "observed-route:reviewing-before-finalizing",
+          "replacement_owner_ids": ["mergecraft", "tricritical"],
+          "required_capability_ids": ["mergecraft:review-readiness", "tricritical:loop", "tricritical:review"],
+          "candidate_behavior_ids": [
+            "mergecraft-pr-lifecycle-from-review-wrappers",
+            "tricritical-review-input-boundary",
+            "tricritical-synthesis-and-incomplete-accounting"
+          ]
+        },
+        {
+          "route_id": "reviewing-others-prs",
+          "source_ref": "observed-route:reviewing-others-prs",
+          "replacement_owner_ids": ["mergecraft", "tricritical"],
+          "required_capability_ids": ["mergecraft:feedback-lifecycle", "tricritical:adjudicate", "tricritical:review"],
+          "candidate_behavior_ids": [
+            "mergecraft-pr-lifecycle-from-review-wrappers",
+            "tricritical-adjudication",
+            "tricritical-review-input-boundary"
+          ]
+        },
+        {
+          "route_id": "tightening-code-for-review",
+          "source_ref": "observed-route:tightening-code-for-review",
+          "replacement_owner_ids": ["tricritical"],
+          "required_capability_ids": ["tricritical:revise", "tricritical:structure"],
+          "candidate_behavior_ids": ["tricritical-authorized-revision", "tricritical-structure-reduction"]
+        }
+      ],
+      "proposed_outcome": "drop-with-reason",
+      "candidate_drop_behavior_ids": [
+        "drop-review-lifecycle-policy-duplication",
+        "drop-review-setup-and-cycle-ceremony"
+      ],
+      "behavior_partition_state": "provisional-non-exhaustive-pending-five-exact-source-diffs",
+      "source_evidence_policy": "preserve exact personal-source comparison identities; retire only the live projections after migration and qualification",
+      "identity_state": "exact-source-and-discovery-bindings-pending-final-rescout",
+      "retirement_prerequisites": [
+        "five route-level semantic diffs and exhaustive behavior partitions are accepted",
+        "Tricritical semantic review and Mergecraft lifecycle composition are qualified where applicable",
+        "install-before-remove, rollback, duplicate, shadow, and absence evidence is complete"
+      ],
+      "operator_review": "pending",
+      "reason": "These are competing general-review entry points. Useful semantic behavior moves to Tricritical; PR lifecycle behavior moves to Mergecraft."
+    },
+    {
+      "id": "superpowers-provider-routes",
+      "routes": [
+        {
+          "route_id": "brainstorming",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["existing-brainstorming-and-requirements-workflows"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "dispatching-parallel-agents",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["rolecasting"],
+          "required_capability_ids": ["rolecasting:delegating-cross-agent-work"],
+          "candidate_behavior_ids": ["rolecasting-same-shape-delegation-and-reconciliation"]
+        },
+        {
+          "route_id": "executing-plans",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["native-plan-state", "standing-implementation-workflows"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "finishing-a-development-branch",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["mergecraft", "versionkeeping"],
+          "required_capability_ids": ["mergecraft:getting-prs-merged", "versionkeeping:checkpoint-and-publication"],
+          "candidate_behavior_ids": ["versionkeeping-checkpoint-and-publication-provenance"]
+        },
+        {
+          "route_id": "receiving-code-review",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["mergecraft", "tricritical"],
+          "required_capability_ids": ["mergecraft:feedback-lifecycle", "tricritical:adjudicate"],
+          "candidate_behavior_ids": ["mergecraft-pr-lifecycle-from-review-wrappers", "tricritical-adjudication"]
+        },
+        {
+          "route_id": "requesting-code-review",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["mergecraft", "tricritical"],
+          "required_capability_ids": ["mergecraft:review-readiness", "tricritical:review"],
+          "candidate_behavior_ids": ["mergecraft-pr-lifecycle-from-review-wrappers", "tricritical-review-input-boundary"]
+        },
+        {
+          "route_id": "subagent-driven-development",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["rolecasting"],
+          "required_capability_ids": ["rolecasting:delegating-cross-agent-work"],
+          "candidate_behavior_ids": ["rolecasting-same-shape-delegation-and-reconciliation"]
+        },
+        {
+          "route_id": "systematic-debugging",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["diagnosing-bugs"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "test-driven-development",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["global-agent-instructions", "tdd"],
+          "candidate_behavior_ids": ["global-pre-change-failure-provenance"]
+        },
+        {
+          "route_id": "using-git-worktrees",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["versionkeeping"],
+          "required_capability_ids": ["versionkeeping:using-persistent-git-worktrees"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "using-superpowers",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["global-agent-instructions", "standing-skill-routing"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "verification-before-completion",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["task-specific-verification-contracts"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "writing-plans",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["durable-requirements-workflows", "native-plan-state"],
+          "candidate_behavior_ids": []
+        },
+        {
+          "route_id": "writing-skills",
+          "source_ref": "superpowers-skill-set",
+          "replacement_owner_ids": ["honing-agent-facing-docs", "skill-creator", "writing-for-agents"],
+          "candidate_behavior_ids": ["honing-agent-instruction-failure-shape"]
+        }
+      ],
+      "proposed_outcome": "drop-with-reason",
+      "source_behavior_partition_ref": {
+        "path": "release/source-skill-disposition/disposition-ledger.json",
+        "contribution_id": "superpowers-contribution-unresolved",
+        "route_match_field": "skill_dispositions[*].skill_ids"
+      },
+      "candidate_drop_behavior_ids": [
+        "drop-exhaustive-review-ceremony",
+        "drop-review-lifecycle-policy-duplication",
+        "drop-review-setup-and-cycle-ceremony"
+      ],
+      "behavior_partition_state": "historically-settled-for-all-fourteen-routes; requires last-responsible-moment source refresh and owner qualification",
+      "source_evidence_policy": "retain immutable upstream source bytes, revision, and MIT evidence; remove only qualified live routes",
+      "identity_state": "live-discovery-bindings-pending-final-rescout",
+      "retirement_prerequisites": [
+        "the fourteen-route source partition is revalidated against the refreshed source",
+        "accepted narrow behaviors are proved in their named owners",
+        "retained managed, native, system, and personal owners remain discoverable",
+        "install-before-remove, rollback, duplicate, shadow, and absence evidence is complete"
+      ],
+      "operator_review": "pending",
+      "reason": "All fourteen live routes duplicate current coordinated, managed, native, system, or personal owners after the named migrations complete."
+    },
+    {
+      "id": "superseded-github-review-route",
+      "routes": [
+        {
+          "route_id": "gh-address-comments",
+          "source_ref": "openai-github-specialists",
+          "replacement_owner_ids": ["mergecraft"],
+          "required_capability_ids": ["mergecraft:feedback-lifecycle"],
+          "candidate_behavior_ids": ["mergecraft-pr-lifecycle-from-review-wrappers"]
+        }
+      ],
+      "proposed_outcome": "drop-with-reason",
+      "behavior_partition_state": "historically mapped; requires refreshed source diff and composed feedback-lifecycle qualification",
+      "source_evidence_policy": "retain immutable upstream source and contribution evidence",
+      "identity_state": "provider-and-discovery-binding-pending-final-rescout",
+      "retirement_prerequisites": [
+        "Mergecraft feedback acquisition and response paths are qualified",
+        "the refreshed source diff preserves no additional accepted behavior",
+        "install-before-remove, rollback, duplicate, shadow, and absence evidence is complete"
+      ],
+      "operator_review": "pending",
+      "reason": "Mergecraft owns review-feedback acquisition and response behind a narrower authority boundary."
+    },
+    {
+      "id": "retained-github-specialist-routes",
+      "routes": [
+        {"route_id": "gh-fix-ci", "source_ref": "openai-github-specialists"},
+        {"route_id": "github", "source_ref": "openai-github-specialists"}
+      ],
+      "proposed_outcome": "retain-as-is",
+      "source_evidence_policy": "retain with the existing upstream owner",
+      "identity_state": "pending-accepted-final-rescout-binding",
+      "operator_review": "pending"
+    },
+    {
+      "id": "superseded-adapted-tool-routes",
+      "routes": [
+        {
+          "route_id": "graphite",
+          "source_ref": "withgraphite-agent-skills",
+          "replacement_owner_ids": ["mergecraft:graphite"],
+          "required_capability_ids": ["mergecraft:graphite"],
+          "candidate_behavior_ids": ["mergecraft-graphite-stack-semantics"]
+        },
+        {
+          "route_id": "yeet",
+          "source_ref": "yeet",
+          "replacement_owner_ids": ["mergecraft", "versionkeeping"],
+          "required_capability_ids": ["mergecraft:review-readiness", "versionkeeping:checkpoint-and-publication"],
+          "candidate_behavior_ids": ["versionkeeping-checkpoint-and-publication-provenance"]
+        }
+      ],
+      "proposed_outcome": "drop-with-reason",
+      "behavior_partition_state": "historically mapped; requires refreshed source diffs and replacement qualification",
+      "source_evidence_policy": "retain immutable upstream source, revision, license, and contribution evidence",
+      "identity_state": "provider-and-discovery-bindings-pending-final-rescout",
+      "retirement_prerequisites": [
+        "the refreshed source diffs preserve no additional accepted behavior",
+        "Mergecraft and Versionkeeping replacement paths are qualified",
+        "install-before-remove, rollback, duplicate, shadow, and absence evidence is complete"
+      ],
+      "operator_review": "pending",
+      "reason": "The coordinated owners already carry the useful stack, checkpoint, publication, and readiness behavior behind stronger boundaries."
+    },
+    {
+      "id": "retained-personal-specialist-routes",
+      "routes": [
+        {"route_id": "adapting-skill-creator-to-harnesses", "source_ref": "observed-route:adapting-skill-creator-to-harnesses"},
+        {"route_id": "applying-diataxis", "source_ref": "observed-route:applying-diataxis"},
+        {"route_id": "context7-mcp", "source_ref": "observed-route:context7-mcp"},
+        {"route_id": "developing-shell-scripts", "source_ref": "observed-route:developing-shell-scripts"},
+        {"route_id": "handling-privileged-steps", "source_ref": "observed-route:handling-privileged-steps"},
+        {"route_id": "honing-agent-facing-docs", "source_ref": "observed-route:honing-agent-facing-docs"},
+        {"route_id": "honing-human-facing-docs", "source_ref": "observed-route:honing-human-facing-docs"},
+        {"route_id": "impeccable", "source_ref": "observed-route:impeccable"},
+        {"route_id": "managing-arch-install-reasons", "source_ref": "observed-route:managing-arch-install-reasons"},
+        {"route_id": "publishing-systalyze-sites", "source_ref": "observed-route:publishing-systalyze-sites"},
+        {"route_id": "resolving-workflow-ownership", "source_ref": "observed-route:resolving-workflow-ownership"},
+        {"route_id": "triaging-agent-armory-issues", "source_ref": "observed-route:triaging-agent-armory-issues"},
+        {"route_id": "triaging-sandboxed-cli-failures", "source_ref": "observed-route:triaging-sandboxed-cli-failures"},
+        {"route_id": "working-in-systalyze-worktrees", "source_ref": "observed-route:working-in-systalyze-worktrees"}
+      ],
+      "proposed_outcome": "retain-as-is",
+      "source_evidence_policy": "retain with existing personal owners",
+      "identity_state": "pending-accepted-final-rescout-binding",
+      "operator_review": "pending"
+    }
+  ],
+  "unbound_route_families": [
+    {
+      "id": "retained-canonical-specialist-route-families",
+      "source_refs": [
+        "firecrawl-cli",
+        "firecrawl-skill-set",
+        "firecrawl-workflows",
+        "heredotnow-here-now",
+        "heygen-hyperframes",
+        "obra-elements-of-style",
+        "vectorize-hindsight",
+        "vercel-labs-skill-set"
+      ],
+      "historical_route_ids_from": "release/source-skill-lineage/source-manifest.json#sources[*].skill_ids",
+      "proposed_outcome": "retain-as-is",
+      "identity_state": "exact-current-route-and-discovery-bindings-pending-final-rescout",
+      "operator_review": "pending",
+      "reason": "These remain narrow external tool, research, publication, visual-production, writing, memory, and discovery specialists outside the coordinated plugin family."
+    },
+    {
+      "id": "retained-matt-pocock-nonreview-routes",
+      "source_refs": ["matt-pocock-skill-set"],
+      "historical_route_ids": [
+        "ask-matt",
+        "codebase-design",
+        "diagnosing-bugs",
+        "domain-modeling",
+        "grill-me",
+        "grill-with-docs",
+        "grilling",
+        "handoff",
+        "implement",
+        "improve-codebase-architecture",
+        "prototype",
+        "research",
+        "setup-matt-pocock-skills",
+        "tdd",
+        "teach",
+        "to-questionnaire",
+        "to-spec",
+        "to-tickets",
+        "triage",
+        "wait-what",
+        "wayfinder",
+        "wizard",
+        "writing-for-agents"
+      ],
+      "proposed_outcome": "retain-as-is",
+      "identity_state": "exact-current-route-and-discovery-bindings-pending-final-rescout",
+      "operator_review": "pending",
+      "reason": "The managed Matt Pocock skills remain immutable and independently owned; only the competing general code-review and conflict routes receive separate route dispositions."
+    },
+    {
+      "id": "retained-keystone-nonreview-routes",
+      "source_refs": ["observed:keystone-plugin"],
+      "historical_route_ids": [
+        "keystone:context-survey",
+        "keystone:implementation",
+        "keystone:product-planning",
+        "keystone:project-audit",
+        "keystone:refactoring",
+        "keystone:root-cause-analysis",
+        "keystone:shipping",
+        "keystone:task-creation"
+      ],
+      "proposed_outcome": "retain-as-is",
+      "identity_state": "exact-upstream-current-route-and-discovery-bindings-pending-final-rescout",
+      "operator_review": "pending",
+      "reason": "Keystone's non-review project workflows remain specialist owners; only change-review competes with Tricritical."
+    },
+    {
+      "id": "retained-review-atlas-private-route",
+      "source_refs": ["review-atlas-private"],
+      "historical_route_ids": ["review-atlas"],
+      "proposed_outcome": "retain-as-is",
+      "identity_state": "exact-current-route-and-discovery-binding-pending-final-rescout",
+      "operator_review": "pending",
+      "reason": "The opaque private overlay remains external and may only add stricter local policy over Mergecraft's public core."
+    },
+    {
+      "id": "personal-standalone-plugin-projections",
+      "source_refs": ["ivan-mergecraft", "ivan-rolecasting", "ivan-versionkeeping"],
+      "proposed_outcome": "drop-with-reason",
+      "identity_state": "exact-route-identities-pending-final-rescout",
+      "retirement_prerequisites": [
+        "accepted three-way semantic comparisons",
+        "qualified plugin installation and discovery",
+        "install-before-remove, duplicate, shadow, rollback, and absence evidence"
+      ],
+      "operator_review": "pending",
+      "reason": "The plugin packages become the canonical portable owners; installed projections are observations, not import authority."
+    },
+    {
+      "id": "claude-commit-command-shortcuts",
+      "source_refs": ["observed-route:claude:commit-commands"],
+      "proposed_outcome": "drop-with-reason",
+      "identity_state": "historically-observed-current-binding-pending-final-rescout",
+      "retirement_prerequisites": [
+        "qualified Versionkeeping and Mergecraft replacements",
+        "exact current route identity and discovery binding",
+        "route-absence and rollback evidence"
+      ],
+      "operator_review": "pending",
+      "reason": "Raw command shortcuts duplicate bounded provenance and publication owners."
+    }
+  ],
+  "non_disposition_release_gaps": [
+    {
+      "id": "thermos-behavior-partition-and-ablation",
+      "owner_id": "tricritical-source-reconciliation",
+      "remaining_evidence": [
+        "bind the refreshed Thermos source revision and license evidence",
+        "partition material behaviors into migrated, retained-external, or dropped-with-reason outcomes",
+        "compare and ablate disputed behaviors on supported frontier models and harnesses"
+      ],
+      "note": "If issue 56 remains the tracker, reframe it around behavior-level evidence. A one-to-one clause or rule map is not the desired strategy."
+    },
+    {
+      "id": "task-witness-runtime-qualification-and-promotion",
+      "owner_id": "task-witness-release-lane",
+      "remaining_evidence": [
+        "producer and issuer reachability",
+        "two native-host receipts",
+        "canonical review",
+        "detached manifest and promotion"
+      ],
+      "note": "These gates do not change the retained source-stage behavior disposition."
+    },
+    {
+      "id": "versionkeeping-conflict-route-coverage",
+      "owner_id": "versionkeeping",
+      "remaining_evidence": ["add resolving-merge-conflicts to the shared behavior and routing coverage inventories"],
+      "note": "This is a qualification gap, not a new behavior owner."
+    }
+  ],
+  "pending_inventory_delta": {
+    "additional_historically_observed_macos_candidates": ["observed-route:claude:commit-commands"],
+    "accepted_macos_delta": "pending",
+    "accepted_hatchery_delta": "pending",
+    "reason": "The final Mac and Hatchery instruction-library captures have not received artifact-pair acceptance.",
+    "required_next_step": "Bind exact source and discovery identities, then append every newly observed or changed topical hit, including recursively referenced material, before claiming completeness or promoting this worklist into the canonical ledgers."
+  }
+}

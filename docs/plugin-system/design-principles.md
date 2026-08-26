@@ -219,6 +219,11 @@ first-release reconciliation makes them conform to this page and revalidates
 their enforcement, this page controls plugin-family ownership and replacement
 direction; the ledgers remain evidence inputs, not authority to retain or
 retire routes. The
+[reconciliation worklist](../../release/source-skill-disposition/reconciliation-worklist.json)
+holds the temporary, proposal-only destination map while the final two-host
+rescout and operator review are incomplete. Accepted entries move into the
+canonical ledgers; remove the worklist after deployment and retirement evidence
+closes the migration. The
 [source-skill disposition and release-refresh contract](../superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md)
 owns source freshness and qualification prerequisites. Package references own
 their current runtime behavior and limitations.

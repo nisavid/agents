@@ -30,6 +30,7 @@ from tooling.hindsight.tests import (
 from tooling.hindsight.tests.test_hindsight_memory_provider_runtime import (
     four_codex_split_timeout_policy_data,
     policy_data,
+    six_member_split_timeout_policy_data,
 )
 from tooling.hindsight.lib.hindsight_memory_control_plane import (
     operation_recovery_runtime,
@@ -44,14 +45,18 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery_pro
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _exact_split_timeout_policy_data() -> dict[str, object]:
-    value = four_codex_split_timeout_policy_data()
+def _rename_exact_policy_members(
+    value: dict[str, object],
+    *,
+    include_luna: bool,
+) -> dict[str, object]:
     renamed = {
         "work": "work-codex",
         "personal": "personal-codex",
         "alt1": "alt1-codex",
         "alt2": "alt2-codex",
         "fallback": "hatchery",
+        "openai-luna": "openai-luna",
     }
     for member in value["members"]:
         member_id = renamed[member["id"]]
@@ -73,7 +78,23 @@ def _exact_split_timeout_policy_data() -> dict[str, object]:
         "alt2-codex",
         "hatchery",
     ]
+    if include_luna:
+        value["failover_order"].append("openai-luna")
     return value
+
+
+def _legacy_exact_split_timeout_policy_data() -> dict[str, object]:
+    return _rename_exact_policy_members(
+        four_codex_split_timeout_policy_data(),
+        include_luna=False,
+    )
+
+
+def _exact_split_timeout_policy_data() -> dict[str, object]:
+    return _rename_exact_policy_members(
+        six_member_split_timeout_policy_data(),
+        include_luna=True,
+    )
 
 
 def _copy_patchable_entity_resolver(candidate_library: Path) -> Path:
@@ -4781,7 +4802,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         )
         self.assertEqual(
             environment["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"],
-            "16384",
+            "32768",
         )
 
         self.assertEqual(
@@ -7092,7 +7113,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(reads, [True])
         self.assertEqual(observed, hashlib.sha256(body).hexdigest())
 
-    def test_exact_drain_provider_policy_requires_four_dedicated_codex_homes(self):
+    def test_exact_drain_provider_policy_requires_canonical_failover_members(self):
         validate = self.controller[
             "_operation_recovery_validate_exact_provider_policy"
         ]
@@ -7101,6 +7122,45 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             policy_value
         )
         self.assertEqual(policy.member("hatchery").max_concurrent, 2)
+        luna = policy.member("openai-luna")
+        self.assertEqual(luna.identity.provider, "openai-responses")
+        self.assertEqual(luna.identity.model, "gpt-5.6-luna")
+        self.assertEqual(
+            luna.identity.credential_marker,
+            "provider-policy:openai-luna",
+        )
+        self.assertEqual(luna.credential_mode, "api-key")
+        self.assertEqual(
+            luna.credential_locator,
+            "api-key:hindsight-openai",
+        )
+        for changed_luna in (
+            replace(
+                luna,
+                identity=replace(
+                    luna.identity,
+                    model="gpt-5.6-luna-drifted",
+                ),
+            ),
+            replace(luna, credential_locator="api-key:other"),
+            replace(luna, quota_cooldown=False),
+            replace(luna, max_retries=1),
+        ):
+            with (
+                self.subTest(changed_luna=changed_luna),
+                self.assertRaisesRegex(Exception, "provider policy differs"),
+            ):
+                validate(
+                    replace(
+                        policy,
+                        members=tuple(
+                            changed_luna
+                            if member.id == luna.id
+                            else member
+                            for member in policy.members
+                        ),
+                    )
+                )
         with self.assertRaisesRegex(Exception, "provider policy differs"):
             validate(
                 replace(
@@ -7181,10 +7241,22 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         )
         with self.assertRaisesRegex(Exception, "provider policy differs"):
             validate(old_timeout_policy)
-        operation_recovery_runtime.validate_exact_drain_provider_policy(
-            repair_policy,
-            plan_schema_version=14,
-        )
+        with self.assertRaisesRegex(Exception, "provider policy differs"):
+            validate(
+                replace(
+                    policy,
+                    failover_order=tuple(
+                        member_id
+                        for member_id in policy.failover_order
+                        if member_id != "openai-luna"
+                    ),
+                )
+            )
+        with self.assertRaisesRegex(Exception, "provider policy differs"):
+            operation_recovery_runtime.validate_exact_drain_provider_policy(
+                repair_policy,
+                plan_schema_version=14,
+            )
         operation_recovery_runtime.validate_exact_drain_provider_policy(
             repair_policy,
             plan_schema_version=15,
@@ -7195,7 +7267,19 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 plan_schema_version=15,
             )
 
-        legacy_value = deepcopy(policy_value)
+        historical_policy = self.controller["ProviderRuntimePolicy"].load(
+            _legacy_exact_split_timeout_policy_data()
+        )
+        operation_recovery_runtime.validate_exact_drain_provider_policy(
+            historical_policy,
+            plan_schema_version=14,
+        )
+        operation_recovery_runtime.validate_exact_drain_provider_policy(
+            historical_policy,
+            plan_schema_version=15,
+        )
+
+        legacy_value = _legacy_exact_split_timeout_policy_data()
         legacy_value["schema_version"] = 1
         for member in legacy_value["members"]:
             member.pop("execution_timeout_seconds")
@@ -7255,7 +7339,13 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             globals_["_operation_recovery_read_private_bytes"] = original
         profile = {
             "HINDSIGHT_API_LLM_STRATEGY": '{"mode":"round-robin"}',
-            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai-codex",
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai",
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL": (
+                "text-embedding-3-small"
+            ),
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY": (
+                "provider-policy:openai-luna"
+            ),
             "HINDSIGHT_API_RERANKER_PROVIDER": "jina-mlx",
         }
         for position, member_id in enumerate(policy.failover_order):
@@ -7273,6 +7363,8 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 profile[f"{prefix}_API_KEY"] = (
                     member.identity.credential_marker
                 )
+            if member_id == "openai-luna":
+                profile[f"{prefix}_REASONING_EFFORT"] = "medium"
         bind = self.controller["exact_drain_effective_profile_digest"]
         initial = bind(policy, profile)
         changed_effort = dict(profile)
@@ -7292,6 +7384,33 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "LLM profile differs",
         ):
             bind(policy, changed_embeddings)
+        changed_embeddings_model = dict(profile)
+        changed_embeddings_model[
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
+        ] = "text-embedding-3-large"
+        with self.assertRaisesRegex(
+            Exception,
+            "LLM profile differs",
+        ):
+            bind(policy, changed_embeddings_model)
+        changed_embeddings_key = dict(profile)
+        changed_embeddings_key[
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
+        ] = "provider-policy:other"
+        with self.assertRaisesRegex(
+            Exception,
+            "LLM profile differs",
+        ):
+            bind(policy, changed_embeddings_key)
+        changed_luna_effort = dict(profile)
+        changed_luna_effort[
+            "HINDSIGHT_API_LLM_5_REASONING_EFFORT"
+        ] = "high"
+        with self.assertRaisesRegex(
+            Exception,
+            "LLM profile differs",
+        ):
+            bind(policy, changed_luna_effort)
         changed_trace = dict(profile)
         changed_trace["HINDSIGHT_API_LLM_TRACE_ENABLED"] = "false"
         self.assertNotEqual(bind(policy, changed_trace), initial)
@@ -7304,6 +7423,42 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "LLM profile differs",
         ):
             bind(policy, changed_extraction_policy)
+
+    def test_historical_five_member_profile_digest_remains_stable(self):
+        policy = self.controller["ProviderRuntimePolicy"].load(
+            _legacy_exact_split_timeout_policy_data()
+        )
+        profile = {
+            "HINDSIGHT_API_LLM_STRATEGY": '{"mode":"round-robin"}',
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai-codex",
+            "HINDSIGHT_API_RERANKER_PROVIDER": "jina-mlx",
+        }
+        for position, member_id in enumerate(policy.failover_order):
+            member = policy.member(member_id)
+            prefix = (
+                "HINDSIGHT_API_LLM"
+                if position == 0
+                else f"HINDSIGHT_API_LLM_{position}"
+            )
+            profile[f"{prefix}_PROVIDER"] = member.identity.provider
+            profile[f"{prefix}_MODEL"] = member.identity.model
+            if member.identity.base_url:
+                profile[f"{prefix}_BASE_URL"] = member.identity.base_url
+            if member.identity.credential_marker is not None:
+                profile[f"{prefix}_API_KEY"] = (
+                    member.identity.credential_marker
+                )
+
+        observed = self.controller["exact_drain_effective_profile_digest"](
+            policy,
+            profile,
+            plan_schema_version=15,
+        )
+
+        self.assertEqual(
+            observed,
+            "165666784f7bdaf9203df967007740e9b804ecbe52c3fc69961f01eabc6e0120",
+        )
 
     def test_exact_drain_apply_rechecks_the_rollback_backup_digest(self):
         verify = self.controller[

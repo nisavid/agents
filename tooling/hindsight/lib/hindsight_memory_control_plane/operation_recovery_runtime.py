@@ -80,6 +80,8 @@ GENERATION_TRIGGER = "hindsight_migration_generation_bump"
 EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
     {
         "HINDSIGHT_API_AUDIT_LOG_ENABLED",
+        "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY",
+        "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL",
         "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
         "HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS",
         "HINDSIGHT_API_LLM_API_KEY",
@@ -97,7 +99,7 @@ EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
         "HINDSIGHT_API_SKIP_LLM_VERIFICATION",
         *(
             f"HINDSIGHT_API_LLM_{position}_{suffix}"
-            for position in range(1, 5)
+            for position in range(1, 6)
             for suffix in (
                 "API_KEY",
                 "BASE_URL",
@@ -109,14 +111,18 @@ EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
     }
 )
 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS = "3600"
-EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS = "16384"
+EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS = "32768"
 EXACT_DRAIN_SERIALIZATION_RETRY_ATTEMPTS = 3
-EXACT_DRAIN_PROVIDER_ORDER = (
+EXACT_DRAIN_LEGACY_PROVIDER_ORDER = (
     "work-codex",
     "personal-codex",
     "alt1-codex",
     "alt2-codex",
     "hatchery",
+)
+EXACT_DRAIN_PROVIDER_ORDER = (
+    *EXACT_DRAIN_LEGACY_PROVIDER_ORDER,
+    "openai-luna",
 )
 EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE = (
     "operation-recovery exact drain execution lease expired"
@@ -478,11 +484,24 @@ def validate_exact_drain_provider_policy(
     *,
     plan_schema_version: int | None = None,
 ) -> None:
-    """Require the exact four-Codex then Hatchery provider authority."""
+    """Require the immutable historical or current exact-drain authority."""
+    if plan_schema_version is None:
+        plan_schema_version = (
+            15
+            if policy.schema_version == 3
+            else 12
+            if policy.schema_version == 2
+            else 10
+        )
     members = {member.id: member for member in policy.members}
+    provider_order = (
+        EXACT_DRAIN_PROVIDER_ORDER
+        if policy.schema_version == 3
+        else EXACT_DRAIN_LEGACY_PROVIDER_ORDER
+    )
     hatchery_max_concurrent = (
         EXACT_DRAIN_HATCHERY_MAX_CONCURRENT
-        if policy.schema_version == 2
+        if policy.schema_version in {2, 3}
         else EXACT_DRAIN_LEGACY_HATCHERY_MAX_CONCURRENT
     )
     legacy_timeout_invalid = (
@@ -491,7 +510,7 @@ def validate_exact_drain_provider_policy(
         and members["hatchery"].timeout_seconds != 1200
     )
     split_timeout_invalid = (
-        policy.schema_version == 2
+        policy.schema_version in {2, 3}
         and any(
             member.queue_timeout_seconds != 3600
             or member.execution_timeout_seconds
@@ -507,19 +526,37 @@ def validate_exact_drain_provider_policy(
             for member in policy.members
         )
     )
+    luna_invalid = policy.schema_version == 3 and (
+        members.get("openai-luna") is None
+        or members["openai-luna"].identity.provider != "openai-responses"
+        or members["openai-luna"].identity.model != "gpt-5.6-luna"
+        or members["openai-luna"].identity.base_url != ""
+        or members["openai-luna"].identity.credential_marker
+        != "provider-policy:openai-luna"
+        or members["openai-luna"].credential_mode != "api-key"
+        or members["openai-luna"].credential_locator
+        != "api-key:hindsight-openai"
+        or members["openai-luna"].quota_cooldown is not True
+        or members["openai-luna"].max_retries != 0
+        or members["openai-luna"].max_concurrent is not None
+    )
     if (
-        policy.schema_version not in {1, 2}
+        policy.schema_version not in {1, 2, 3}
         or (
-            plan_schema_version in {11, 12, 13, 14, 15}
+            plan_schema_version in {11, 12, 13, 14}
             and policy.schema_version != 2
+        )
+        or (
+            plan_schema_version == 15
+            and policy.schema_version not in {2, 3}
         )
         or (
             plan_schema_version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
             and policy.schema_version != 1
         )
         or policy.default_usage_limit_cooldown_seconds != 300
-        or policy.failover_order != EXACT_DRAIN_PROVIDER_ORDER
-        or set(members) != set(EXACT_DRAIN_PROVIDER_ORDER)
+        or policy.failover_order != provider_order
+        or set(members) != set(provider_order)
         or any(
             members[member_id].identity.provider != "openai-codex"
             or members[member_id].identity.base_url != ""
@@ -542,6 +579,7 @@ def validate_exact_drain_provider_policy(
         or split_timeout_invalid
         or members["hatchery"].max_retries != 0
         or members["hatchery"].max_concurrent != hatchery_max_concurrent
+        or luna_invalid
     ):
         raise OperationRecoveryError(
             "operation-recovery exact drain provider policy differs"
@@ -554,9 +592,15 @@ def exact_drain_effective_profile_digest(
     *,
     plan_schema_version: int | None = None,
 ) -> str:
-    """Validate and bind the effective five-member Hindsight LLM profile."""
+    """Validate and bind the versioned effective Hindsight LLM profile."""
     if plan_schema_version is None:
-        plan_schema_version = 12 if policy.schema_version == 2 else 10
+        plan_schema_version = (
+            15
+            if policy.schema_version == 3
+            else 12
+            if policy.schema_version == 2
+            else 10
+        )
     validate_exact_drain_provider_policy(
         policy,
         plan_schema_version=plan_schema_version,
@@ -575,9 +619,22 @@ def exact_drain_effective_profile_digest(
         raise OperationRecoveryError(
             "operation-recovery exact drain LLM profile differs"
         )
-    if (
-        environment.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")
+    managed_openai_embeddings = policy.schema_version == 3
+    embeddings_invalid = (
+        (
+            environment.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")
+            != "openai"
+            or environment.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL")
+            != "text-embedding-3-small"
+            or environment.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY")
+            != "provider-policy:openai-luna"
+        )
+        if managed_openai_embeddings
+        else environment.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")
         != "openai-codex"
+    )
+    if (
+        embeddings_invalid
         or environment.get("HINDSIGHT_API_RERANKER_PROVIDER")
         != "jina-mlx"
         or environment.get("HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS")
@@ -587,7 +644,12 @@ def exact_drain_effective_profile_digest(
             "operation-recovery exact drain LLM profile differs"
         )
     projection: list[dict[str, Any]] = []
-    for position, member_id in enumerate(EXACT_DRAIN_PROVIDER_ORDER):
+    provider_order = (
+        EXACT_DRAIN_PROVIDER_ORDER
+        if policy.schema_version == 3
+        else EXACT_DRAIN_LEGACY_PROVIDER_ORDER
+    )
+    for position, member_id in enumerate(provider_order):
         member = policy.member(member_id)
         prefix = (
             "HINDSIGHT_API_LLM"
@@ -613,8 +675,15 @@ def exact_drain_effective_profile_digest(
                 expected_marker is None
                 and api_key not in {None, ""}
             )
-            or reasoning_effort
-            not in {None, "low", "medium", "high", "xhigh"}
+            or (
+                member_id == "openai-luna"
+                and reasoning_effort != "medium"
+            )
+            or (
+                member_id != "openai-luna"
+                and reasoning_effort
+                not in {None, "low", "medium", "high", "xhigh"}
+            )
         ):
             raise OperationRecoveryError(
                 "operation-recovery exact drain LLM profile differs"
@@ -629,19 +698,29 @@ def exact_drain_effective_profile_digest(
                 "reasoning_effort": reasoning_effort,
             }
         )
-    return digest(
-        {
-            "strategy": {"mode": "round-robin"},
-            "members": projection,
-            "embeddings_provider": "openai-codex",
-            "reranker_provider": "jina-mlx",
-            "profile_environment": {
-                key: environment[key]
-                for key in sorted(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
-                if key in environment
-            },
-        }
-    )
+    binding = {
+        "strategy": {"mode": "round-robin"},
+        "members": projection,
+        "embeddings_provider": (
+            "openai" if managed_openai_embeddings else "openai-codex"
+        ),
+        "reranker_provider": "jina-mlx",
+        "profile_environment": {
+            key: environment[key]
+            for key in sorted(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
+            if key in environment
+        },
+    }
+    if managed_openai_embeddings:
+        binding.update(
+            {
+                "embeddings_model": "text-embedding-3-small",
+                "embeddings_credential_marker": (
+                    "provider-policy:openai-luna"
+                ),
+            }
+        )
+    return digest(binding)
 SAFE_OPERATION_QUERY = """
 SELECT
     operation_id::text AS operation_id,

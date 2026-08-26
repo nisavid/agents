@@ -236,8 +236,11 @@ services without editing reusable implementation.
 quota cooldown, exact provider matching, per-member concurrency and priority,
 timeout, and retry mechanics. Consumers supply the closed policy shape shown in
 `examples/provider-runtime-policy.json` and a protected credential resolver.
-The policy contains OAuth-home locators, never resolved paths or credential
-values.
+The policy contains abstract `oauth-home:` or `api-key:` locators, never
+resolved paths or credential values.
+Schemas 1 and 2 retain their historical OAuth-home and credential-free member
+grammar. Schema 3 adds managed API-key members without changing how earlier
+policies load or how their exact-drain profile digests are verified.
 
 The Hindsight strategy selects linear failover or tiered round-robin request
 starts. Both modes use the policy's declared member order and try each member at
@@ -256,18 +259,22 @@ replace every example member identity, endpoint, model, locator, and ordering
 entry with a deployed provider that is valid on that installation before
 installing the adapter.
 
-For an OAuth-backed Codex member, the Hindsight provider credential field
-contains only `provider-policy:<member-id>`. At construction time the adapter
-resolves that member's `oauth-home:` locator, scopes `CODEX_HOME` while the
-Codex client initializes, and restores the prior environment. No resolved home
-is retained in the policy or logged. Other providers are matched by the exact
-provider, model, and normalized base URL declared by the consumer.
+For a managed provider, the Hindsight provider credential field contains only
+`provider-policy:<member-id>`. For an OAuth-backed Codex member, the adapter
+resolves the member's `oauth-home:` locator, scopes `CODEX_HOME` while the
+Codex client initializes, and restores the prior environment. For a supported
+OpenAI API-key member, the adapter resolves the member's `api-key:` locator
+only while constructing the provider and preserves the non-secret policy
+marker for later identity matching. Resolved homes and key values are never
+retained in policy evidence or logged. Other providers are matched by the
+exact provider, model, and normalized base URL declared by the consumer.
 
 Call `ProviderRuntimePolicy.load(...)`, then install
 `HindsightProviderAdapter` with the protected resolver during Hindsight process
 startup. Installation fails before changing Hindsight classes unless the
 installed `hindsight-api` version and the policy both name an adapter-supported
-version. The current adapter supports `0.8.4`, `0.9.0`, and `0.9.1`;
+version. The current adapter supports `0.8.4`, `0.9.0`, `0.9.1`, and
+`0.9.2`;
 supporting another release requires an explicit compatibility update and
 contract tests.
 

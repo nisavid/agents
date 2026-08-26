@@ -8836,7 +8836,7 @@ def operation_recovery_plan_command(args: argparse.Namespace) -> int:
 def _operation_recovery_validate_exact_provider_policy(
     policy: ProviderRuntimePolicy,
     *,
-    schema_version: int = 12,
+    schema_version: int | None = None,
 ) -> None:
     validate_exact_drain_provider_policy(
         policy,

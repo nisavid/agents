@@ -517,7 +517,8 @@ raw Hindsight bank selection remains an implementation detail.
 - Supported hosted LLM authentication includes `openai-codex` with an explicitly
   selected Codex model and reasoning effort, and `claude-code` with an explicitly
   selected Claude model and reasoning effort. Other hosted services require
-  Keychain API-key references.
+  protected, abstract API-key references; policy and profile evidence never
+  contain resolved key values.
 - Hosted retrieval candidates include Jina embedding and reranking, OpenAI
   `text-embedding-3-small` plus Jina reranking, and ZeroEntropy embedding and
   reranking. Their readiness includes endpoint, terms, license, and benchmark

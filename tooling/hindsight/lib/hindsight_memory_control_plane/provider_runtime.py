@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import heapq
+import inspect
 from importlib import metadata
 import json
 import logging
@@ -85,7 +86,9 @@ IDENTITY_KEYS = {"provider", "model", "base_url", "credential_marker"}
 CREDENTIAL_KEYS = {"mode", "locator"}
 PRIORITY_KEYS = {"default", "reflect", "retain", "consolidation"}
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-SUPPORTED_HINDSIGHT_VERSIONS = frozenset({"0.8.4", "0.9.0", "0.9.1"})
+SUPPORTED_HINDSIGHT_VERSIONS = frozenset(
+    {"0.8.4", "0.9.0", "0.9.1", "0.9.2"}
+)
 SUPPORTED_RUNTIME_PROVIDERS_084 = frozenset(
     {
         "anthropic",
@@ -115,6 +118,9 @@ SUPPORTED_RUNTIME_PROVIDERS_084 = frozenset(
         "volcano",
         "zai",
     }
+)
+SUPPORTED_RUNTIME_PROVIDERS_091 = (
+    SUPPORTED_RUNTIME_PROVIDERS_084 | {"openai-responses"}
 )
 STARTUP_LLM_VERIFICATION_TIMEOUT_SECONDS = 10.0
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 20.0
@@ -266,7 +272,11 @@ class ProviderIdentity:
             provider=str(getattr(member, "provider", "")),
             model=getattr(member, "model", None),
             base_url=getattr(member, "base_url", ""),
-            credential_marker=getattr(member, "api_key", None),
+            credential_marker=getattr(
+                member,
+                "_hindsight_provider_credential_marker",
+                getattr(member, "api_key", None),
+            ),
         )
 
     def matches_values(
@@ -335,9 +345,9 @@ class ProviderRuntimePolicy:
             )
         _closed(value, POLICY_KEYS, "provider runtime policy")
         schema_version = value["schema_version"]
-        if type(schema_version) is not int or schema_version not in {1, 2}:
+        if type(schema_version) is not int or schema_version not in {1, 2, 3}:
             raise ProviderRuntimeCompatibilityError(
-                "provider runtime schema_version must be 1 or 2"
+                "provider runtime schema_version must be 1, 2, or 3"
             )
         hindsight_version = _string(value["hindsight_version"], "hindsight_version")
         cooldown = value["default_usage_limit_cooldown_seconds"]
@@ -357,6 +367,13 @@ class ProviderRuntimePolicy:
             _load_member(item, schema_version=schema_version)
             for item in raw_members
         )
+        if hindsight_version not in {"0.9.1", "0.9.2"} and any(
+            member.identity.provider == "openai-responses"
+            for member in members
+        ):
+            raise ProviderRuntimeCompatibilityError(
+                "openai-responses requires Hindsight 0.9.1 or 0.9.2"
+            )
         ids = [member.id for member in members]
         if len(ids) != len(set(ids)):
             raise ProviderRuntimeCompatibilityError("member ids must be unique")
@@ -469,7 +486,12 @@ def _load_member(
                 f"credential marker must equal {expected_marker}"
             )
     runtime_provider = _identifier(identity["provider"], "runtime provider")
-    if runtime_provider not in SUPPORTED_RUNTIME_PROVIDERS_084:
+    supported_runtime_providers = (
+        SUPPORTED_RUNTIME_PROVIDERS_091
+        if schema_version == 3
+        else SUPPORTED_RUNTIME_PROVIDERS_084
+    )
+    if runtime_provider not in supported_runtime_providers:
         raise ProviderRuntimeCompatibilityError(
             "runtime provider is not supported by Hindsight 0.8.4"
         )
@@ -500,6 +522,21 @@ def _load_member(
             raise ProviderRuntimeCompatibilityError(
                 "OAuth home credentials require the openai-codex provider"
             )
+    elif mode == "api-key" and schema_version == 3:
+        if not isinstance(locator, str) or re.fullmatch(
+            r"api-key:[a-z0-9][a-z0-9._-]*", locator
+        ) is None:
+            raise ProviderRuntimeCompatibilityError(
+                "API key locator shape is invalid"
+            )
+        if marker is None:
+            raise ProviderRuntimeCompatibilityError(
+                "API key provider requires a credential marker"
+            )
+        if provider_identity.provider not in {"openai", "openai-responses"}:
+            raise ProviderRuntimeCompatibilityError(
+                "API key credentials require an OpenAI provider"
+            )
     elif mode == "none":
         if locator is not None or marker is not None:
             raise ProviderRuntimeCompatibilityError(
@@ -521,9 +558,9 @@ def _load_member(
     quota_cooldown = value["quota_cooldown"]
     if type(quota_cooldown) is not bool:
         raise ProviderRuntimeCompatibilityError("quota_cooldown must be boolean")
-    if quota_cooldown and mode != "oauth-home":
+    if quota_cooldown and mode not in {"oauth-home", "api-key"}:
         raise ProviderRuntimeCompatibilityError(
-            "quota cooldown requires an OAuth home identity"
+            "quota cooldown requires a managed credential identity"
         )
     return ProviderMemberPolicy(
         id=member_id,
@@ -625,6 +662,14 @@ class HindsightProviderAdapter:
 
         try:
             original_llm_init = LLMProvider.__init__
+            llm_init_signature = inspect.signature(original_llm_init)
+            if not {
+                "provider",
+                "api_key",
+                "base_url",
+                "model",
+            }.issubset(llm_init_signature.parameters):
+                raise TypeError("provider constructor signature is unsupported")
             original_methods = {
                 method_name: getattr(LLMProvider, method_name)
                 for method_name in ("call", "call_with_tools")
@@ -659,7 +704,28 @@ class HindsightProviderAdapter:
             )
 
         def policy_aware_init(instance: Any, *args: Any, **kwargs: Any) -> None:
-            original_llm_init(instance, *args, **kwargs)
+            bound = llm_init_signature.bind(instance, *args, **kwargs)
+            marker = bound.arguments.get("api_key")
+            managed_api_key = runtime.managed_api_key(
+                provider=str(bound.arguments.get("provider", "")),
+                marker=marker,
+                base_url=bound.arguments.get("base_url", ""),
+                model=bound.arguments.get("model"),
+            )
+            if managed_api_key is None:
+                original_llm_init(instance, *args, **kwargs)
+            else:
+                member_id, resolved_api_key = managed_api_key
+                bound.arguments["api_key"] = resolved_api_key
+                try:
+                    original_llm_init(*bound.args, **bound.kwargs)
+                except Exception:
+                    raise ProviderRuntimeCompatibilityError(
+                        "API key provider initialization failed for "
+                        f"{member_id}"
+                    ) from None
+                instance._hindsight_provider_credential_marker = marker
+                instance.api_key = marker
             runtime.prepare(instance)
 
         policy_aware_init._hindsight_provider_policy = True  # type: ignore[attr-defined]
@@ -908,6 +974,57 @@ class _ProviderRuntime:
         self._gates: dict[str, _PriorityGate] = {}
         self._resolved_oauth_homes: dict[str, Path] = {}
         self._oauth_home_owners: dict[Path, str] = {}
+
+    def managed_api_key(
+        self,
+        *,
+        provider: str,
+        marker: Any,
+        base_url: Any,
+        model: Any,
+    ) -> tuple[str, str] | None:
+        if not isinstance(marker, str) or not marker.startswith(
+            "provider-policy:"
+        ):
+            return None
+        member = self.policy.member_for_marker(marker)
+        if member is None:
+            raise ProviderRuntimeCompatibilityError(
+                "unknown managed provider credential marker"
+            )
+        if member.credential_mode != "api-key":
+            return None
+        if not member.identity.matches_values(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            credential_marker=marker,
+        ):
+            raise ProviderRuntimeCompatibilityError(
+                f"provider identity does not match managed marker {member.id}"
+            )
+        if member.credential_locator is None:
+            raise ProviderRuntimeCompatibilityError(
+                f"API key locator is absent for {member.id}"
+            )
+        try:
+            resolved = self._credential_resolver(member.credential_locator)
+        except Exception:
+            raise ProviderRuntimeCompatibilityError(
+                f"API key resolution failed for {member.id}"
+            ) from None
+        if (
+            not isinstance(resolved, str)
+            or not resolved
+            or len(resolved) > 8192
+            or resolved != resolved.strip()
+            or any(character.isspace() for character in resolved)
+            or resolved == marker
+        ):
+            raise ProviderRuntimeCompatibilityError(
+                f"API key resolver returned an invalid value for {member.id}"
+            )
+        return member.id, resolved
 
     @property
     def _progress_recorder(self) -> Any | None:

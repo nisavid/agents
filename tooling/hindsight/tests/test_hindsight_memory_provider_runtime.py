@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib.metadata
 import importlib.util
 import json
 import logging
@@ -150,6 +151,35 @@ def four_codex_split_timeout_policy_data() -> dict[str, object]:
     return value
 
 
+def six_member_split_timeout_policy_data() -> dict[str, object]:
+    value = four_codex_split_timeout_policy_data()
+    value["schema_version"] = 3
+    value["hindsight_version"] = "0.9.1"
+    luna = copy.deepcopy(value["members"][0])
+    luna["id"] = "openai-luna"
+    luna["identity"] = {
+        "provider": "openai-responses",
+        "model": "gpt-5.6-luna",
+        "base_url": "",
+        "credential_marker": "provider-policy:openai-luna",
+    }
+    luna["credential"] = {
+        "mode": "api-key",
+        "locator": "api-key:hindsight-openai",
+    }
+    luna["quota_cooldown"] = True
+    value["failover_order"] = [
+        "work",
+        "personal",
+        "alt1",
+        "alt2",
+        "fallback",
+        "openai-luna",
+    ]
+    value["members"].append(luna)
+    return value
+
+
 def four_codex_homes() -> dict[str, str]:
     return {
         "oauth-home:work": "/tmp/work-codex",
@@ -196,6 +226,48 @@ def four_codex_members() -> dict[str, StaticMember]:
 
 
 class ProviderRuntimePolicyTest(unittest.TestCase):
+    def test_api_key_member_is_a_closed_managed_fallback_identity(self) -> None:
+        policy = ProviderRuntimePolicy.load(six_member_split_timeout_policy_data())
+
+        luna = policy.member("openai-luna")
+        self.assertEqual(luna.identity.provider, "openai-responses")
+        self.assertEqual(luna.credential_mode, "api-key")
+        self.assertEqual(luna.credential_locator, "api-key:hindsight-openai")
+        self.assertTrue(luna.quota_cooldown)
+
+        invalid = six_member_split_timeout_policy_data()
+        invalid["members"][-1]["credential"]["locator"] = "/tmp/plaintext-key"
+        with self.assertRaisesRegex(
+            ProviderRuntimeCompatibilityError,
+            "API key locator shape is invalid",
+        ):
+            ProviderRuntimePolicy.load(invalid)
+
+        wrong_provider = six_member_split_timeout_policy_data()
+        wrong_provider["members"][-1]["identity"]["provider"] = "lmstudio"
+        with self.assertRaisesRegex(
+            ProviderRuntimeCompatibilityError,
+            "API key credentials require an OpenAI provider",
+        ):
+            ProviderRuntimePolicy.load(wrong_provider)
+
+        older_runtime = six_member_split_timeout_policy_data()
+        older_runtime["hindsight_version"] = "0.9.0"
+        with self.assertRaisesRegex(
+            ProviderRuntimeCompatibilityError,
+            "openai-responses requires Hindsight 0.9.1",
+        ):
+            ProviderRuntimePolicy.load(older_runtime)
+
+        historical_schema = six_member_split_timeout_policy_data()
+        historical_schema["schema_version"] = 2
+        historical_schema["members"][-1]["identity"]["provider"] = "openai"
+        with self.assertRaisesRegex(
+            ProviderRuntimeCompatibilityError,
+            "credential mode is invalid",
+        ):
+            ProviderRuntimePolicy.load(historical_schema)
+
     def test_schema_two_closes_split_queue_and_execution_timeouts(self) -> None:
         policy = ProviderRuntimePolicy.load(split_timeout_policy_data())
 
@@ -481,8 +553,9 @@ class HindsightProviderAdapterTest(unittest.TestCase):
                 return Client(timeout)
 
         class ProviderImpl:
-            def __init__(self, timeout: int) -> None:
+            def __init__(self, timeout: int, api_key: str) -> None:
                 self.timeout = timeout
+                self.api_key = api_key
                 self._client = Client(timeout)
 
         class LLMProvider:
@@ -502,7 +575,8 @@ class HindsightProviderAdapterTest(unittest.TestCase):
                 self.model = model
                 self.timeout = timeout
                 self.max_retries = max_retries
-                self._provider_impl = ProviderImpl(timeout)
+                self.reasoning_effort = _kwargs.get("reasoning_effort")
+                self._provider_impl = ProviderImpl(timeout, api_key)
                 self.operation = None
 
             async def call(self, **kwargs):
@@ -609,9 +683,11 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.install())
         return classes
 
-    def test_install_supports_real_hindsight_091_provider_interfaces(self) -> None:
+    def test_install_supports_current_real_hindsight_provider_interfaces(self) -> None:
         value = policy_data()
-        value["hindsight_version"] = "0.9.1"
+        value["hindsight_version"] = importlib.metadata.version(
+            "hindsight-api"
+        )
         fallback = value["members"][2]
         fallback["identity"] = {
             "provider": "mock",
@@ -640,9 +716,9 @@ from hindsight_memory_control_plane.provider_runtime import (
     HindsightProviderAdapter,
     ProviderRuntimePolicy,
 )
-if importlib.metadata.version("hindsight-api") != "0.9.1":
-    raise RuntimeError("real Hindsight test runtime differs")
 policy = ProviderRuntimePolicy.load(json.loads(sys.argv[2]))
+if importlib.metadata.version("hindsight-api") != policy.hindsight_version:
+    raise RuntimeError("real Hindsight test runtime differs")
 HindsightProviderAdapter(
     policy,
     credential_resolver=lambda _locator: "/private/tmp/unread-oauth-home",
@@ -673,6 +749,93 @@ print("accepted")
                 script,
                 str(LIB),
                 json.dumps(value, sort_keys=True),
+            ],
+            check=False,
+            cwd="/",
+            env={
+                "HOME": str(Path.home()),
+                "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "accepted")
+
+    def test_install_constructs_current_real_openai_responses_member(self) -> None:
+        worker_python = (
+            Path.home()
+            / ".local/share/uv/tools/hindsight-api/bin/python3"
+        )
+        script = """
+import asyncio
+import importlib.metadata
+import json
+import socket
+import sys
+
+def reject_network(*_args, **_kwargs):
+    raise RuntimeError("network use is forbidden in compatibility test")
+
+socket.socket.connect = reject_network
+socket.create_connection = reject_network
+sys.path.insert(0, sys.argv[1])
+from hindsight_memory_control_plane.provider_runtime import (
+    HindsightProviderAdapter,
+    ProviderRuntimePolicy,
+)
+policy = ProviderRuntimePolicy.load(json.loads(sys.argv[2]))
+if importlib.metadata.version("hindsight-api") != policy.hindsight_version:
+    raise RuntimeError("real Hindsight test runtime differs")
+marker = "provider-policy:openai-luna"
+secret = "sk-synthetic-compatibility-only"
+HindsightProviderAdapter(
+    policy,
+    credential_resolver=lambda locator: (
+        secret
+        if locator == "api-key:hindsight-openai"
+        else "/private/tmp/unread-oauth-home"
+    ),
+).install()
+from hindsight_api.engine.llm_wrapper import LLMProvider
+member = LLMProvider(
+    provider="openai-responses",
+    api_key=marker,
+    base_url="",
+    model="gpt-5.6-luna",
+    reasoning_effort="medium",
+)
+if member.api_key != marker:
+    raise RuntimeError("wrapper retained resolved credential")
+if member._hindsight_provider_credential_marker != marker:
+    raise RuntimeError("wrapper marker is absent")
+if member._provider_impl.api_key != secret:
+    raise RuntimeError("provider did not receive resolved credential")
+if policy.match(member).id != "openai-luna":
+    raise RuntimeError("provider policy no longer matches constructed member")
+asyncio.run(member.cleanup())
+print("accepted")
+"""
+        result = subprocess.run(
+            [
+                str(worker_python),
+                "-I",
+                "-c",
+                script,
+                str(LIB),
+                json.dumps(
+                    {
+                        **six_member_split_timeout_policy_data(),
+                        "hindsight_version": importlib.metadata.version(
+                            "hindsight-api"
+                        ),
+                    },
+                    sort_keys=True,
+                ),
             ],
             check=False,
             cwd="/",
@@ -795,6 +958,113 @@ print("accepted")
                 "alt2": "/tmp/alt2-codex",
             },
         )
+
+    def test_managed_api_key_is_resolved_only_for_provider_construction(self) -> None:
+        marker = "provider-policy:openai-luna"
+        secret = "sk-test-runtime-only"
+        LLMProvider, _CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=six_member_split_timeout_policy_data(),
+            homes={
+                **four_codex_homes(),
+                "api-key:hindsight-openai": secret,
+            },
+            hindsight_version="0.9.1",
+        )
+
+        with mock.patch.object(
+            provider_runtime,
+            "_split_timeout",
+            return_value=1_200,
+        ):
+            luna = LLMProvider(
+                provider="openai-responses",
+                api_key=marker,
+                base_url="",
+                model="gpt-5.6-luna",
+                reasoning_effort="medium",
+            )
+
+        self.assertEqual(luna.api_key, marker)
+        self.assertEqual(
+            luna._hindsight_provider_credential_marker,
+            marker,
+        )
+        self.assertEqual(luna._provider_impl.api_key, secret)
+        self.assertEqual(luna.reasoning_effort, "medium")
+        policy = ProviderRuntimePolicy.load(
+            six_member_split_timeout_policy_data()
+        )
+        self.assertEqual(policy.match(luna).id, "openai-luna")
+
+    def test_managed_api_key_resolution_failure_is_redacted(self) -> None:
+        modules, LLMProvider, _CodexLLM, _MultiLLMProvider = (
+            self.runtime_modules()
+        )
+
+        def failing_resolver(_locator: str) -> str:
+            raise RuntimeError("sk-sensitive-resolver-output")
+
+        adapter = HindsightProviderAdapter(
+            ProviderRuntimePolicy.load(six_member_split_timeout_policy_data()),
+            credential_resolver=failing_resolver,
+            version_resolver=lambda: "0.9.1",
+        )
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(adapter.install())
+            with self.assertRaisesRegex(
+                ProviderRuntimeCompatibilityError,
+                "API key resolution failed for openai-luna",
+            ) as raised:
+                LLMProvider(
+                    provider="openai-responses",
+                    api_key="provider-policy:openai-luna",
+                    base_url="",
+                    model="gpt-5.6-luna",
+                    reasoning_effort="medium",
+                )
+
+        self.assertNotIn("sensitive", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_managed_api_key_provider_initialization_failure_is_redacted(self) -> None:
+        modules, LLMProvider, _CodexLLM, _MultiLLMProvider = (
+            self.runtime_modules()
+        )
+
+        def failing_init(
+            _instance,
+            provider: str,
+            api_key: str,
+            base_url: str,
+            model: str,
+            **_kwargs,
+        ) -> None:
+            raise RuntimeError(
+                f"constructor rejected {provider} {api_key} {base_url} {model}"
+            )
+
+        LLMProvider.__init__ = failing_init
+        adapter = HindsightProviderAdapter(
+            ProviderRuntimePolicy.load(six_member_split_timeout_policy_data()),
+            credential_resolver=lambda _locator: "sk-sensitive-constructor",
+            version_resolver=lambda: "0.9.1",
+        )
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(adapter.install())
+            with self.assertRaisesRegex(
+                ProviderRuntimeCompatibilityError,
+                "API key provider initialization failed for openai-luna",
+            ) as raised:
+                LLMProvider(
+                    provider="openai-responses",
+                    api_key="provider-policy:openai-luna",
+                    base_url="",
+                    model="gpt-5.6-luna",
+                    reasoning_effort="medium",
+                )
+
+        self.assertNotIn("sensitive", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
 
     def test_managed_codex_53_omits_unsupported_reasoning_summary(self) -> None:
         value = policy_data()
@@ -1093,6 +1363,50 @@ print("accepted")
             ),
             (1, 2, 1, 1, 1),
         )
+
+    def test_round_robin_uses_luna_only_after_codex_and_hatchery_fail(self) -> None:
+        _LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+            policy_value=six_member_split_timeout_policy_data(),
+            homes=four_codex_homes(),
+            hindsight_version="0.9.1",
+        )
+
+        codex_members = four_codex_members()
+        for member in codex_members.values():
+            member.result = ConnectionError("codex unavailable")
+        hatchery = StaticMember(
+            "lmstudio",
+            "private-fallback-model",
+            "http://inference.example.test:13305/v1",
+            "",
+            "hatchery",
+        )
+        luna = StaticMember(
+            "openai-responses",
+            "gpt-5.6-luna",
+            "",
+            "provider-policy:openai-luna",
+            "luna",
+        )
+        provider = MultiLLMProvider()
+        provider._strategy.mode = "round-robin"
+        provider._members = [
+            luna,
+            codex_members["personal"],
+            hatchery,
+            codex_members["alt2"],
+            codex_members["work"],
+            codex_members["alt1"],
+        ]
+
+        with self.assertLogs("test-provider-runtime", level="WARNING"):
+            self.assertEqual(asyncio.run(provider._dispatch("call")), "hatchery")
+        self.assertEqual(luna.calls, 0)
+
+        hatchery.result = ConnectionError("hatchery unavailable")
+        with self.assertLogs("test-provider-runtime", level="WARNING"):
+            self.assertEqual(asyncio.run(provider._dispatch("call")), "luna")
+        self.assertEqual((hatchery.calls, luna.calls), (2, 1))
 
     def test_usage_limit_reset_hint_is_capped_to_the_probe_cooldown(self) -> None:
         class Response:

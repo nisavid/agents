@@ -8034,6 +8034,39 @@ def _post_abort_timestamp(value: Any) -> float | None:
         return None
 
 
+def _post_abort_preserved_row_matches(
+    reference: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    if (
+        current["current_status"] == reference["current_status"]
+        and current["row_digest"] == reference["row_digest"]
+    ):
+        return True
+    claim_keys = {
+        "claimed_at",
+        "row_digest",
+        "worker_id_digest",
+        "worker_id_present",
+    }
+    return (
+        set(current) == set(reference)
+        and reference["current_status"] == "failed"
+        and current["current_status"] == "failed"
+        and reference["worker_id_present"] is True
+        and reference["worker_id_digest"] is not None
+        and reference["claimed_at"] is not None
+        and current["worker_id_present"] is False
+        and current["worker_id_digest"] is None
+        and current["claimed_at"] is None
+        and all(
+            current[key] == value
+            for key, value in reference.items()
+            if key not in claim_keys
+        )
+    )
+
+
 def _post_abort_v10_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
@@ -8118,10 +8151,10 @@ def _post_abort_v10_contract(
             for operation_id in current
         )
         or any(
-            current[operation_id]["current_status"]
-            != reference_snapshot[operation_id]["current_status"]
-            or current[operation_id]["row_digest"]
-            != reference_snapshot[operation_id]["row_digest"]
+            not _post_abort_preserved_row_matches(
+                reference_snapshot[operation_id],
+                current[operation_id],
+            )
             for operation_id in reference_preserved_ids
         )
     ):

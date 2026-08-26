@@ -4481,7 +4481,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                         now=mismatched["created_at"],
                     )
 
-    def test_post_abort_v11_preserves_preexisting_failed_rows(self):
+    def test_post_abort_v11_accepts_released_preexisting_failed_claim(self):
         reference_snapshot = self.drain_snapshot(
             completed_positions=set(range(6)),
             failed_positions={6},
@@ -4531,8 +4531,21 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for item in reference["live_snapshot"]["operations"]
             if item["operation_id"] == preserved_failed_id
         )
+        released_failed = deepcopy(reference_failed)
+        released_failed.update(
+            worker_id_present=False,
+            worker_id_digest=None,
+            claimed_at=None,
+        )
+        released_failed["row_digest"] = digest(
+            {
+                key: value
+                for key, value in released_failed.items()
+                if key != "row_digest"
+            }
+        )
         snapshot["operations"] = [
-            deepcopy(reference_failed)
+            released_failed
             if item["operation_id"] == preserved_failed_id
             else item
             for item in snapshot["operations"]
@@ -4566,28 +4579,43 @@ class OperationRecoveryContractTest(unittest.TestCase):
             backup["source_authority"][key] = snapshot[key]
         backup["source_authority_digest"] = digest(backup["source_authority"])
 
-        plan = create_post_abort_recovery_plan(
-            reference,
-            snapshot,
-            candidate_release=release_identity(),
-            rollback_backup=backup,
-            rollback_encryption=rollback_encryption(),
-            rollback_backup_path="/private/tmp/v11-preserved-failed-backup.age",
-            rollback_bundle_path="/private/tmp/v11-preserved-failed-bundle.age",
-            authorization_receipt_path="/private/tmp/v11-preserved-failed-auth.json",
-            application_receipt_path="/private/tmp/v11-preserved-failed-app.json",
-            verification_receipt_path="/private/tmp/v11-preserved-failed-verify.json",
-            rollback_receipt_path="/private/tmp/v11-preserved-failed-rollback.json",
-            reference_application_authorization=(
-                exact_drain_authorization(reference)
-            ),
-            reference_application_journal=(
-                exact_drain_application_journal(reference)
-            ),
-            reference_application_progress_digest="e" * 64,
-            schema_version=11,
-            created_at=1_786_390_500,
-        )
+        def create(candidate_snapshot):
+            return create_post_abort_recovery_plan(
+                reference,
+                candidate_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path=(
+                    "/private/tmp/v11-preserved-failed-backup.age"
+                ),
+                rollback_bundle_path=(
+                    "/private/tmp/v11-preserved-failed-bundle.age"
+                ),
+                authorization_receipt_path=(
+                    "/private/tmp/v11-preserved-failed-auth.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/v11-preserved-failed-app.json"
+                ),
+                verification_receipt_path=(
+                    "/private/tmp/v11-preserved-failed-verify.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/v11-preserved-failed-rollback.json"
+                ),
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="e" * 64,
+                schema_version=11,
+                created_at=1_786_390_500,
+            )
+
+        plan = create(snapshot)
 
         self.assertEqual(
             plan["preserved_status_counts"],
@@ -4597,6 +4625,33 @@ class OperationRecoveryContractTest(unittest.TestCase):
             verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
             plan,
         )
+
+        changed_nonclaim = deepcopy(snapshot)
+        changed_failed = next(
+            item
+            for item in changed_nonclaim["operations"]
+            if item["operation_id"] == preserved_failed_id
+        )
+        changed_failed["error_digest"] = "0" * 64
+        changed_failed["row_digest"] = digest(
+            {
+                key: value
+                for key, value in changed_failed.items()
+                if key != "row_digest"
+            }
+        )
+        changed_nonclaim["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in changed_nonclaim.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "post-abort row set is invalid",
+        ):
+            create(changed_nonclaim)
 
     def test_post_abort_v10_preserves_changed_unowned_pending_row(self):
         reference_snapshot = self.drain_snapshot(

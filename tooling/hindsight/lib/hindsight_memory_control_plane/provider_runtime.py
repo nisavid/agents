@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, AsyncIterator, Callable, Iterator, Mapping
+from typing import Any, AsyncIterator, Callable, Iterator, Mapping, MutableMapping
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -135,6 +135,16 @@ _PROVIDER_REQUEST_DIGEST: ContextVar[str | None] = ContextVar(
 _CODEX_MODELS_WITHOUT_REASONING_SUMMARY = frozenset(
     {"gpt-5.3-codex-spark"}
 )
+_OPENAI_EMBEDDINGS_PROVIDER_VARIABLE = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
+_OPENAI_EMBEDDINGS_MODEL_VARIABLE = (
+    "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
+)
+_OPENAI_EMBEDDINGS_API_KEY_VARIABLE = (
+    "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
+)
+_OPENAI_EMBEDDINGS_MODEL = "text-embedding-3-small"
+_OPENAI_LUNA_PROVIDER = "openai-responses"
+_OPENAI_LUNA_MODEL = "gpt-5.6-luna"
 
 
 class _CodexRequestCompatibilityClient:
@@ -618,6 +628,90 @@ class HindsightProviderAdapter:
         self.version_resolver = version_resolver or (
             lambda: metadata.version("hindsight-api")
         )
+        self._resolved_api_keys: dict[str, str] = {}
+        self._api_key_lock = threading.Lock()
+
+    def _resolve_api_key(self, member: ProviderMemberPolicy) -> str:
+        locator = member.credential_locator
+        if locator is None:
+            raise ProviderRuntimeCompatibilityError(
+                f"API key locator is absent for {member.id}"
+            )
+        with self._api_key_lock:
+            cached = self._resolved_api_keys.get(locator)
+            if cached is not None:
+                return cached
+            try:
+                resolved = self.credential_resolver(locator)
+            except Exception:
+                raise ProviderRuntimeCompatibilityError(
+                    f"API key resolution failed for {member.id}"
+                ) from None
+            marker = member.identity.credential_marker
+            if (
+                not isinstance(resolved, str)
+                or not resolved
+                or len(resolved) > 8192
+                or resolved != resolved.strip()
+                or any(character.isspace() for character in resolved)
+                or resolved == marker
+            ):
+                raise ProviderRuntimeCompatibilityError(
+                    "API key resolver returned an invalid value for "
+                    f"{member.id}"
+                )
+            self._resolved_api_keys[locator] = resolved
+            return resolved
+
+    def _resolve_credential(self, locator: str) -> str:
+        api_key_members = tuple(
+            member
+            for member in self.policy.members
+            if member.credential_mode == "api-key"
+            and member.credential_locator == locator
+        )
+        if not api_key_members:
+            return self.credential_resolver(locator)
+        if len(api_key_members) != 1:
+            raise ProviderRuntimeCompatibilityError(
+                "API key locator matches more than one provider policy"
+            )
+        return self._resolve_api_key(api_key_members[0])
+
+    def prepare_openai_embeddings(
+        self,
+        environment: MutableMapping[str, str],
+    ) -> None:
+        """Resolve the policy-bound OpenAI key into process-local embeddings state."""
+        if (
+            environment.get(_OPENAI_EMBEDDINGS_PROVIDER_VARIABLE) != "openai"
+            or environment.get(_OPENAI_EMBEDDINGS_MODEL_VARIABLE)
+            != _OPENAI_EMBEDDINGS_MODEL
+        ):
+            raise ProviderRuntimeCompatibilityError(
+                "OpenAI embeddings provider binding is invalid"
+            )
+        marker = environment.get(_OPENAI_EMBEDDINGS_API_KEY_VARIABLE)
+        member = (
+            self.policy.member_for_marker(marker)
+            if isinstance(marker, str)
+            else None
+        )
+        if (
+            member is None
+            or member.credential_mode != "api-key"
+            or member.credential_locator is None
+            or member.identity.provider != _OPENAI_LUNA_PROVIDER
+            or member.identity.model != _OPENAI_LUNA_MODEL
+            or member.identity.base_url != ""
+            or member.identity.credential_marker != marker
+        ):
+            raise ProviderRuntimeCompatibilityError(
+                "OpenAI embeddings credential binding is invalid"
+            )
+        environment[_OPENAI_EMBEDDINGS_API_KEY_VARIABLE] = (
+            self._resolve_api_key(member)
+        )
 
     def install(self) -> bool:
         try:
@@ -694,7 +788,7 @@ class HindsightProviderAdapter:
 
         runtime = _ProviderRuntime(
             self.policy,
-            credential_resolver=self.credential_resolver,
+            credential_resolver=self._resolve_credential,
             logger=logger,
         )
 

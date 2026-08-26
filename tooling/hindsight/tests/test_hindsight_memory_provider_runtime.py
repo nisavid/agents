@@ -775,8 +775,10 @@ print("accepted")
 import asyncio
 import importlib.metadata
 import json
+import os
 import socket
 import sys
+from unittest import mock
 
 def reject_network(*_args, **_kwargs):
     raise RuntimeError("network use is forbidden in compatibility test")
@@ -793,22 +795,44 @@ if importlib.metadata.version("hindsight-api") != policy.hindsight_version:
     raise RuntimeError("real Hindsight test runtime differs")
 marker = "provider-policy:openai-luna"
 secret = "sk-synthetic-compatibility-only"
-HindsightProviderAdapter(
-    policy,
-    credential_resolver=lambda locator: (
+resolver_calls = []
+def resolve_credential(locator):
+    resolver_calls.append(locator)
+    return (
         secret
         if locator == "api-key:hindsight-openai"
         else "/private/tmp/unread-oauth-home"
-    ),
-).install()
-from hindsight_api.engine.llm_wrapper import LLMProvider
-member = LLMProvider(
-    provider="openai-responses",
-    api_key=marker,
-    base_url="",
-    model="gpt-5.6-luna",
-    reasoning_effort="medium",
+    )
+adapter = HindsightProviderAdapter(
+    policy,
+    credential_resolver=resolve_credential,
 )
+profile_marker = os.environ["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"]
+adapter.prepare_openai_embeddings(os.environ)
+adapter.install()
+captured = {}
+class FakeAsyncOpenAI:
+    def __init__(self, **kwargs):
+        captured["luna"] = dict(kwargs)
+    def with_options(self, **kwargs):
+        captured["luna_with_options"] = dict(kwargs)
+        return self
+    async def close(self):
+        return None
+class FakeOpenAI:
+    def __init__(self, **kwargs):
+        captured["embeddings"] = dict(kwargs)
+        self.embeddings = object()
+import hindsight_api.engine.providers.openai_responses_llm as responses_module
+from hindsight_api.engine.llm_wrapper import LLMProvider
+with mock.patch.object(responses_module, "AsyncOpenAI", FakeAsyncOpenAI):
+    member = LLMProvider(
+        provider="openai-responses",
+        api_key=marker,
+        base_url="",
+        model="gpt-5.6-luna",
+        reasoning_effort="medium",
+    )
 if member.api_key != marker:
     raise RuntimeError("wrapper retained resolved credential")
 if member._hindsight_provider_credential_marker != marker:
@@ -817,6 +841,26 @@ if member._provider_impl.api_key != secret:
     raise RuntimeError("provider did not receive resolved credential")
 if policy.match(member).id != "openai-luna":
     raise RuntimeError("provider policy no longer matches constructed member")
+from hindsight_api import config as hindsight_config
+from hindsight_api.engine.embeddings import create_embeddings_from_env
+import openai
+hindsight_config.clear_config_cache()
+embeddings = create_embeddings_from_env()
+with mock.patch.object(openai, "OpenAI", FakeOpenAI):
+    asyncio.run(embeddings.initialize())
+hindsight_config.clear_config_cache()
+if captured.get("luna", {}).get("api_key") != secret:
+    raise RuntimeError("Luna did not receive the shared credential")
+if captured.get("embeddings", {}).get("api_key") != secret:
+    raise RuntimeError("embeddings did not receive the shared credential")
+if embeddings.api_key != secret or embeddings.model != "text-embedding-3-small":
+    raise RuntimeError("embeddings model differs")
+if resolver_calls != ["api-key:hindsight-openai"]:
+    raise RuntimeError("shared credential was not resolved exactly once")
+if profile_marker != marker:
+    raise RuntimeError("persisted profile did not retain the policy marker")
+if secret in sys.argv[2]:
+    raise RuntimeError("provider policy retained the resolved credential")
 asyncio.run(member.cleanup())
 print("accepted")
 """
@@ -843,6 +887,13 @@ print("accepted")
                 "HOME": str(Path.home()),
                 "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                 "PYTHONDONTWRITEBYTECODE": "1",
+                "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai",
+                "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL": (
+                    "text-embedding-3-small"
+                ),
+                "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY": (
+                    "provider-policy:openai-luna"
+                ),
             },
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -995,6 +1046,103 @@ print("accepted")
             six_member_split_timeout_policy_data()
         )
         self.assertEqual(policy.match(luna).id, "openai-luna")
+
+    def test_openai_embeddings_and_luna_share_one_cached_api_key(self) -> None:
+        value = six_member_split_timeout_policy_data()
+        value["hindsight_version"] = "0.9.2"
+        marker = "provider-policy:openai-luna"
+        secret = "sk-test-shared-runtime-only"
+        resolver_calls: list[str] = []
+
+        def resolve_credential(locator: str) -> str:
+            resolver_calls.append(locator)
+            if len(resolver_calls) > 1:
+                raise RuntimeError("API key resolver was called more than once")
+            return secret
+
+        modules, LLMProvider, _CodexLLM, _MultiLLMProvider = (
+            self.runtime_modules()
+        )
+        adapter = HindsightProviderAdapter(
+            ProviderRuntimePolicy.load(value),
+            credential_resolver=resolve_credential,
+            version_resolver=lambda: "0.9.2",
+        )
+        environment = {
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai",
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL": (
+                "text-embedding-3-small"
+            ),
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY": marker,
+        }
+
+        adapter.prepare_openai_embeddings(environment)
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(adapter.install())
+            with mock.patch.object(
+                provider_runtime,
+                "_split_timeout",
+                return_value=1_200,
+            ):
+                luna = LLMProvider(
+                    provider="openai-responses",
+                    api_key=marker,
+                    base_url="",
+                    model="gpt-5.6-luna",
+                    reasoning_effort="medium",
+                )
+
+        self.assertEqual(
+            environment["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"],
+            secret,
+        )
+        self.assertEqual(luna._provider_impl.api_key, secret)
+        self.assertEqual(luna.api_key, marker)
+        self.assertEqual(resolver_calls, ["api-key:hindsight-openai"])
+
+    def test_openai_embeddings_binding_fails_closed_without_disclosing_values(
+        self,
+    ) -> None:
+        value = six_member_split_timeout_policy_data()
+        value["hindsight_version"] = "0.9.2"
+        adapter = HindsightProviderAdapter(
+            ProviderRuntimePolicy.load(value),
+            credential_resolver=lambda _locator: "sk-sensitive-test-value",
+            version_resolver=lambda: "0.9.2",
+        )
+        valid = {
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai",
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL": (
+                "text-embedding-3-small"
+            ),
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY": (
+                "provider-policy:openai-luna"
+            ),
+        }
+        invalid_values = {
+            "provider": {
+                **valid,
+                "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai-codex",
+            },
+            "model": {
+                **valid,
+                "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL": "sensitive-model",
+            },
+            "credential": {
+                **valid,
+                "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY": (
+                    "sk-sensitive-ambient-value"
+                ),
+            },
+        }
+
+        for label, environment in invalid_values.items():
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    ProviderRuntimeCompatibilityError
+                ) as raised:
+                    adapter.prepare_openai_embeddings(environment)
+                self.assertNotIn("sensitive", str(raised.exception))
 
     def test_managed_api_key_resolution_failure_is_redacted(self) -> None:
         modules, LLMProvider, _CodexLLM, _MultiLLMProvider = (

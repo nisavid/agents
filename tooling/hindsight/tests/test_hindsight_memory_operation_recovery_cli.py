@@ -4781,7 +4781,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         )
         self.assertEqual(
             environment["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"],
-            "8192",
+            "16384",
         )
 
         self.assertEqual(

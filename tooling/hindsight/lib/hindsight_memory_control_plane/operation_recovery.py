@@ -4092,10 +4092,25 @@ def _exact_drain_recovery_context(
         recovery epoch merely to clear evidence that the next worker can
         safely consume.
         """
+        baseline = cohort_rows[item["operation_id"]]
         retry_at = _post_abort_timestamp(item["next_retry_at"])
         return (
-            item["current_status"] == "pending"
-            and item["retry_count"] > 0
+            baseline["baseline_status"] == "pending"
+            and item["current_status"] == "pending"
+            and item["created_at"] == baseline["created_at"]
+            and item["updated_at"] > baseline["updated_at"]
+            and baseline["retry_count"] < item["retry_count"]
+            <= EXACT_DRAIN_WORKER_MAX_RETRIES
+            and item["completed_at"] is None
+            and item["worker_id_present"] is False
+            and item["worker_id_digest"] is None
+            and item["claimed_at"] is None
+            and item["task_payload_present"]
+            is baseline["task_payload_present"]
+            and item["task_payload_digest"]
+            == baseline["task_payload_digest"]
+            and item["result_metadata_digest"]
+            == baseline["result_metadata_digest"]
             and item["error_category"] in FAILURE_CAUSE_FAMILIES
             and item["error_digest"] is not None
             and retry_at is not None
@@ -4113,37 +4128,40 @@ def _exact_drain_recovery_context(
         in the signed initial projection while rejecting incomplete or future
         retry state.
         """
+        baseline = cohort_rows[item["operation_id"]]
         if (
-            item["current_status"] != "completed"
+            baseline["baseline_status"] != "pending"
+            or item["created_at"] != baseline["created_at"]
+            or item["updated_at"] < baseline["updated_at"]
+            or item["current_status"] != "completed"
             or item["completed_at"] is None
+            or item["retry_count"] < baseline["retry_count"]
+            or item["retry_count"] > EXACT_DRAIN_WORKER_MAX_RETRIES
             or item["worker_id_present"]
             != (item["worker_id_digest"] is not None)
             or item["claimed_at"] is None
             and item["worker_id_present"]
             or item["claimed_at"] is not None
             and not item["worker_id_present"]
+            or item["task_payload_present"]
+            is not baseline["task_payload_present"]
+            or item["task_payload_digest"]
+            != baseline["task_payload_digest"]
+            or item["result_metadata_digest"]
+            != baseline["result_metadata_digest"]
         ):
             return False
         retry_at = _post_abort_timestamp(item["next_retry_at"])
         if retry_at is not None and retry_at > snapshot["observed_at"]:
             return False
-        if item["retry_count"] == 0:
-            return (
-                item["next_retry_at"] is None
-                and item["error_category"] == "none"
+        return (
+            (
+                item["error_category"] == "none"
                 and item["error_digest"] is None
             )
-        return (
-            retry_at is not None
-            and (
-                (
-                    item["error_category"] == "none"
-                    and item["error_digest"] is None
-                )
-                or (
-                    item["error_category"] in FAILURE_CAUSE_FAMILIES
-                    and item["error_digest"] is not None
-                )
+            or (
+                item["error_category"] in FAILURE_CAUSE_FAMILIES
+                and item["error_digest"] is not None
             )
         )
 
@@ -4174,10 +4192,18 @@ def _exact_drain_recovery_context(
             and item["error_digest"] is not None
         )
 
+    preserved_initial_evidence_allowed = plan_schema_version >= 12
     initial_origin_valid = (
         set(snapshot_rows) == set(cohort_rows)
         and all(
-            terminal_failed_evidence_is_valid(item)
+            (
+                preserved_initial_evidence_allowed
+                and (
+                    terminal_failed_evidence_is_valid(item)
+                    or terminal_completed_evidence_is_valid(item)
+                    or initial_retry_evidence_is_valid(item)
+                )
+            )
             or (
                 item["current_status"]
                 in {
@@ -4200,15 +4226,9 @@ def _exact_drain_recovery_context(
                     (item["current_status"] == "completed")
                     == (item["completed_at"] is not None)
                 )
-                and (
-                    (
-                        item["next_retry_at"] is None
-                        and item["error_category"] == "none"
-                        and item["error_digest"] is None
-                    )
-                    or initial_retry_evidence_is_valid(item)
-                    or terminal_completed_evidence_is_valid(item)
-                )
+                and item["next_retry_at"] is None
+                and item["error_category"] == "none"
+                and item["error_digest"] is None
             )
             for item in snapshot_rows.values()
         )

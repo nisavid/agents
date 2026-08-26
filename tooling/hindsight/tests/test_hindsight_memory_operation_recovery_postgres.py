@@ -5678,12 +5678,24 @@ asyncio.run(exercise())
                     claimed_at=CLAIMED_AT,
                     error_message="provider transport failed",
                 )
+            await self._insert_operation(
+                connection,
+                "00000000-0000-4000-8000-000000000003",
+                status="failed",
+                worker_id="exact-drain-worker",
+                claimed_at=CLAIMED_AT,
+                error_message="provider transport failed",
+            )
             await connection.execute(
                 "UPDATE public.async_operations SET retry_count = 1, "
                 "next_retry_at = '2026-08-25T18:40:00Z', "
                 "error_message = 'provider transport failed' "
                 "WHERE operation_id = ANY($1::uuid[])",
                 operation_ids,
+            )
+            await connection.execute(
+                "UPDATE public.hindsight_migration_generation "
+                "SET generation = 123 WHERE singleton"
             )
             cohort_ids = [
                 f"00000000-0000-4000-8000-{index + 1:012d}"
@@ -5757,8 +5769,11 @@ asyncio.run(exercise())
             self.assertTrue(all(row["next_retry_at"] is not None for row in post))
 
         async def run():
-            async with self._postgres() as connection:
+            connection = await self._connect()
+            try:
                 await exercise(connection)
+            finally:
+                await connection.close()
 
         asyncio.run(run())
 

@@ -8898,6 +8898,7 @@ async def apply_claim_release_transaction(
                             WHERE selected.operation_id = ($1::uuid[])[1]
                         )
                           AND outside.operation_id <> ALL($1::uuid[])
+                          AND outside.status IN ('pending', 'processing')
                     ) AS outside_claim_count
                 FROM {quoted_schema}.async_operations
                 WHERE operation_id = ANY($1::uuid[])

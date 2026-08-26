@@ -367,6 +367,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
         *,
         completed_positions: set[int] | None = None,
         failed_positions: set[int] | None = None,
+        retry_pending_positions: dict[int, int] | None = None,
+        evolved_completed_positions: set[int] | None = None,
         observed_at: int = 1_785_461_000,
     ) -> dict:
         rows = operation_rows()
@@ -376,12 +378,27 @@ class OperationRecoveryContractTest(unittest.TestCase):
             else completed_positions
         )
         failed_positions = set() if failed_positions is None else failed_positions
+        retry_pending_positions = (
+            {} if retry_pending_positions is None else retry_pending_positions
+        )
+        evolved_completed_positions = (
+            set()
+            if evolved_completed_positions is None
+            else evolved_completed_positions
+        )
         if completed_positions & failed_positions:
             raise ValueError("completed and failed positions must be distinct")
+        if not evolved_completed_positions.issubset(completed_positions):
+            raise ValueError("evolved completed positions must be completed")
+        if set(retry_pending_positions) & (completed_positions | failed_positions):
+            raise ValueError("retry pending positions must remain pending")
         for index, row in enumerate(rows):
             if index in completed_positions:
                 row["status"] = "completed"
                 row["completed_at"] = "2026-07-29T13:00:02Z"
+                if index in evolved_completed_positions:
+                    row["updated_at"] = "2026-07-29T13:00:02Z"
+                    row["retry_count"] += 1
             elif index in failed_positions:
                 row["status"] = "failed"
                 row["completed_at"] = "2026-07-29T13:00:03Z"
@@ -392,6 +409,12 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 row["claimed_at"] = "2026-07-29T12:59:00.000000Z"
                 row["error_category"] = "provider_transport"
                 row["error_digest"] = f"{index + 900:064x}"
+            elif index in retry_pending_positions:
+                row["updated_at"] = "2026-07-29T12:59:00.000000Z"
+                row["retry_count"] = retry_pending_positions[index]
+                row["next_retry_at"] = "2026-07-29T12:59:30.000000Z"
+                row["error_category"] = "unknown"
+                row["error_digest"] = f"{index + 950:064x}"
         return dict(
             create_live_snapshot(
                 self.cohort(),
@@ -7829,7 +7852,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
     def test_exact_drain_plan_preserves_retry_exhausted_failures(self):
         planned_at = 1_785_462_000
-        snapshot = self.drain_snapshot(failed_positions={44, 45, 47})
+        snapshot = self.drain_snapshot(
+            failed_positions={44, 45, 47},
+            retry_pending_positions={2: 1},
+            evolved_completed_positions={0},
+        )
         plan = recovery_contract.create_exact_drain_plan(
             self.cohort(),
             snapshot,

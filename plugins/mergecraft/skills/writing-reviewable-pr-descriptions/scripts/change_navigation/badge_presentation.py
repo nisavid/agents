@@ -8,19 +8,31 @@ from urllib.parse import urlsplit
 
 from .badge_colors import validate_color_and_label
 from .categories import category_title
-from .model import SHIELD_IMAGE_RE, alt, attribute_values, raw_attribute, source, title
+from .model import (
+    CATEGORY_METRIC_SHAPE_RE,
+    LINE_METRIC_TEXT_PATTERN,
+    LINE_METRIC_TEXT_RE,
+    SHIELD_IMAGE_RE,
+    alt,
+    attribute_values,
+    parse_line_metric_counts,
+    parse_line_metric_text,
+    raw_attribute,
+    source,
+    title,
+)
 
 
 SUPPORTED_ALT_RE = re.compile(
     r"^(?:STACK|DIFF|STACK STATUS: TOP|BINARY|MOVED|COPIED|"
     r"STACK POSITION: \d+ OF \d+|"
     r"(?:BASE|DEP|NEXT): .+|"
-    r"(?:IMPL|TEST|DOC|GEN|OTHER): \d+ additions, \d+ deletions|"
+    rf"(?:IMPL|TEST|DOC|GEN|OTHER): {LINE_METRIC_TEXT_PATTERN}|"
     r"FILES: (?:\d+ touched|"
     r"\d+ (?:implementation|test|documentation|generated|other) files?|"
     r"\d+ added, \d+ modified, \d+ removed"
     r"(?:, [1-9]\d* moved)?(?:, [1-9]\d* copied)?)|"
-    r"\d+ additions, \d+ deletions)$"
+    rf"{LINE_METRIC_TEXT_PATTERN})$"
 )
 
 
@@ -29,6 +41,7 @@ def validate_shields(text: str, errors: list[str]) -> None:
         _validate_attribute_cardinality(image, errors)
         image_alt = alt(image)
         _validate_attribute_escaping(image, errors)
+        _validate_line_metric_grammar(image_alt, errors)
         if not SUPPORTED_ALT_RE.fullmatch(image_alt):
             errors.append(f"unsupported or non-uppercase shield label: {image_alt}")
         source_url = source(image)
@@ -50,12 +63,10 @@ def _validate_attribute_cardinality(image: str, errors: list[str]) -> None:
         errors.append(f"shield must have exactly one 16px height: {image_alt or image}")
 
     titles = attribute_values(image, "title")
-    category = re.fullmatch(
-        r"(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, (\d+) deletions", image_alt
-    )
+    category = CATEGORY_METRIC_SHAPE_RE.fullmatch(image_alt)
     title_required = bool(
         re.fullmatch(r"(?:BASE|DEP|NEXT): #\d+ — .+", image_alt)
-        or re.fullmatch(r"\d+ additions, \d+ deletions", image_alt)
+        or LINE_METRIC_TEXT_RE.fullmatch(image_alt)
         or image_alt in {"BINARY", "MOVED", "COPIED"}
         or category
     )
@@ -68,14 +79,24 @@ def _validate_attribute_cardinality(image: str, errors: list[str]) -> None:
 
 
 def _expected_title(image_alt: str) -> str:
-    category = re.fullmatch(
-        r"(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, (\d+) deletions", image_alt
-    )
+    category = CATEGORY_METRIC_SHAPE_RE.fullmatch(image_alt)
     if category:
         label, additions, deletions = category.groups()
         return category_title(label, int(additions), int(deletions))
     navigation = re.fullmatch(r"(?:BASE|DEP|NEXT): (#\d+ — .+)", image_alt)
     return navigation.group(1) if navigation else image_alt
+
+
+def _validate_line_metric_grammar(image_alt: str, errors: list[str]) -> None:
+    metric = (
+        image_alt.split(": ", 1)[1]
+        if CATEGORY_METRIC_SHAPE_RE.fullmatch(image_alt)
+        else image_alt
+    )
+    if parse_line_metric_counts(metric) is not None and parse_line_metric_text(metric) is None:
+        errors.append(
+            f"metric badge has ungrammatical accessibility text: {image_alt}"
+        )
 
 
 def _validate_attribute_escaping(image: str, errors: list[str]) -> None:
@@ -110,7 +131,7 @@ def _validate_shields_url(
         errors.append("shield URL must use the canonical Shields HTTPS badge endpoint")
         return
     expected_query = [("style", expected_style)]
-    if re.fullmatch(r"\d+ additions, \d+ deletions", image_alt):
+    if LINE_METRIC_TEXT_RE.fullmatch(image_alt):
         expected_query.append(("labelColor", "1A7F37"))
     actual_query = (
         []

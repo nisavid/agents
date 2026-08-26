@@ -21,8 +21,10 @@ Use this reference only while constructing or revising the first-viewport
   navigation badges.
 - Linked PR badges have matching descriptive `alt` and `title` text containing
   `#number — recognizable title`. Escape HTML special characters.
-- Atomic line badges and `BINARY`, `MOVED`, and `COPIED` badges have exactly one
-  `title` matching their `alt`. Other badges have no `title`.
+- Category badges have exactly one semantic `title` naming the category, metric,
+  and taxonomy meaning. Atomic line badges and `BINARY`, `MOVED`, and `COPIED`
+  badges have exactly one `title` matching their `alt`. Other badges have no
+  `title`.
 - Encode Shields paths canonically with uppercase percent escapes. Do not use
   alternate-but-equivalent encodings such as a raw `+` or lowercase `%2b`.
 - Use real `src`, `height`, `alt`, and `title` attributes. Attributes such as
@@ -33,9 +35,35 @@ Use this reference only while constructing or revising the first-viewport
 - Keep every summary on one source line. GitHub disclosure rendering is less
   predictable when block markup appears inside `<summary>`. Each disclosure
   contains exactly one `<summary>...</summary>` pair.
+- Start the body at byte zero with an exact full-line `<details>` opener. Each
+  navigation disclosure ends on an exact full-line `</details>` closer; do not
+  indent these tags, add attributes, change their case, put them inline, or nest
+  another full-line `<details>` inside them.
 - Render exactly one Stack disclosure when stacked and exactly one Diff
-  disclosure in every body. They form the leading `[STACK, DIFF]` or `[DIFF]`
-  prefix; unrelated disclosures may follow, but must not interrupt that prefix.
+  disclosure in every body. The complete leading grammar is `[STACK, DIFF]` or
+  `[DIFF]`. A truly empty source line separates Stack from Diff and separates
+  the final navigation disclosure from any remaining body content, including
+  raw HTML. No separator is required when the body ends at `</details>`.
+- Everything after that deterministic boundary is an opaque suffix. Do not
+  tokenize or normalize it while validating navigation; preserve its bytes
+  through the baseline-fragment contract. Unrelated disclosures may live there.
+- The Stack and Diff Shields source URLs are reserved navigation fingerprints,
+  and a full-line Markdown `Stack` heading is a reserved ambiguity signature.
+  Reject those signatures anywhere in the opaque suffix, including examples,
+  code fences, and raw HTML, rather than interpreting suffix Markdown.
+
+### Parser Scope Guard
+
+The change-navigation parser is a strict prefix recognizer, never a CommonMark
+or GFM parser. Do not add state for fences, lists, blockquotes, links, reference
+definitions, tables, HTML blocks or comments, inline code, or other suffix
+syntax. Review findings and ambiguity concerns do not authorize that expansion.
+
+When a new residual-navigation ambiguity is proven, use the smallest explicit
+byte signature that closes it and add adversarial opaque-suffix tests. If the
+requirement truly depends on Markdown semantics, stop and make a separately
+reviewed contract/dependency decision around a maintained standards-compliant
+parser. Do not build or iterate a partial Markdown parser in this skill.
 
 ## Stack Disclosure
 
@@ -45,11 +73,11 @@ Render this only for a stacked PR, immediately before Diff:
 <details>
 <summary><picture><img alt="STACK" src="https://img.shields.io/badge/STACK-57606A?style=for-the-badge" height="16"></picture>&nbsp;<picture><img alt="STACK POSITION: 2 OF 2" src="https://img.shields.io/badge/2%20OF%202-5F6B78?style=flat" height="16"></picture> <a href="https://github.com/OWNER/REPO/pull/100"><img alt="BASE: #100 — feat(api): add request contract" title="#100 — feat(api): add request contract" src="https://img.shields.io/badge/BASE-%23100-5F6B78?style=flat" height="16"></a> <picture><img alt="STACK STATUS: TOP" src="https://img.shields.io/badge/TOP-5F6B78?style=flat" height="16"></picture></summary>
 
-- **[#100 — feat(api): add request contract](https://github.com/OWNER/REPO/pull/100)**<br><picture><img alt="IMPL: 32 additions, 4 deletions" src="https://img.shields.io/badge/IMPL-%2B32%20%E2%88%924-0969DA?style=flat" height="16"></picture> <picture><img alt="TEST: 18 additions, 0 deletions" src="https://img.shields.io/badge/TEST-%2B18%20%E2%88%920-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 2 added, 1 modified, 0 removed" src="https://img.shields.io/badge/FILES-%2B2%20~1%20%E2%88%920-5F6B78?style=flat" height="16"></picture>
+- **[#100 — feat(api): add request contract](https://github.com/OWNER/REPO/pull/100)**<br><picture><img alt="IMPL: 32 additions, 4 deletions" title="Implementation: 32 additions, 4 deletions (non-test source and configuration)" src="https://img.shields.io/badge/IMPL-%2B32%20%E2%88%924-0969DA?style=flat" height="16"></picture> <picture><img alt="TEST: 18 additions, 0 deletions" title="Tests: 18 additions, 0 deletions (automated verification)" src="https://img.shields.io/badge/TEST-%2B18%20%E2%88%920-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 2 added, 1 modified, 0 removed" src="https://img.shields.io/badge/FILES-%2B2%20~1%20%E2%88%920-5F6B78?style=flat" height="16"></picture>
 
-- **[#101 — feat(web): consume request contract](https://github.com/OWNER/REPO/pull/101)** **← this PR**<br><picture><img alt="IMPL: 20 additions, 8 deletions" src="https://img.shields.io/badge/IMPL-%2B20%20%E2%88%928-0969DA?style=flat" height="16"></picture> <picture><img alt="TEST: 16 additions, 22 deletions" src="https://img.shields.io/badge/TEST-%2B16%20%E2%88%9222-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 0 added, 6 modified, 0 removed" src="https://img.shields.io/badge/FILES-%2B0%20~6%20%E2%88%920-5F6B78?style=flat" height="16"></picture>
+- **[#101 — feat(web): consume request contract](https://github.com/OWNER/REPO/pull/101)** **← this PR**<br><picture><img alt="IMPL: 9 additions, 3 deletions" title="Implementation: 9 additions, 3 deletions (non-test source and configuration)" src="https://img.shields.io/badge/IMPL-%2B9%20%E2%88%923-0969DA?style=flat" height="16"></picture> <picture><img alt="TEST: 16 additions, 22 deletions" title="Tests: 16 additions, 22 deletions (automated verification)" src="https://img.shields.io/badge/TEST-%2B16%20%E2%88%9222-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 0 added, 2 modified, 0 removed" src="https://img.shields.io/badge/FILES-%2B0%20~2%20%E2%88%920-5F6B78?style=flat" height="16"></picture>
 
-<sup>IMPL means non-test source and configuration. TEST, DOC, GEN, and OTHER are counted separately. FILES shows added, modified, and removed files as +, ~, and −.</sup>
+<sup>IMPL means non-test source and configuration. TEST means automated verification. DOC means reviewer and user documentation. GEN means generated artifacts. OTHER means files outside those categories. FILES shows added, modified, and removed files as +, ~, and −.</sup>
 
 </details>
 ```
@@ -95,32 +123,41 @@ Render this only for a stacked PR, immediately before Diff:
 ## Diff Disclosure
 
 Render this for every PR, immediately after Stack when present. Resolve the
-exact pushed base/head first; stop rather than publish when it is unavailable:
+exact pushed base tip and head, then require one unique merge base and compute
+the reviewer-visible merge-base-to-head diff. Stop rather than publish when any
+identity or the unique merge base is unavailable:
 
 ```md
 <details>
-<summary><picture><img alt="DIFF" src="https://img.shields.io/badge/DIFF-57606A?style=for-the-badge" height="16"></picture>&nbsp;<picture><img alt="IMPL: 9 additions, 3 deletions" src="https://img.shields.io/badge/IMPL-%2B9%20%E2%88%923-0969DA?style=flat" height="16"></picture> <picture><img alt="TEST: 16 additions, 22 deletions" src="https://img.shields.io/badge/TEST-%2B16%20%E2%88%9222-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 2 touched" src="https://img.shields.io/badge/FILES-2-5F6B78?style=flat" height="16"></picture></summary>
+<summary><picture><img alt="DIFF" src="https://img.shields.io/badge/DIFF-57606A?style=for-the-badge" height="16"></picture>&nbsp;<picture><img alt="IMPL: 9 additions, 3 deletions" title="Implementation: 9 additions, 3 deletions (non-test source and configuration)" src="https://img.shields.io/badge/IMPL-%2B9%20%E2%88%923-0969DA?style=flat" height="16"></picture> <picture><img alt="TEST: 16 additions, 22 deletions" title="Tests: 16 additions, 22 deletions (automated verification)" src="https://img.shields.io/badge/TEST-%2B16%20%E2%88%9222-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 2 touched" src="https://img.shields.io/badge/FILES-2-5F6B78?style=flat" height="16"></picture></summary>
 
-- <picture><img alt="IMPL: 9 additions, 3 deletions" src="https://img.shields.io/badge/IMPL-%2B9%20%E2%88%923-0969DA?style=flat" height="16"></picture> <picture><img alt="FILES: 1 implementation file" src="https://img.shields.io/badge/FILES-1-5F6B78?style=flat" height="16"></picture>
-  - [`src/widget.ts`](https://github.com/OWNER/REPO/pull/101/files#diff-PATH_HASH) <picture><img alt="9 additions, 3 deletions" title="9 additions, 3 deletions" src="https://img.shields.io/badge/%2B9-%E2%88%923-CF222E?style=flat&labelColor=1A7F37" height="16"></picture>
-- <picture><img alt="TEST: 16 additions, 22 deletions" src="https://img.shields.io/badge/TEST-%2B16%20%E2%88%9222-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 1 test file" src="https://img.shields.io/badge/FILES-1-5F6B78?style=flat" height="16"></picture>
-  - [`tests/widget.test.ts`](https://github.com/OWNER/REPO/pull/101/files#diff-PATH_HASH) <picture><img alt="16 additions, 22 deletions" title="16 additions, 22 deletions" src="https://img.shields.io/badge/%2B16-%E2%88%9222-CF222E?style=flat&labelColor=1A7F37" height="16"></picture>
+- <picture><img alt="IMPL: 9 additions, 3 deletions" title="Implementation: 9 additions, 3 deletions (non-test source and configuration)" src="https://img.shields.io/badge/IMPL-%2B9%20%E2%88%923-0969DA?style=flat" height="16"></picture> <picture><img alt="FILES: 1 implementation file" src="https://img.shields.io/badge/FILES-1-5F6B78?style=flat" height="16"></picture>
+  - [`src/widget.ts`](https://github.com/OWNER/REPO/pull/101/files#diff-c58057923cf3465c660a0574f12a0bc228e2005e0e2685a82691938232e2ac0c) <picture><img alt="9 additions, 3 deletions" title="9 additions, 3 deletions" src="https://img.shields.io/badge/%2B9-%E2%88%923-CF222E?style=flat&labelColor=1A7F37" height="16"></picture>
+- <picture><img alt="TEST: 16 additions, 22 deletions" title="Tests: 16 additions, 22 deletions (automated verification)" src="https://img.shields.io/badge/TEST-%2B16%20%E2%88%9222-6F5F9A?style=flat" height="16"></picture> <picture><img alt="FILES: 1 test file" src="https://img.shields.io/badge/FILES-1-5F6B78?style=flat" height="16"></picture>
+  - [`tests/widget.test.ts`](https://github.com/OWNER/REPO/pull/101/files#diff-e9a6bc8c53dbfc140a01d61d4ec98e6204dea1ca9f889db10c9fce8ea4786ba2) <picture><img alt="16 additions, 22 deletions" title="16 additions, 22 deletions" src="https://img.shields.io/badge/%2B16-%E2%88%9222-CF222E?style=flat&labelColor=1A7F37" height="16"></picture>
+
+<sup>IMPL means non-test source and configuration. TEST means automated verification. DOC means reviewer and user documentation. GEN means generated artifacts. OTHER means files outside those categories. FILES shows added, modified, and removed files as +, ~, and −.</sup>
 
 </details>
 ```
 
 ### Diff Semantics
 
-- Summary category totals are additions/deletions from the exact pushed PR
-  base/head. Omit categories with no changed lines. `FILES` is total touched
-  files, including binary and operation-only files.
+- Summary category totals are additions/deletions from the unique merge base to
+  the exact pushed head: the same three-dot comparison reviewers see. Preserve
+  the base-tip identity for publication leases and immutable comparison links.
+  Omit categories with no changed lines. `FILES` is total touched files,
+  including binary and operation-only files.
 - Expanded top-level items follow fixed category order. Each has the same
   category total plus the number of files included in that category. Use these
   exact descriptors: `implementation`, `test`, `documentation`, `generated`,
   and `other`, with singular `file` or plural `files`.
-- Nested items link every changed path to its actual Files changed anchor. Hash
-  the exact GitHub diff path with SHA-256 only when GitHub's anchor convention
-  is confirmed; otherwise read and verify the anchor from GitHub.
+- Nested items link every changed path to its actual Files changed anchor. The
+  current schema v3 supports only GitHub's confirmed
+  `diff-<sha256(target path)>` anchor convention. Verify rendered anchors
+  against GitHub and stop if GitHub renders another anchor. Supporting another
+  convention requires a versioned manifest field and a live GitHub observer; do
+  not guess or silently substitute it.
 - Render an ordinary path as Markdown inline code inside the link. When the
   semantic path contains a backtick, use
   `<a href="FILES_URL"><code>HTML-ESCAPED_PATH</code></a>` instead; HTML-escape
@@ -179,8 +216,9 @@ exact pushed base/head first; stop rather than publish when it is unavailable:
   presentation; one with at most 100 files must not. Place the omission record
   exactly once after every rendered category and file row, immediately before
   the taxonomy note except for blank lines. The count, repository, and
-  immutable OIDs must match, and the complete body must not exceed 65,536
-  characters.
+  immutable OIDs must match. The first-100 presentation is only a file-count
+  bound. Schema v3 has no second truncation or shortening fallback: if the
+  canonical bounded body still exceeds 65,536 characters, stop publication.
 - Shields unavailable: meaningful `alt` text must leave the summaries and file
   metrics understandable.
 

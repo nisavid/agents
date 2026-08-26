@@ -18,11 +18,12 @@ from .diff_metrics import (
     validate_file_line,
 )
 from .metrics import Metric
+from .model import COUNT_PATTERN
 
 GROUP_RE = re.compile(
-    r'^- <picture><img alt="(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, '
-    r'(\d+) deletions"[^>]*></picture> '
-    r'<picture><img alt="FILES: (\d+) '
+    rf'^- <picture><img alt="(IMPL|TEST|DOC|GEN|OTHER): ({COUNT_PATTERN}) additions?, '
+    rf'({COUNT_PATTERN}) deletions?"[^>]*></picture> '
+    rf'<picture><img alt="FILES: ({COUNT_PATTERN}) '
     r"(implementation|test|documentation|generated|other) "
     r'(file|files)"[^>]*></picture>$'
 )

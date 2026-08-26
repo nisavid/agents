@@ -29,8 +29,8 @@
         "capabilities": ["Pull Requests"],
         "websiteURL": "https://github.com/nisavid/agents/tree/main/plugins/mergecraft",
         "defaultPrompt": [
-          "Use $mergecraft:writing-reviewable-pr-descriptions to prepare the PR title and body.",
-          "Use $mergecraft:publishing-reviewable-prs to publish verified PR state.",
+          "Use $mergecraft:writing-reviewable-pr-descriptions to prepare and validate the exact PR title and body without forge mutation.",
+          "Use $mergecraft:publishing-reviewable-prs to publish a validated PR text or readiness transition through the guarded helper.",
           "Use $mergecraft:getting-prs-merged to complete the merge lifecycle."
         ]
       }

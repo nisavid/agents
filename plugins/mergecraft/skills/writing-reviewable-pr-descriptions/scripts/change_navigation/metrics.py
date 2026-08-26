@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import re
 
-from .model import ATTRIBUTE_BOUNDARY
+from .model import ATTRIBUTE_BOUNDARY, COUNT_PATTERN
 
 
 CATEGORY_METRIC_RE = re.compile(
     rf'{ATTRIBUTE_BOUNDARY}alt="(IMPL|TEST|DOC|GEN|OTHER): '
-    r'(\d+) additions, (\d+) deletions"'
+    rf'({COUNT_PATTERN}) additions?, ({COUNT_PATTERN}) deletions?"'
 )
 Metric = tuple[int, int]
 

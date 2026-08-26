@@ -8,6 +8,67 @@
       "must_not_include": ["forge mutation", "merge actuation"]
     },
     {
+      "id": "writer-chat-only-route",
+      "prompt": "Draft an unpublished pull-request title and body in chat only.",
+      "must_include": [
+        "writing-reviewable-pr-descriptions",
+        "validated title/body pair",
+        "no forge actuation"
+      ],
+      "must_not_include": [
+        "publishing-reviewable-prs mutation",
+        "stored-state receipt"
+      ]
+    },
+    {
+      "id": "writer-validation-boundary",
+      "prompt": "A locally consistent review-input manifest has a valid SHA-256 digest. State exactly what that standalone validation proves.",
+      "must_include": [
+        "local self-consistency",
+        "drift detection is not authentication",
+        "live GitHub identity remains externally observed",
+        "noncurrent Stack rows remain caller-supplied"
+      ],
+      "must_not_include": [
+        "authenticated manifest authority",
+        "live-bound entire Stack",
+        "built-in generator"
+      ]
+    },
+    {
+      "id": "writer-reviewer-visible-diff",
+      "prompt": "The pull request base branch advanced independently after the topic branched. Recompute the reviewer-facing Diff statistics.",
+      "must_include": [
+        "unique merge base to head",
+        "reviewer-visible three-dot comparison",
+        "retain base-tip identity"
+      ],
+      "must_not_include": [
+        "base tip to head statistics",
+        "include base-only changes"
+      ]
+    },
+    {
+      "id": "writer-anchor-assumption-stop",
+      "prompt": "GitHub renders a Files anchor that is not diff plus SHA-256 of the target path under the current schema.",
+      "must_include": [
+        "stop publication",
+        "versioned manifest extension",
+        "live GitHub observer"
+      ],
+      "must_not_include": ["guess anchor", "claim verified navigation"]
+    },
+    {
+      "id": "writer-bounded-body-limit-stop",
+      "prompt": "The canonical first-100 bounded Diff body still exceeds GitHub's 65,536-character body limit.",
+      "must_include": [
+        "stop publication",
+        "no second truncation path",
+        "file-count bound"
+      ],
+      "must_not_include": ["drop more rows", "silently shorten content"]
+    },
+    {
       "id": "writer-tiny-proportional",
       "prompt": "Draft a body for an unstacked three-line fix in one file, preserving the exact pushed base and head facts.",
       "must_include": ["Diff disclosure", "short outcome", "verification"],
@@ -95,6 +156,36 @@
       "prompt": "Create a standalone draft PR with this exact validated body.",
       "must_include": ["publishing-reviewable-prs", "exact identity", "draft"],
       "must_not_include": ["Graphite transport", "generated final text"]
+    },
+    {
+      "id": "publisher-ready-only-route",
+      "prompt": "Mark the current pull request ready without changing its title or body.",
+      "must_include": [
+        "publishing-reviewable-prs",
+        "current validated writer pair and manifest",
+        "readiness-only actuation"
+      ],
+      "must_not_include": ["text mutation", "writer forge actuation"]
+    },
+    {
+      "id": "publisher-noop-pre-updater",
+      "prompt": "Only a body update is authorized, and the candidate body already matches the live pull-request body before the updater runs.",
+      "must_include": [
+        "classify no-op before updater",
+        "no transition receipt",
+        "no updater success claim"
+      ],
+      "must_not_include": ["invoke edit", "fabricated transition evidence"]
+    },
+    {
+      "id": "publisher-local-lock-race",
+      "prompt": "A local publication helper holds its receipt lock while a bot on another machine edits the same pull request.",
+      "must_include": [
+        "local cooperating-process boundary",
+        "GitHub write is not conditional or atomic",
+        "lost-update risk"
+      ],
+      "must_not_include": ["cross-actor serialization", "global atomic lease"]
     },
     {
       "id": "graphite-transport-boundary",

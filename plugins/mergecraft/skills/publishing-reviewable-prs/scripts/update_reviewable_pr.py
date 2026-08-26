@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -243,22 +244,28 @@ def _update_text_locked(
         raise PublicationError("PR state changed during required-review validation")
     before = final_before
     command_error: PublicationError | None = None
-    with _write_temporary_body(body) as body_file:
+    body_context = (
+        nullcontext(None)
+        if text_scope == "title-only"
+        else _write_temporary_body(body)
+    )
+    with body_context as body_file:
+        command = [
+            "gh",
+            "-R",
+            github_repository(expected.repository),
+            "pr",
+            "edit",
+            str(expected.pr_number),
+        ]
+        if text_scope in {"title-only", "title-body"}:
+            command.extend(["--title", title])
+        if text_scope in {"body-only", "title-body"}:
+            if body_file is None:
+                raise PublicationError("body-scoped edit lost its body snapshot")
+            command.extend(["--body-file", body_file.name])
         try:
-            _run_mutation(
-                [
-                    "gh",
-                    "-R",
-                    github_repository(expected.repository),
-                    "pr",
-                    "edit",
-                    str(expected.pr_number),
-                    "--title",
-                    title,
-                    "--body-file",
-                    body_file.name,
-                ]
-            )
+            _run_mutation(command)
         except PublicationError as error:
             command_error = error
     after = _stored_pr(expected.repository, expected.pr_number)

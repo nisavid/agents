@@ -225,7 +225,9 @@ class NavigationIntegrityTests(unittest.TestCase):
             any("visual badge" in error for error in MODULE.validate(broken))
         )
 
-    def test_rejects_anchor_that_does_not_match_path(self) -> None:
+    def test_rejects_observed_noncanonical_anchor_instead_of_claiming_verified(
+        self,
+    ) -> None:
         anchor_start = DIFF.index("#diff-") + len("#diff-")
         broken = DIFF[:anchor_start] + "0" * 64 + DIFF[anchor_start + 64 :]
         self.assertTrue(
@@ -368,7 +370,7 @@ class NavigationIntegrityTests(unittest.TestCase):
             any("must use file" in error for error in MODULE.validate(broken))
         )
 
-    def test_ignores_badges_in_a_later_unrelated_disclosure(self) -> None:
+    def test_accepts_badges_in_a_later_unrelated_disclosure(self) -> None:
         unrelated = (
             "<details>\n<summary>Extra</summary>\n"
             '<picture><img alt="EXTRA" src="https://img.shields.io/badge/EXTRA-red">'
@@ -376,13 +378,19 @@ class NavigationIntegrityTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.validate(DIFF + unrelated), [])
 
+    def test_rejects_documented_navigation_signature_in_opaque_suffix(self) -> None:
         documented_navigation = (
             "<details>\n<summary>Navigation markup example</summary>\n"
             "```html\n"
             + badge("DIFF", "DIFF-57606A", style="for-the-badge")
             + "\n```\n</details>\n"
         )
-        self.assertEqual(MODULE.validate(DIFF + documented_navigation), [])
+        self.assertTrue(
+            any(
+                "reserved navigation fingerprint" in error
+                for error in MODULE.validate(DIFF + documented_navigation)
+            )
+        )
 
     def test_rejects_interposed_or_later_change_navigation_disclosures(self) -> None:
         unrelated = "<details>\n<summary>Extra</summary>\nExtra\n</details>\n"
@@ -403,9 +411,16 @@ class NavigationIntegrityTests(unittest.TestCase):
                     )
                 )
 
-    def test_ignores_change_navigation_markup_inside_a_code_fence(self) -> None:
+    def test_rejects_reserved_change_navigation_markup_inside_a_code_fence(
+        self,
+    ) -> None:
         example = "```md\n" + STACK + "```\n"
-        self.assertEqual(MODULE.validate(DIFF + example), [])
+        self.assertTrue(
+            any(
+                "reserved navigation fingerprint" in error
+                for error in MODULE.validate(DIFF + example)
+            )
+        )
 
     def test_accepts_edited_move_with_old_and_new_path(self) -> None:
         file_line = next(
@@ -567,7 +582,7 @@ class NavigationIntegrityTests(unittest.TestCase):
             ],
         )
         diff = DIFF.replace("/pull/2/files", "/pull/3/files")
-        errors = MODULE._validate_markup(stack + diff, "acme/app", 3)
+        errors = MODULE._validate_markup(stack + "\n" + diff, "acme/app", 3)
         self.assertTrue(any("any Stack inventory PR" in error for error in errors))
 
     def test_rejects_bottom_base_that_points_into_stack(self) -> None:
@@ -591,7 +606,7 @@ class NavigationIntegrityTests(unittest.TestCase):
             ],
         )
         diff = DIFF.replace("/pull/2/files", "/pull/1/files")
-        errors = MODULE._validate_markup(stack + diff, "acme/app", 1)
+        errors = MODULE._validate_markup(stack + "\n" + diff, "acme/app", 1)
         self.assertTrue(any("outside the Stack inventory" in error for error in errors))
 
     def test_requires_bottom_pr_base_to_link_to_its_pr(self) -> None:
@@ -619,7 +634,7 @@ class NavigationIntegrityTests(unittest.TestCase):
             ],
         )
         diff = DIFF.replace("/pull/2/files", "/pull/1/files")
-        errors = MODULE._validate_markup(stack + diff, "acme/app", 1)
+        errors = MODULE._validate_markup(stack + "\n" + diff, "acme/app", 1)
         self.assertTrue(any("PR-valued BASE must link" in error for error in errors))
 
     def test_accepts_unlinked_branch_base_on_bottom_pr(self) -> None:
@@ -643,7 +658,10 @@ class NavigationIntegrityTests(unittest.TestCase):
             ],
         )
         diff = DIFF.replace("/pull/2/files", "/pull/1/files")
-        self.assertEqual(MODULE._validate_markup(stack + diff, "acme/app", 1), [])
+        self.assertEqual(
+            MODULE._validate_markup(stack + "\n" + diff, "acme/app", 1),
+            [],
+        )
 
     def test_accepts_stack_move_and_copy_counts_in_alt_and_visual(self) -> None:
         broken = STACK.replace(

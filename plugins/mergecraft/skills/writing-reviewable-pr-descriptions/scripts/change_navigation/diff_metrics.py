@@ -7,7 +7,13 @@ import re
 from dataclasses import dataclass
 from html import escape, unescape
 
-from .model import ATOMIC_FILE_BADGE_RE, SHIELD_IMAGE_RE, alt, title
+from .model import (
+    ATOMIC_FILE_BADGE_RE,
+    SHIELD_IMAGE_RE,
+    alt,
+    parse_line_metric_text,
+    title,
+)
 from .urls import parse_github_url
 
 
@@ -283,11 +289,15 @@ def validate_metric_titles(
             )
             continue
         if atomic_match:
-            expected = (
-                f"{atomic_match.group(1)} additions, {atomic_match.group(2)} deletions"
-            )
-            if badge_alt != expected:
+            expected = (int(atomic_match.group(1)), int(atomic_match.group(2)))
+            observed = parse_line_metric_text(badge_alt)
+            if observed is None:
+                errors.append(
+                    f"Diff file metric {line_number} has ungrammatical "
+                    "accessibility text"
+                )
+            elif observed != expected:
                 errors.append(
                     f"Diff file metric {line_number} accessibility text must "
-                    f"match {expected}"
+                    f"match its +{expected[0]} −{expected[1]} visual metrics"
                 )

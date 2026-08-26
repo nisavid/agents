@@ -6,6 +6,7 @@ import re
 from urllib.parse import quote, unquote, urlsplit
 
 from .categories import CATEGORY_COLORS
+from .model import CATEGORY_METRIC_SHAPE_RE, LINE_METRIC_COUNT_SHAPE_RE
 
 
 EXPECTED_BADGE_COLORS = {
@@ -33,10 +34,7 @@ def _raw_badge_path(source_url: str) -> str:
 def _expected_badge_path(image_alt: str) -> str | None:  # noqa: C901
     if image_alt in {"STACK", "DIFF"}:
         return f"{image_alt}-57606A"
-    category = re.fullmatch(
-        r"(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, (\d+) deletions",
-        image_alt,
-    )
+    category = CATEGORY_METRIC_SHAPE_RE.fullmatch(image_alt)
     if category:
         label, additions, deletions = category.groups()
         return f"{label}-+{additions} −{deletions}-{EXPECTED_BADGE_COLORS[label]}"
@@ -73,7 +71,7 @@ def _expected_badge_path(image_alt: str) -> str | None:  # noqa: C901
         return "TOP-5F6B78"
     if image_alt in {"BINARY", "MOVED", "COPIED"}:
         return f"{image_alt}-5F6B78"
-    atomic = re.fullmatch(r"(\d+) additions, (\d+) deletions", image_alt)
+    atomic = LINE_METRIC_COUNT_SHAPE_RE.fullmatch(image_alt)
     if atomic:
         return f"+{atomic.group(1)}-−{atomic.group(2)}-CF222E"
     return None

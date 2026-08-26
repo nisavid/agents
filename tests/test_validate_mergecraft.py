@@ -237,6 +237,202 @@ class ValidateMergecraftTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("summary category badges", result.stderr)
 
+    def test_change_navigation_examples_satisfy_the_production_validator(
+        self,
+    ) -> None:
+        navigation = (
+            self.plugin
+            / "skills/writing-reviewable-pr-descriptions/references/change-navigation.md"
+        ).read_text(encoding="utf-8")
+
+        VALIDATE_MERGECRAFT.validate_change_navigation_reference_example(
+            navigation,
+            self.plugin,
+        )
+
+    def test_change_navigation_example_validation_timeout_is_contextual(self) -> None:
+        navigation = (
+            self.plugin
+            / "skills/writing-reviewable-pr-descriptions/references/change-navigation.md"
+        ).read_text(encoding="utf-8")
+
+        with mock.patch.object(
+            VALIDATE_MERGECRAFT.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["python"], 30),
+        ):
+            with self.assertRaisesRegex(
+                VALIDATE_MERGECRAFT.ContractError,
+                "production validation timed out",
+            ):
+                VALIDATE_MERGECRAFT.validate_change_navigation_reference_example(
+                    navigation,
+                    self.plugin,
+                )
+
+    def test_publisher_actuation_fixtures_bind_exact_head_repository(self) -> None:
+        fixture = self.repo / EVAL_ROOT / (
+            "skills/publishing-reviewable-prs/fixtures/ready-state-only.md"
+        )
+        fixture.write_text(
+            fixture.read_text(encoding="utf-8").replace(
+                "- Head repository: `alice/widgets`\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATE_MERGECRAFT.ContractError,
+            "publisher actuation fixture identity drift",
+        ):
+            VALIDATE_MERGECRAFT.validate_raw_skill_eval_isolation(self.repo)
+
+    def test_rejects_change_navigation_example_missing_required_category_title(
+        self,
+    ) -> None:
+        path = self.plugin / (
+            "skills/writing-reviewable-pr-descriptions/references/change-navigation.md"
+        )
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                ' title="Implementation: 32 additions, 4 deletions '
+                '(non-test source and configuration)"',
+                "",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        self.assert_rejected("change-navigation reference example")
+
+    def test_rejects_change_navigation_example_with_noncanonical_taxonomy(
+        self,
+    ) -> None:
+        path = self.plugin / (
+            "skills/writing-reviewable-pr-descriptions/references/change-navigation.md"
+        )
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "TEST means automated verification.",
+                "TEST means tests.",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        self.assert_rejected("change-navigation reference example")
+
+    def test_rejects_change_navigation_example_with_stack_diff_aggregate_drift(
+        self,
+    ) -> None:
+        path = self.plugin / (
+            "skills/writing-reviewable-pr-descriptions/references/change-navigation.md"
+        )
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "IMPL: 9 additions, 3 deletions",
+                "IMPL: 10 additions, 3 deletions",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        self.assert_rejected("change-navigation reference example")
+
+    def test_resynced_writer_and_publisher_boundaries_are_explicit(self) -> None:
+        writer = (
+            self.plugin / "skills/writing-reviewable-pr-descriptions/SKILL.md"
+        ).read_text(encoding="utf-8")
+        navigation = (
+            self.plugin
+            / "skills/writing-reviewable-pr-descriptions/references/change-navigation.md"
+        ).read_text(encoding="utf-8")
+        publisher = (
+            self.plugin / "skills/publishing-reviewable-prs/SKILL.md"
+        ).read_text(encoding="utf-8")
+        normalized_writer = " ".join(writer.split())
+        normalized_navigation = " ".join(navigation.split())
+        normalized_publisher = " ".join(publisher.split())
+
+        for requirement in (
+            "standalone validation proves manifest, body, and local Git self-consistency",
+            "does not prove the live pull request identity",
+            "detects content drift; it does not authenticate the manifest's source",
+            "Noncurrent Stack rows remain caller-supplied observations",
+            "deterministic body generator, pathname classifier, Stack-discovery adapter, GitHub observer, or GitHub Action",
+            "The first-100 presentation is a file-count bound, not a body-size guarantee",
+        ):
+            self.assertIn(requirement, normalized_writer)
+        for requirement in (
+            "schema v3 supports only GitHub's confirmed `diff-<sha256(target path)>` anchor convention",
+            "stop if GitHub renders another anchor",
+        ):
+            self.assertIn(requirement, normalized_navigation)
+        for requirement in (
+            "serializes only cooperating processes that share the same local receipt root",
+            "does not serialize another machine, user, bot, automation, or GitHub actor",
+            "Classify an unchanged candidate as `no-op` before invoking the updater",
+            "not updater success",
+        ):
+            self.assertIn(requirement, normalized_publisher)
+
+    def test_resynced_writer_and_publisher_evals_are_retained(self) -> None:
+        expected = {
+            "writing-reviewable-pr-descriptions": {
+                "chat-only-draft.md",
+                "command-envelope-stack.md",
+                "config-loader-precedence.md",
+                "documentation-flag-correction.md",
+                "preview-server-port-selection.md",
+                "provider-plugin-framework.md",
+            },
+            "publishing-reviewable-prs": {
+                "body-only-preservation.md",
+                "chat-only-draft-near-miss.md",
+                "existing-pr-text-update.md",
+                "new-draft-pr.md",
+                "read-only-inspection-near-miss.md",
+                "ready-state-only.md",
+            },
+        }
+        for skill, fixtures in expected.items():
+            root = self.repo / EVAL_ROOT / "skills" / skill
+            with self.subTest(skill=skill):
+                self.assertTrue((root / "evals.json").is_file())
+                self.assertTrue((root / "trigger-evals.json").is_file())
+                self.assertEqual(
+                    {path.name for path in (root / "fixtures").glob("*.md")},
+                    fixtures,
+                )
+
+    def test_rejects_writer_publisher_trigger_complement_drift(self) -> None:
+        relative = (
+            "skills/writing-reviewable-pr-descriptions/trigger-evals.json"
+        )
+        document = json.loads((self.repo / EVAL_ROOT / relative).read_text())
+        chat_only = next(
+            item
+            for item in document
+            if item["query"]
+            == "Draft a better pull request title and body here in chat. "
+            "Do not change GitHub."
+        )
+        chat_only["should_trigger"] = False
+        self.write_eval_json(relative, document)
+
+        self.assert_rejected("writer/publisher trigger complement drift")
+
+    def test_rejects_nonboolean_trigger_eval_result(self) -> None:
+        relative = "skills/publishing-reviewable-prs/trigger-evals.json"
+        document = json.loads((self.repo / EVAL_ROOT / relative).read_text())
+        document[0]["should_trigger"] = 1
+        self.write_eval_json(relative, document)
+
+        self.assert_rejected(
+            "trigger eval schema drift: publishing-reviewable-prs"
+        )
+
     def test_rejects_non_finite_json_at_any_boundary(self) -> None:
         path = self.plugin / "plugin.json"
         for constant in ("NaN", "Infinity", "-Infinity"):
@@ -1081,7 +1277,7 @@ class ValidateMergecraftTests(unittest.TestCase):
         # Review each changed artifact against its owning sources before updating them.
         expected_digests = {
             "review-atlas-contract.json": (
-                "d8f1f44707134a9546f444751688af067b5f7f640ff6d39f17c8c7e18bdf30c2"
+                "931e2b16e14aace65fffbba4bd4affe0e682268c1b6f59850d7b8d02b9e3ee57"
             ),
             "review-atlas-contribution-ledger.json": (
                 "5804803a8abb18e26c2b7700670d036aadf6d44cab2b0457f7b8a69e1a9e0046"

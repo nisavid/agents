@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1996,6 +1997,78 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                 )
         run.assert_not_called()
 
+    def test_body_only_write_does_not_send_title_to_github(self) -> None:
+        desired_path = self.desired_body_path()
+        desired = desired_path.read_text(encoding="utf-8")
+        after = self.stored(body=desired)
+        with (
+            mock.patch.object(UPDATE, "_validate_body"),
+            mock.patch.object(
+                UPDATE,
+                "_stored_pr",
+                side_effect=[self.stored(), self.stored(), after],
+            ),
+            mock.patch.object(
+                UPDATE,
+                "_run_mutation",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
+        ):
+            UPDATE.update_text(
+                expected=self.expected,
+                expected_title_sha256=self.digest(self.title),
+                expected_body_sha256=self.digest(self.body),
+                expected_draft=True,
+                title=self.title,
+                body_path=desired_path,
+                review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
+                receipt_directory=self.receipt_directory,
+                text_scope="body-only",
+            )
+
+        command = run.call_args.args[0]
+        self.assertNotIn("--title", command)
+        self.assertIn("--body-file", command)
+
+    def test_title_only_write_does_not_send_body_to_github(self) -> None:
+        body_path = Path(self.temporary_directory.name) / "same-body.md"
+        body_path.write_text(self.body, encoding="utf-8")
+        after = self.stored(title="feat: authorized title")
+        with (
+            mock.patch.object(UPDATE, "_validate_body"),
+            mock.patch.object(
+                UPDATE,
+                "_stored_pr",
+                side_effect=[self.stored(), self.stored(), after],
+            ),
+            mock.patch.object(
+                UPDATE,
+                "_run_mutation",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
+        ):
+            UPDATE.update_text(
+                expected=self.expected,
+                expected_title_sha256=self.digest(self.title),
+                expected_body_sha256=self.digest(self.body),
+                expected_draft=True,
+                title="feat: authorized title",
+                body_path=body_path,
+                review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
+                receipt_directory=self.receipt_directory,
+                text_scope="title-only",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--title", command)
+        self.assertNotIn("--body-file", command)
+
     def test_text_command_error_never_mints_canonical_provenance(self) -> None:
         desired_path = self.desired_body_path()
         after = self.stored(body=desired_path.read_text())
@@ -3083,6 +3156,56 @@ class PublicationReceiptTests(ReviewablePrFixture):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("--receipt-directory", result.stdout)
+
+    def test_relocated_writer_publisher_duo_loads_without_installed_projection(
+        self,
+    ) -> None:
+        source_skills = SCRIPTS.parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            skills = Path(temporary) / "relocated bundle" / "skills"
+            skills.mkdir(parents=True)
+            for skill in (
+                "writing-reviewable-pr-descriptions",
+                "publishing-reviewable-prs",
+            ):
+                shutil.copytree(
+                    source_skills / skill,
+                    skills / skill,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+            environment = {
+                "PATH": os.defpath,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            for script in (
+                skills
+                / "writing-reviewable-pr-descriptions/scripts/"
+                "validate_change_navigation.py",
+                skills
+                / "publishing-reviewable-prs/scripts/create_reviewable_pr.py",
+                skills
+                / "publishing-reviewable-prs/scripts/update_reviewable_pr.py",
+                skills
+                / "publishing-reviewable-prs/scripts/audit_reviewable_pr.py",
+            ):
+                result = subprocess.run(
+                    [sys.executable, "-E", "-S", "-B", str(script), "--help"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    cwd=temporary,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(
+                (
+                    skills
+                    / "publishing-reviewable-prs/scripts/"
+                    "literal_create_reviewable_pr.py"
+                ).exists()
+            )
 
     def test_oid_epoch_rollover_preserves_history_and_latest_authority(self) -> None:
         old_state = self.stored(title="old epoch")

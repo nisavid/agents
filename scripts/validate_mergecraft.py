@@ -134,6 +134,22 @@ MERGE_EVAL_FIXTURES = (
     "review-only-near-miss.md",
 )
 RAW_SKILL_EVAL_FIXTURES = {
+    "writing-reviewable-pr-descriptions": (
+        "documentation-flag-correction.md",
+        "preview-server-port-selection.md",
+        "command-envelope-stack.md",
+        "provider-plugin-framework.md",
+        "chat-only-draft.md",
+        "config-loader-precedence.md",
+    ),
+    "publishing-reviewable-prs": (
+        "existing-pr-text-update.md",
+        "new-draft-pr.md",
+        "ready-state-only.md",
+        "chat-only-draft-near-miss.md",
+        "read-only-inspection-near-miss.md",
+        "body-only-preservation.md",
+    ),
     "graphite": ("latest-publication-receipt-drift.md",),
     "interacting-with-pr-review-feedback": (
         "authorized-reply-and-resolution-boundary.md",
@@ -155,6 +171,14 @@ RAW_SKILL_EVAL_FIXTURES = {
         "latest-publication-receipt-drift.md",
     ),
 }
+PUBLISHER_ACTUATION_EVAL_FIXTURES = frozenset(
+    {
+        "existing-pr-text-update.md",
+        "new-draft-pr.md",
+        "ready-state-only.md",
+        "body-only-preservation.md",
+    }
+)
 TERMINAL_INTERNAL_OPERATIONS = {"focused-ci"}
 TERMINAL_OPERATION_HANDOFFS = {"focused-ci", "remote-ref-deletion"}
 GITHUB_ALIAS_ACCESS = {
@@ -231,11 +255,12 @@ EXPECTED_SKILL_FILES = {
 }
 CODEX_PROMPTS = {
     "writing-reviewable-pr-descriptions": (
-        "Use $mergecraft:writing-reviewable-pr-descriptions to prepare the "
-        "exact PR title and body."
+        "Use $mergecraft:writing-reviewable-pr-descriptions to prepare and "
+        "validate the exact PR title and body without forge mutation."
     ),
     "publishing-reviewable-prs": (
-        "Use $mergecraft:publishing-reviewable-prs to publish exact PR state."
+        "Use $mergecraft:publishing-reviewable-prs to publish a validated PR "
+        "text or readiness transition through the guarded helper."
     ),
     "graphite": "Use $mergecraft:graphite to manage this Graphite stack.",
     "addressing-pr-review-feedback": (
@@ -261,10 +286,13 @@ CODEX_PROMPTS = {
 }
 MANIFEST_PROMPTS = [
     (
-        "Use $mergecraft:writing-reviewable-pr-descriptions to prepare the PR "
-        "title and body."
+        "Use $mergecraft:writing-reviewable-pr-descriptions to prepare and "
+        "validate the exact PR title and body without forge mutation."
     ),
-    "Use $mergecraft:publishing-reviewable-prs to publish verified PR state.",
+    (
+        "Use $mergecraft:publishing-reviewable-prs to publish a validated PR "
+        "text or readiness transition through the guarded helper."
+    ),
     "Use $mergecraft:getting-prs-merged to complete the merge lifecycle.",
 ]
 ORIGINAL_ATLAS_HEADINGS = {
@@ -429,6 +457,11 @@ EXPECTED_ATLAS_CONTRIBUTIONS = [
 ]
 BEHAVIOR_SCENARIO_IDS = {
     "writer-owns-content",
+    "writer-chat-only-route",
+    "writer-validation-boundary",
+    "writer-reviewer-visible-diff",
+    "writer-anchor-assumption-stop",
+    "writer-bounded-body-limit-stop",
     "writer-tiny-proportional",
     "writer-ordinary-proportional",
     "writer-stacked-navigation",
@@ -437,6 +470,9 @@ BEHAVIOR_SCENARIO_IDS = {
     "writer-visual-not-needed",
     "writer-exceptional-atlas",
     "publisher-owns-actuation",
+    "publisher-ready-only-route",
+    "publisher-noop-pre-updater",
+    "publisher-local-lock-race",
     "graphite-transport-boundary",
     "feedback-natural-reply",
     "resume-selects-one-owner",
@@ -476,9 +512,9 @@ ATLAS_EXTENSION_CONTRACT = {
 }
 EXPECTED_ATLAS_PROSE_SHA256 = {
     "design": "23b642b37ced3407c84ad2b1ca6da430d95dd68a674f7daceede3a1b297af441",
-    "writer": "c29521dd91805e53fcf26ef429e13555cc17b61caf7e1f87e30d2c6871e43686",
-    "body": "3c59ae1b4ec197b0cd4c41624a39c597744bea4fd5333b1ed81e7f2c8d6753c4",
-    "navigation": "c748a6c555374fa72022e49446f489f8c5477da4fae799bbb15a854a23f6c27c",
+    "writer": "db848932da6f2c5bb6f4c1270cf8c5d5fc4f5ad182104064a62a64d62e092f61",
+    "body": "4b1b754b546f7740ca56d865ebc52cb34fa17663e68d8ede51e534a3b582a799",
+    "navigation": "a619b2292831ef56f8f991dd761b60b211389b2a2cf649b67b9624d228ef8cec",
 }
 RELEASE_VERSION = "1.0.0"
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -1598,16 +1634,27 @@ def validate_atlas_release_tree(repo_root: Path) -> None:
     )
 
 
-def validate_change_navigation_reference_example(navigation: str) -> None:
-    """Reject a documentation example whose declared change totals disagree."""
+def validate_change_navigation_reference_example(
+    navigation: str,
+    root: Path,
+) -> None:
+    """Reject documentation examples that the production validator rejects."""
+    stack_match = re.search(
+        r"## Stack Disclosure\n.*?```md\n(?P<example>.*?)\n```",
+        navigation,
+        re.DOTALL,
+    )
     example_match = re.search(
         r"## Diff Disclosure\n.*?```md\n(?P<example>.*?)\n```",
         navigation,
         re.DOTALL,
     )
     require(
-        example_match is not None,
-        "change-navigation reference example is missing",
+        stack_match is not None and example_match is not None,
+        "change-navigation reference examples are missing",
+    )
+    combined_example = (
+        stack_match.group("example") + "\n\n" + example_match.group("example")
     )
     example = example_match.group("example")
     summary_match = re.search(r"<summary>(?P<summary>.*?)</summary>", example)
@@ -1707,6 +1754,44 @@ def validate_change_navigation_reference_example(navigation: str) -> None:
     require(
         len(observed_paths) == int(summary_files_match.group("count")),
         "change-navigation reference example touched-file total disagrees with files",
+    )
+    validator_directory = (
+        root / "skills/writing-reviewable-pr-descriptions/scripts"
+    )
+    validation_program = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from validate_change_navigation import _validate_markup
+
+errors = _validate_markup(sys.stdin.read(), "OWNER/REPO", 101)
+if errors:
+    raise SystemExit("\\n".join(errors))
+"""
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                validation_program,
+                str(validator_directory),
+            ],
+            cwd=root,
+            input=combined_example,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ContractError(
+            "change-navigation reference production validation timed out"
+        ) from error
+    require(
+        result.returncode == 0,
+        "change-navigation reference example fails production validation: "
+        + (result.stderr.strip() or result.stdout.strip() or "unknown error"),
     )
 
 
@@ -1896,7 +1981,7 @@ def validate_atlas_split(repo_root: Path, root: Path) -> None:
     )
     normalized_writer = " ".join(writer.split())
     normalized_navigation = " ".join(navigation.split())
-    validate_change_navigation_reference_example(navigation)
+    validate_change_navigation_reference_example(navigation, root)
     require(
         "[atlas extension contract](references/review-atlas-extension.json)" in writer,
         "atlas extension contract is not linked from the writer",
@@ -2456,9 +2541,38 @@ def validate_raw_skill_eval_isolation(repo_root: Path) -> None:
                 ),
                 f"raw eval prose drift: {skill}",
             )
-            fixture_body = read_repository_file(
+            fixture_text = read_repository_file(
                 repo_root, EVAL_RELATIVE / f"skills/{fixture}"
-            ).lower()
+            )
+            fixture_body = fixture_text.lower()
+            if (
+                skill == "publishing-reviewable-prs"
+                and fixture_name in PUBLISHER_ACTUATION_EVAL_FIXTURES
+            ):
+                head = re.search(
+                    r"^- Head: `(?P<owner>[^`:/\s]+):[^`\s]+` at `[0-9a-f]{40}`$",
+                    fixture_text,
+                    re.MULTILINE,
+                )
+                owner = re.search(
+                    r"^- Head owner: `(?P<owner>[^`/\s]+)`$",
+                    fixture_text,
+                    re.MULTILINE,
+                )
+                repository = re.search(
+                    r"^- Head repository: `(?P<owner>[^`/\s]+)/[^`/\s]+`$",
+                    fixture_text,
+                    re.MULTILINE,
+                )
+                require(
+                    head is not None
+                    and owner is not None
+                    and repository is not None
+                    and head.group("owner")
+                    == owner.group("owner")
+                    == repository.group("owner"),
+                    f"publisher actuation fixture identity drift: {fixture_name}",
+                )
             for marker in (
                 "expected behavior",
                 "expected_output",
@@ -2471,6 +2585,74 @@ def validate_raw_skill_eval_isolation(repo_root: Path) -> None:
                     marker not in fixture_body,
                     f"raw eval grader answer leaked into fixture: {skill}",
                 )
+
+
+def validate_writer_publisher_trigger_evals(repo_root: Path) -> None:
+    trigger_maps: dict[str, dict[str, bool]] = {}
+    for skill in (
+        "writing-reviewable-pr-descriptions",
+        "publishing-reviewable-prs",
+    ):
+        relative = EVAL_RELATIVE / f"skills/{skill}/trigger-evals.json"
+        document = load_repository_json(repo_root, relative)
+        require(
+            isinstance(document, list) and document,
+            f"trigger eval coverage drift: {skill}",
+        )
+        observed: dict[str, bool] = {}
+        for item in document:
+            require(
+                isinstance(item, dict)
+                and set(item) == {"query", "should_trigger"}
+                and isinstance(item["query"], str)
+                and item["query"]
+                and type(item["should_trigger"]) is bool
+                and item["query"] not in observed,
+                f"trigger eval schema drift: {skill}",
+            )
+            observed[item["query"]] = item["should_trigger"]
+        require(
+            {True, False} <= set(observed.values()),
+            f"trigger eval polarity drift: {skill}",
+        )
+        trigger_maps[skill] = observed
+
+    writer = trigger_maps["writing-reviewable-pr-descriptions"]
+    publisher = trigger_maps["publishing-reviewable-prs"]
+    require(
+        set(publisher) <= set(writer),
+        "writer/publisher trigger query coverage drift",
+    )
+    writer_only = {query: writer[query] for query in set(writer) - set(publisher)}
+    require(
+        writer_only
+        == {
+            (
+                "Propose a reviewer-facing title and body for this pushed branch "
+                "and show them here in chat. Do not create the pull request."
+            ): True
+        },
+        "writer-only trigger routing drift",
+    )
+    differences = {
+        query: (writer[query], publisher[query])
+        for query in publisher
+        if writer[query] != publisher[query]
+    }
+    require(
+        differences
+        == {
+            (
+                "Draft a better pull request title and body here in chat. "
+                "Do not change GitHub."
+            ): (True, False),
+            (
+                "The stored title and body are already current. Mark pull request "
+                "#84 ready for review without rewriting them."
+            ): (False, True),
+        },
+        "writer/publisher trigger complement drift",
+    )
 
 
 CANDIDATE_RUNTIME_PROBE = r'''
@@ -3040,6 +3222,8 @@ with tempfile.TemporaryDirectory() as raw_directory:
         "    print('topic')\n"
         "elif command[:2] == ['cat-file', '-e']:\n"
         "    pass\n"
+        "elif command[:2] == ['merge-base', '--all']:\n"
+        "    print('a' * 40)\n"
         "elif command[:2] == ['status', '--porcelain=v1']:\n"
         "    pass\n"
         "elif command[:2] == ['diff', '--numstat']:\n"
@@ -3554,6 +3738,10 @@ def validate_runtime_contracts(root: Path) -> None:
         root,
         "skills/writing-reviewable-pr-descriptions/references/body-contract.md",
     )
+    navigation = read(
+        root,
+        "skills/writing-reviewable-pr-descriptions/references/change-navigation.md",
+    )
     publisher = read(root, "skills/publishing-reviewable-prs/SKILL.md")
     feedback_skill = read(root, "skills/addressing-pr-review-feedback/SKILL.md")
     ci_adapter = read(
@@ -3566,6 +3754,8 @@ def validate_runtime_contracts(root: Path) -> None:
     )
     normalized_writer = " ".join(writer.split())
     normalized_body_contract = " ".join(body_contract.split())
+    normalized_navigation = " ".join(navigation.split())
+    normalized_publisher = " ".join(publisher.split())
     normalized_ci_adapter = " ".join(ci_adapter.split())
     normalized_merge_actuator = " ".join(merge_actuator.split())
     require(
@@ -3585,6 +3775,44 @@ def validate_runtime_contracts(root: Path) -> None:
         and "no forge or source authority" in normalized_writer,
         "writer independent review gate drift",
     )
+    for requirement in (
+        "standalone validation proves manifest, body, and local Git self-consistency",
+        "does not prove the live pull request identity",
+        "detects content drift; it does not authenticate the manifest's source",
+        "Noncurrent Stack rows remain caller-supplied observations",
+        (
+            "deterministic body generator, pathname classifier, Stack-discovery "
+            "adapter, GitHub observer, or GitHub Action"
+        ),
+        "The first-100 presentation is a file-count bound, not a body-size guarantee",
+    ):
+        require(
+            requirement in normalized_writer,
+            f"writer reconciliation boundary drift: {requirement}",
+        )
+    for requirement in (
+        (
+            "schema v3 supports only GitHub's confirmed "
+            "`diff-<sha256(target path)>` anchor convention"
+        ),
+        "stop if GitHub renders another anchor",
+        "unique merge base to the exact pushed head",
+        "no second truncation or shortening fallback",
+    ):
+        require(
+            requirement in normalized_navigation,
+            f"writer navigation boundary drift: {requirement}",
+        )
+    for requirement in (
+        "serializes only cooperating processes that share the same local receipt root",
+        "does not serialize another machine, user, bot, automation, or GitHub actor",
+        "Classify an unchanged candidate as `no-op` before invoking the updater",
+        "not updater success",
+    ):
+        require(
+            requirement in normalized_publisher,
+            f"publisher reconciliation boundary drift: {requirement}",
+        )
     require(
         "hard security gate" in writer
         and "hard security gate" in normalized_body_contract
@@ -3900,6 +4128,7 @@ def validate(
     validate_behavior_corpus(repo_root)
     validate_merge_eval_isolation(repo_root)
     validate_raw_skill_eval_isolation(repo_root)
+    validate_writer_publisher_trigger_evals(repo_root)
     validate_runtime_contracts(root)
     if check_content_lock is None:
         check_content_lock = not source_stage

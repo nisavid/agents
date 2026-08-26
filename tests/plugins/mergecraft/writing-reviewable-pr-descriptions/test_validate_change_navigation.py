@@ -163,7 +163,7 @@ def stack_body() -> str:
 
 
 DIFF = diff_body()
-STACK = stack_body()
+STACK = stack_body() + "\n"
 
 
 class ValidateChangeNavigationTests(unittest.TestCase):
@@ -181,6 +181,246 @@ class ValidateChangeNavigationTests(unittest.TestCase):
     def test_accepts_stack_then_diff(self) -> None:
         self.assertEqual(MODULE.validate(STACK + DIFF), [])
 
+    def test_accepts_grammatical_singular_line_metrics(self) -> None:
+        singular = DIFF.replace(
+            "9 additions, 3 deletions",
+            "1 addition, 0 deletions",
+        ).replace(
+            "%2B9%20%E2%88%923",
+            "%2B1%20%E2%88%920",
+        ).replace(
+            "%2B9-%E2%88%923",
+            "%2B1-%E2%88%920",
+        )
+
+        self.assertEqual(MODULE.validate(singular), [])
+
+    def test_accepts_grammatical_singular_deletion_metric(self) -> None:
+        singular = DIFF.replace(
+            "9 additions, 3 deletions",
+            "0 additions, 1 deletion",
+        ).replace(
+            "%2B9%20%E2%88%923",
+            "%2B0%20%E2%88%921",
+        ).replace(
+            "%2B9-%E2%88%923",
+            "%2B0-%E2%88%921",
+        )
+
+        self.assertEqual(MODULE.validate(singular), [])
+
+    def test_rejects_singular_noun_for_non_singular_count(self) -> None:
+        broken = DIFF.replace(
+            "9 additions, 3 deletions",
+            "9 addition, 3 deletions",
+        )
+
+        self.assertTrue(
+            any("ungrammatical" in error for error in MODULE.validate(broken))
+        )
+
+    def test_requires_empty_source_line_before_suffix(self) -> None:
+        broken = DIFF.replace("</details>\n\n## Summary", "</details>\n## Summary")
+
+        self.assertTrue(
+            any("empty source line" in error for error in MODULE.validate(broken))
+        )
+
+    def test_requires_empty_source_line_between_stack_and_diff(self) -> None:
+        broken = STACK.rstrip("\n") + "\n" + DIFF
+
+        self.assertTrue(
+            any("between Stack and Diff" in error for error in MODULE.validate(broken))
+        )
+
+    def test_rejects_whitespace_only_prefix_boundary(self) -> None:
+        broken = STACK.replace("</details>\n\n", "</details>\n \n", 1) + DIFF
+
+        self.assertTrue(
+            any("empty source line" in error for error in MODULE.validate(broken))
+        )
+
+    def test_requires_exact_full_line_disclosure_at_byte_zero(self) -> None:
+        cases = (
+            "\n" + DIFF,
+            " " + DIFF,
+            DIFF.replace("<details>", "<details open>", 1),
+            DIFF.replace("<details>", "<DETAILS>", 1),
+            "prefix " + DIFF,
+        )
+        for broken in cases:
+            with self.subTest(first_line=broken.splitlines()[0]):
+                self.assertTrue(
+                    any(
+                        "byte zero" in error or "exact full-line" in error
+                        for error in MODULE.validate(broken)
+                    )
+                )
+
+    def test_rejects_non_markdown_line_separators_in_prefix(self) -> None:
+        for separator in ("\v", "\f", "\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=ascii(separator)):
+                broken = DIFF.replace("<details>\n", "<details>" + separator, 1)
+                self.assertTrue(
+                    any(
+                        "byte zero" in error or "exact full-line" in error
+                        for error in MODULE.validate(broken)
+                    )
+                )
+
+    def test_accepts_lf_crlf_and_cr_prefix_boundaries(self) -> None:
+        prefix = DIFF.split("\n\n## Summary", 1)[0]
+        for newline in ("\n", "\r\n", "\r"):
+            with self.subTest(newline=ascii(newline)):
+                body = prefix.replace("\n", newline) + newline * 2 + "## Summary"
+                self.assertEqual(MODULE.validate(body), [])
+
+    def test_requires_exact_full_line_closing_tag(self) -> None:
+        broken = DIFF.replace("</details>", " </details>", 1)
+
+        self.assertTrue(
+            any("exact full-line </details>" in error for error in MODULE.validate(broken))
+        )
+
+    def test_rejects_nested_canonical_disclosure_in_prefix(self) -> None:
+        broken = DIFF.replace("\n</details>", "\n<details>\n</details>", 1)
+
+        self.assertTrue(
+            any("cannot nest" in error for error in MODULE.validate(broken))
+        )
+
+    def test_rejects_stack_without_leading_diff(self) -> None:
+        self.assertTrue(
+            any(
+                "missing its leading Diff" in error
+                for error in MODULE.validate(STACK)
+            )
+        )
+
+    def test_rejects_non_diff_block_after_stack(self) -> None:
+        unrelated = "\n".join(
+            [
+                "<details>",
+                "<summary>Additional evidence</summary>",
+                "",
+                "Opaque evidence.",
+                "",
+                "</details>",
+                "",
+            ]
+        )
+
+        self.assertTrue(
+            any(
+                "disclosure order" in error
+                for error in MODULE.validate(STACK + unrelated)
+            )
+        )
+
+    def test_accepts_arbitrary_opaque_suffix_bytes(self) -> None:
+        prefix = DIFF.split("\n\n## Summary", 1)[0]
+        suffix = "\r\n".join(
+            [
+                "## Summary",
+                "- Keep `inline code`, [links][ref], and literal <details> bytes.",
+                "",
+                "[ref]: https://example.com/docs",
+                "",
+                "| surface | result |",
+                "| --- | --- |",
+                "| suffix | opaque |",
+                "",
+                "> quoted",
+                "",
+                "<div data-note=\"raw\">HTML</div>",
+                "",
+                "```md",
+                "<details>",
+                "<summary>Example without reserved navigation badges</summary>",
+                "</details>",
+                "```",
+                "",
+            ]
+        )
+
+        self.assertEqual(MODULE.validate(prefix + "\r\n\r\n" + suffix), [])
+
+    def test_rejects_reserved_navigation_fingerprint_in_opaque_suffix(self) -> None:
+        prefix = DIFF.split("\n\n## Summary", 1)[0]
+        for label in ("STACK", "DIFF"):
+            with self.subTest(label=label):
+                example = badge(label, f"{label}-57606A", style="for-the-badge")
+                body = prefix + "\n\n```html\n" + example + "\n```\n"
+                self.assertTrue(
+                    any(
+                        "reserved navigation fingerprint" in error
+                        for error in MODULE.validate(body)
+                    )
+                )
+
+        escaped = (
+            "https://img.shields.io/badge/DIFF-57606A?style=for-the-badge"
+            + r'\"'
+        )
+        self.assertTrue(
+            any(
+                "reserved navigation fingerprint" in error
+                for error in MODULE.validate(prefix + "\n\n" + escaped)
+            )
+        )
+        fingerprint = (
+            "https://img.shields.io/badge/DIFF-57606A?style=for-the-badge"
+        )
+        for extension in ("#copy", "&logo=github"):
+            with self.subTest(extension=extension):
+                self.assertTrue(
+                    any(
+                        "reserved navigation fingerprint" in error
+                        for error in MODULE.validate(
+                            prefix + "\n\n" + fingerprint + extension
+                        )
+                    )
+                )
+
+    def test_accepts_fingerprint_followed_by_token_continuation_in_opaque_suffix(
+        self,
+    ) -> None:
+        prefix = DIFF.split("\n\n## Summary", 1)[0]
+        # URL delimiters remain reserved; an identifier token may continue.
+        suffix = (
+            "https://img.shields.io/badge/DIFF-57606A?style=for-the-badger"
+        )
+
+        self.assertEqual(MODULE.validate(prefix + "\n\n" + suffix), [])
+
+    def test_rejects_reserved_stack_heading_signature_in_opaque_suffix(self) -> None:
+        prefix = DIFF.split("\n\n## Summary", 1)[0]
+        for newline in ("\n", "\r\n", "\r"):
+            with self.subTest(newline=ascii(newline)):
+                body = prefix + newline * 2 + "## Stack" + newline
+                self.assertTrue(
+                    any(
+                        "reserved Stack-heading" in error
+                        for error in MODULE.validate(body)
+                    )
+                )
+
+    def test_accepts_unrelated_disclosure_in_opaque_suffix(self) -> None:
+        prefix = DIFF.split("\n\n## Summary", 1)[0]
+        suffix = "\n".join(
+            [
+                "<details>",
+                "<summary>Additional evidence</summary>",
+                "",
+                badge("EXTRA", "EXTRA-red"),
+                "",
+                "</details>",
+                "",
+            ]
+        )
+
+        self.assertEqual(MODULE.validate(prefix + "\n\n" + suffix), [])
+
     def test_rejects_split_file_metrics(self) -> None:
         broken = DIFF.replace(
             atomic_metric(9, 3),
@@ -190,44 +430,14 @@ class ValidateChangeNavigationTests(unittest.TestCase):
         )
         self.assertTrue(any("atomic" in error for error in MODULE.validate(broken)))
 
-    def test_rejects_separate_stack_heading(self) -> None:
-        self.assertTrue(
-            any(
-                "Stack section" in error
-                for error in MODULE.validate(STACK + DIFF + "\n## Stack\n")
-            )
-        )
-
-    def test_rejects_unclosed_later_duplicate_diff_disclosure(self) -> None:
-        duplicate = DIFF.split("</details>", 1)[0]
-        errors = MODULE.validate(DIFF + "\n" + duplicate)
-        self.assertTrue(any("exactly once" in error for error in errors))
-
     def test_rejects_unclosed_canonical_diff_disclosure(self) -> None:
         unclosed = DIFF.replace("\n</details>", "", 1)
-        self.assertTrue(MODULE.validate(unclosed))
-
-    def test_rejects_inline_later_duplicate_diff_disclosure(self) -> None:
-        summary = DIFF.splitlines()[1]
-        duplicate = f"<details>{summary}duplicate</details>"
-        errors = MODULE.validate(DIFF + "\n" + duplicate)
-        self.assertTrue(any("exactly once" in error for error in errors))
-
-    def test_rejects_uppercase_later_duplicate_diff_disclosure(self) -> None:
-        summary = DIFF.splitlines()[1]
-        uppercase_summary = summary.replace("<summary>", "<SUMMARY>").replace(
-            "</summary>", "</SUMMARY>"
+        self.assertTrue(
+            any(
+                "missing its exact full-line </details>" in error
+                for error in MODULE.validate(unclosed)
+            )
         )
-        uppercase_summary = uppercase_summary.replace('alt="DIFF"', 'ALT="DIFF"')
-        duplicate = f"<DETAILS>{uppercase_summary}duplicate</DETAILS>"
-        errors = MODULE.validate(DIFF + "\n" + duplicate)
-        self.assertTrue(any("exactly once" in error for error in errors))
-
-    def test_rejects_unquoted_alt_later_duplicate_diff_disclosure(self) -> None:
-        summary = DIFF.splitlines()[1].replace('alt="DIFF"', "alt=DIFF")
-        duplicate = f"<details>{summary}duplicate</details>"
-        errors = MODULE.validate(DIFF + "\n" + duplicate)
-        self.assertTrue(any("exactly once" in error for error in errors))
 
     def test_rejects_wrong_height(self) -> None:
         broken = DIFF.replace('height="16"', 'height="20"', 1)

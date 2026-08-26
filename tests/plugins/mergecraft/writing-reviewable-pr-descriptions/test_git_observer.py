@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -94,6 +95,48 @@ class GitObserverTests(unittest.TestCase):
             ),
             (None, None, True),
         )
+
+    def test_observes_reviewer_visible_merge_base_diff_when_base_tip_diverged(
+        self,
+    ) -> None:
+        self.git("switch", "-qc", "diverged-base", self.base)
+        self.write("base-only.txt", b"base-side change\n")
+        self.git("add", "base-only.txt")
+        self.git("commit", "-qm", "base tip")
+        diverged_base = self.git("rev-parse", "HEAD").stdout.strip()
+
+        rows = MODULE.observe_git_diff(
+            self.repository,
+            base_oid=diverged_base,
+            head_oid=self.head,
+        )
+
+        self.assertNotIn("base-only.txt", {row["target_path"] for row in rows})
+        self.assertEqual(
+            {row["target_path"] for row in rows},
+            {
+                "added.txt",
+                "binary.bin",
+                "copied.txt",
+                "delete.txt",
+                "modify.txt",
+                "renamed.txt",
+            },
+        )
+
+    def test_fails_closed_without_one_unique_merge_base(self) -> None:
+        for output in (b"", b"a" * 40 + b"\n" + b"b" * 40 + b"\n"):
+            with self.subTest(output=output):
+                with mock.patch.object(MODULE, "_run", return_value=output):
+                    with self.assertRaisesRegex(
+                        MODULE.GitObservationError,
+                        "one unique merge base",
+                    ):
+                        MODULE._review_diff_base(
+                            self.repository,
+                            self.base,
+                            self.head,
+                        )
 
     def test_fails_closed_for_missing_objects_wrong_root_and_dirty_ambiguity(
         self,

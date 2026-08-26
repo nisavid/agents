@@ -8054,10 +8054,19 @@ def _post_abort_v10_contract(
         schema_version in {12, 13}
         or (
             schema_version == 11
-            and reference_plan.get("schema_version") == 12
             and isinstance(recovery_context, Mapping)
             and recovery_context.get("schema_version") == 1
-            and recovery_context.get("recovery_epoch") == 1
+            and (
+                (
+                    reference_plan.get("schema_version") == 12
+                    and recovery_context.get("recovery_epoch") == 1
+                )
+                or (
+                    reference_plan.get("schema_version") == 15
+                    and recovery_context.get("origin") == "initial-snapshot"
+                    and recovery_context.get("recovery_epoch") == 0
+                )
+            )
         )
     )
     released_operation_ids = (

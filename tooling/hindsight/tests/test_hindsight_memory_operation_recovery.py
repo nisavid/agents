@@ -1850,6 +1850,55 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 recovery,
             )
 
+    def test_schema_fifteen_initial_post_abort_accepts_released_retry(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(completed_positions=set(range(7))),
+            schema_version=12,
+        )
+        reference = deepcopy(reference)
+        reference["schema_version"] = 15
+        reference["installation_authority"] = rebound_installation_authority()
+        reference["live_snapshot"]["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        snapshot = self.post_abort_v10_snapshot(reference)
+        snapshot["installation_authority"] = rebound_installation_authority()
+        released = next(
+            item
+            for item in snapshot["operations"]
+            if item["current_status"] == "pending"
+            and item["worker_id_present"] is True
+        )
+        released.update(
+            worker_id_present=False,
+            worker_id_digest=None,
+            claimed_at=None,
+            updated_at="2026-08-10T18:30:00Z",
+            next_retry_at="2026-08-10T18:00:00Z",
+        )
+        released["row_digest"] = digest(
+            {
+                key: value
+                for key, value in released.items()
+                if key != "row_digest"
+            }
+        )
+
+        selected, _worker, _statuses, _types, _preserved, _retry = (
+            recovery_contract._post_abort_v10_contract(
+                reference,
+                snapshot,
+                schema_version=11,
+                prior_retry_recovery=None,
+                reference_application_progress_digest="f" * 64,
+            )
+        )
+
+        self.assertNotIn(
+            released["operation_id"],
+            {item["operation_id"] for item in selected},
+        )
+
     def test_schema_twelve_epoch_one_retry_accepts_authenticated_release_subset(self):
         """Epoch one may omit rows released by the stopped worker."""
         initial = self.drain_plan(schema_version=12)

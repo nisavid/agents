@@ -71,6 +71,8 @@ def _rename_exact_policy_members(
             member["identity"]["credential_marker"] = (
                 f"provider-policy:{member_id}"
             )
+            if member_id.endswith("-codex"):
+                member["identity"]["model"] = "gpt-5.3-codex-spark"
     value["failover_order"] = [
         "work-codex",
         "personal-codex",
@@ -7112,6 +7114,44 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             globals_["_operation_recovery_read_private_bytes"] = original
         self.assertEqual(reads, [True])
         self.assertEqual(observed, hashlib.sha256(body).hexdigest())
+
+    def test_exact_drain_provider_policy_requires_codex_spark_models(self):
+        validate = self.controller[
+            "_operation_recovery_validate_exact_provider_policy"
+        ]
+        policy = self.controller["ProviderRuntimePolicy"].load(
+            _exact_split_timeout_policy_data()
+        )
+        for member_id in (
+            "work-codex",
+            "personal-codex",
+            "alt1-codex",
+            "alt2-codex",
+        ):
+            member = policy.member(member_id)
+            self.assertEqual(member.identity.model, "gpt-5.3-codex-spark")
+            changed_member = replace(
+                member,
+                identity=replace(
+                    member.identity,
+                    model="gpt-5.3-codex-spark-drifted",
+                ),
+            )
+            with (
+                self.subTest(member_id=member_id),
+                self.assertRaisesRegex(Exception, "provider policy differs"),
+            ):
+                validate(
+                    replace(
+                        policy,
+                        members=tuple(
+                            changed_member
+                            if candidate.id == member_id
+                            else candidate
+                            for candidate in policy.members
+                        ),
+                    )
+                )
 
     def test_exact_drain_provider_policy_requires_canonical_failover_members(self):
         validate = self.controller[

@@ -559,6 +559,7 @@ def validate_exact_drain_provider_policy(
         or set(members) != set(provider_order)
         or any(
             members[member_id].identity.provider != "openai-codex"
+            or members[member_id].identity.model != "gpt-5.3-codex-spark"
             or members[member_id].identity.base_url != ""
             or members[member_id].identity.credential_marker
             != f"provider-policy:{member_id}"

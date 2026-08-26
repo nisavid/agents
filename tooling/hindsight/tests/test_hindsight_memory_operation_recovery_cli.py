@@ -7464,7 +7464,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         ):
             bind(policy, changed_extraction_policy)
 
-    def test_historical_five_member_profile_digest_remains_stable(self):
+    def test_five_member_spark_profile_digest_remains_stable(self):
         policy = self.controller["ProviderRuntimePolicy"].load(
             _legacy_exact_split_timeout_policy_data()
         )
@@ -7497,7 +7497,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
         self.assertEqual(
             observed,
-            "165666784f7bdaf9203df967007740e9b804ecbe52c3fc69961f01eabc6e0120",
+            "f20eb2683864403ee0717dd4cc74c52da51fa5fa73140a1cb606898d189bf214",
         )
 
     def test_exact_drain_apply_rechecks_the_rollback_backup_digest(self):

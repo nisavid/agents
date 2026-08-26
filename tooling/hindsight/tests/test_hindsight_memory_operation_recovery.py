@@ -2022,6 +2022,144 @@ class OperationRecoveryContractTest(unittest.TestCase):
             2,
         )
 
+    def test_schema_fifteen_epoch_one_retry_preserves_safe_terminal_subset(self):
+        """Epoch one retries only owned failures after safe row boundaries."""
+        initial = self.drain_plan(schema_version=12)
+        reference = deepcopy(initial)
+        reference["schema_version"] = 15
+        rebound_authority = rebound_installation_authority()
+        reference["installation_authority"] = rebound_authority
+        reference["live_snapshot"]["installation_authority"] = (
+            rebound_authority
+        )
+        reference_selected = reference["selected_operations"]
+        current = {
+            item["operation_id"]: deepcopy(item)
+            for item in reference["live_snapshot"]["operations"]
+        }
+        prior = recovery_contract._post_abort_v10_retry_recovery(
+            reference,
+            reference_selected,
+            current,
+        )
+        reference["recovery_context"] = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": "systalyze:public:124",
+            "recovery_epoch": 1,
+            "candidate_release_digest": release_identity()["release_digest"],
+            "selected_operation_ids_digest": digest(
+                sorted(
+                    item["operation_id"] for item in reference_selected
+                )
+            ),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": digest(
+                sorted(
+                    item["operation_id"] for item in reference_selected
+                )
+            ),
+            "post_abort_plan_digest": initial["plan_digest"],
+            "post_abort_application_receipt_digest": "a" * 64,
+            "post_abort_verification_receipt_digest": "b" * 64,
+            "retry_recovery_digest": digest(prior),
+            "selected_checkpoint_set_digest": "c" * 64,
+            "preserved_row_set_digest": "d" * 64,
+        }
+        failed_id = reference_selected[0]["operation_id"]
+        completed_id = reference_selected[1]["operation_id"]
+        worker_digest = recovery_contract._post_abort_worker_digest(
+            reference["plan_digest"]
+        )
+        for operation_id, status in (
+            (failed_id, "failed"),
+            (completed_id, "completed"),
+        ):
+            row = current[operation_id]
+            row.update(
+                current_status=status,
+                completed_at="2026-08-20T15:00:00.000000Z",
+                updated_at="2026-08-20T15:00:00.000000Z",
+                retry_count=3 if status == "failed" else 0,
+                worker_id_present=True,
+                worker_id_digest=worker_digest,
+                claimed_at="2026-08-20T14:00:00.000000Z",
+            )
+            row["row_digest"] = digest(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "row_digest"
+                }
+            )
+        failed = {
+            **reference_selected[0],
+            "expected_status": "failed",
+            "row_digest": current[failed_id]["row_digest"],
+        }
+
+        retry = recovery_contract._post_abort_v11_retry_recovery(
+            reference,
+            [failed],
+            current,
+            prior,
+            reference_application_progress_digest="f" * 64,
+        )
+
+        self.assertEqual(retry["recovery_epoch_before"], 1)
+        self.assertEqual(retry["recovery_epoch_after"], 2)
+        self.assertEqual(retry["failed_reset_count"], 1)
+        self.assertEqual(
+            [item["operation_id"] for item in retry["operations"]],
+            [failed_id],
+        )
+
+        changed_pending = deepcopy(current)
+        changed_pending_id = reference_selected[2]["operation_id"]
+        changed_pending[changed_pending_id]["updated_at"] = (
+            "2026-08-20T15:00:00.000000Z"
+        )
+        changed_pending[changed_pending_id]["row_digest"] = digest(
+            {
+                key: value
+                for key, value in changed_pending[changed_pending_id].items()
+                if key != "row_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retry recovery is invalid",
+        ):
+            recovery_contract._post_abort_v11_retry_recovery(
+                reference,
+                [failed],
+                changed_pending,
+                prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
+        foreign_completed = deepcopy(current)
+        foreign_completed[completed_id]["worker_id_digest"] = "0" * 64
+        foreign_completed[completed_id]["row_digest"] = digest(
+            {
+                key: value
+                for key, value in foreign_completed[completed_id].items()
+                if key != "row_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retry recovery is invalid",
+        ):
+            recovery_contract._post_abort_v11_retry_recovery(
+                reference,
+                [failed],
+                foreign_completed,
+                prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
     def test_schema_twelve_status_closes_payload_free_failure_classification(self):
         plan = self.drain_plan(schema_version=12)
         body = {

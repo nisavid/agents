@@ -7732,6 +7732,38 @@ def _post_abort_v11_retry_recovery(
         and omitted_changed_operation_ids.issubset(released_operation_ids)
     ):
         release_only_recovery = True
+    reference_worker_digest = _post_abort_worker_digest(
+        reference_plan["plan_digest"]
+    )
+    schema_fifteen_safe_terminal_subset = (
+        not release_only_recovery
+        and reference_plan["schema_version"] == 15
+        and recovery_epoch_before == 1
+        and selected_ids.issubset(reference_selected)
+        and all(
+            (
+                current[operation_id]["current_status"] == "completed"
+                and current[operation_id]["completed_at"] is not None
+                and current[operation_id]["worker_id_present"] is True
+                and current[operation_id]["worker_id_digest"]
+                == reference_worker_digest
+                and current[operation_id]["claimed_at"] is not None
+                and 0
+                <= current[operation_id]["retry_count"]
+                <= ordinary_retry_ceiling
+            )
+            or (
+                current[operation_id]["current_status"] == "pending"
+                and current[operation_id]["completed_at"] is None
+                and current[operation_id]["worker_id_present"] is False
+                and current[operation_id]["worker_id_digest"] is None
+                and current[operation_id]["claimed_at"] is None
+                and current[operation_id]["row_digest"]
+                == reference_snapshot[operation_id]["row_digest"]
+            )
+            for operation_id in omitted_operation_ids
+        )
+    )
     maximum_cumulative_attempts = (
         ordinary_attempt_ceiling * (recovery_epoch_after + 1)
     )
@@ -7755,6 +7787,7 @@ def _post_abort_v11_retry_recovery(
         )
         or (
             not release_only_recovery
+            and not schema_fifteen_safe_terminal_subset
             and selected_ids != set(reference_selected)
         )
         or not set(prior_by_id).issubset(reference_selected)

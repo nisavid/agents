@@ -5393,6 +5393,44 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 data["services"][0]["environment"][name] = "ordinary"
                 InstallationConfig.load(data, source_path=self.config_path)
 
+    def test_embeddings_api_key_environment_accepts_only_policy_marker(self) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"][
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
+        ] = "provider-policy:openai-luna"
+        loaded = InstallationConfig.load(data, source_path=self.config_path)
+        self.assertIn(
+            (
+                "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY",
+                "provider-policy:openai-luna",
+            ),
+            loaded.services[0].environment,
+        )
+
+        for invalid in (
+            "",
+            "sk-example",
+            "provider-policy:",
+            "provider-policy:openai luna",
+            "provider-policy:openai/luna",
+        ):
+            with self.subTest(invalid=invalid):
+                data = self.config_data()
+                data["services"][0]["environment"][
+                    "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
+                ] = invalid
+                with self.assertRaisesRegex(PortableInstallError, "environment"):
+                    InstallationConfig.load(data, source_path=self.config_path)
+
+        data = self.config_data()
+        data["services"][0]["environment"]["OPENAI_API_KEY"] = (
+            "provider-policy:openai-luna"
+        )
+        with self.assertRaisesRegex(
+            PortableInstallError, "credential environment"
+        ):
+            InstallationConfig.load(data, source_path=self.config_path)
+
     def test_config_requires_exact_schema_version_and_protected_path(self) -> None:
         for schema_version in (True, 1.0, "1"):
             with self.subTest(schema_version=schema_version):

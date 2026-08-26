@@ -73,6 +73,12 @@ RESOLVER_ENVIRONMENT_BINDINGS = frozenset(
         "HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV",
     }
 )
+NON_SECRET_POLICY_MARKER_ENVIRONMENTS = frozenset(
+    {"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"}
+)
+PROVIDER_POLICY_MARKER = re.compile(
+    r"provider-policy:[a-z0-9][a-z0-9._-]{0,126}\Z"
+)
 AUTHORIZED_CREDENTIAL_ENVIRONMENTS = frozenset(
     {
         "HINDSIGHT_API_KEY",
@@ -331,11 +337,20 @@ def _environment(value: Any, label: str) -> tuple[tuple[str, str], ...]:
             raise PortableInstallError(
                 f"{label} PATH must contain only protected system directories"
             )
-        if SECRET_NAME.search(name) and name not in RESOLVER_ENVIRONMENT_BINDINGS:
+        text = _text(raw, f"{label} value", maximum=8192)
+        secret_named = SECRET_NAME.search(name) is not None
+        protected_marker = (
+            name in NON_SECRET_POLICY_MARKER_ENVIRONMENTS
+            and PROVIDER_POLICY_MARKER.fullmatch(text) is not None
+        )
+        if (
+            secret_named
+            and name not in RESOLVER_ENVIRONMENT_BINDINGS
+            and not protected_marker
+        ):
             raise PortableInstallError(
                 f"credential environment {name} must use a protected locator"
             )
-        text = _text(raw, f"{label} value", maximum=8192)
         if text.startswith("release://"):
             _entrypoint(text.removeprefix("release://"), f"{label} release path")
         result.append((name, text))

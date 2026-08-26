@@ -4098,8 +4098,8 @@ def _exact_drain_recovery_context(
             baseline["baseline_status"] == "pending"
             and item["current_status"] == "pending"
             and item["created_at"] == baseline["created_at"]
-            and item["updated_at"] > baseline["updated_at"]
-            and baseline["retry_count"] < item["retry_count"]
+            and item["updated_at"] >= baseline["updated_at"]
+            and baseline["retry_count"] <= item["retry_count"]
             <= EXACT_DRAIN_WORKER_MAX_RETRIES
             and item["completed_at"] is None
             and item["worker_id_present"] is False
@@ -4115,6 +4115,32 @@ def _exact_drain_recovery_context(
             and item["error_digest"] is not None
             and retry_at is not None
             and retry_at <= snapshot["observed_at"]
+        )
+
+    def quiescent_pending_evidence_is_valid(
+        item: Mapping[str, Any],
+    ) -> bool:
+        """Permit an unclaimed pending row with only observational time drift."""
+        baseline = cohort_rows[item["operation_id"]]
+        return (
+            baseline["baseline_status"] == "pending"
+            and item["current_status"] == "pending"
+            and item["created_at"] == baseline["created_at"]
+            and item["updated_at"] >= baseline["updated_at"]
+            and item["retry_count"] == baseline["retry_count"]
+            and item["completed_at"] is None
+            and item["worker_id_present"] is False
+            and item["worker_id_digest"] is None
+            and item["claimed_at"] is None
+            and item["task_payload_present"]
+            is baseline["task_payload_present"]
+            and item["task_payload_digest"]
+            == baseline["task_payload_digest"]
+            and item["result_metadata_digest"]
+            == baseline["result_metadata_digest"]
+            and item["next_retry_at"] is None
+            and item["error_category"] == "none"
+            and item["error_digest"] is None
         )
 
     def terminal_completed_evidence_is_valid(
@@ -4202,6 +4228,7 @@ def _exact_drain_recovery_context(
                     terminal_failed_evidence_is_valid(item)
                     or terminal_completed_evidence_is_valid(item)
                     or initial_retry_evidence_is_valid(item)
+                    or quiescent_pending_evidence_is_valid(item)
                 )
             )
             or (

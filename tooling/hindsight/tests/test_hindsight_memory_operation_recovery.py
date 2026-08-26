@@ -368,6 +368,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         completed_positions: set[int] | None = None,
         failed_positions: set[int] | None = None,
         retry_pending_positions: dict[int, int] | None = None,
+        quiescent_pending_positions: set[int] | None = None,
         evolved_completed_positions: set[int] | None = None,
         observed_at: int = 1_785_461_000,
     ) -> dict:
@@ -381,6 +382,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
         retry_pending_positions = (
             {} if retry_pending_positions is None else retry_pending_positions
         )
+        quiescent_pending_positions = (
+            set()
+            if quiescent_pending_positions is None
+            else quiescent_pending_positions
+        )
         evolved_completed_positions = (
             set()
             if evolved_completed_positions is None
@@ -392,6 +398,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
             raise ValueError("evolved completed positions must be completed")
         if set(retry_pending_positions) & (completed_positions | failed_positions):
             raise ValueError("retry pending positions must remain pending")
+        if quiescent_pending_positions & (
+            completed_positions | failed_positions | set(retry_pending_positions)
+        ):
+            raise ValueError("quiescent pending positions must remain distinct")
         for index, row in enumerate(rows):
             if index in completed_positions:
                 row["status"] = "completed"
@@ -415,6 +425,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 row["next_retry_at"] = "2026-07-29T12:59:30.000000Z"
                 row["error_category"] = "unknown"
                 row["error_digest"] = f"{index + 950:064x}"
+            elif index in quiescent_pending_positions:
+                row["updated_at"] = "2026-07-29T12:59:00.000000Z"
         return dict(
             create_live_snapshot(
                 self.cohort(),
@@ -7854,7 +7866,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
         planned_at = 1_785_462_000
         snapshot = self.drain_snapshot(
             failed_positions={44, 45, 47},
-            retry_pending_positions={2: 1},
+            retry_pending_positions={2: 1, 3: 0},
+            quiescent_pending_positions={4},
             evolved_completed_positions={0},
         )
         plan = recovery_contract.create_exact_drain_plan(

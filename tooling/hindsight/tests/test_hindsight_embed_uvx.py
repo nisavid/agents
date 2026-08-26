@@ -31,6 +31,7 @@ class HindsightEmbedUvxTest(unittest.TestCase):
                 '"$PYTHON_FOR_TEST" -c \'import json, os, shutil, sys; '
                 "open(os.environ[\"CAPTURE\"], \"w\").write(json.dumps({"
                 "\"argv\": sys.argv[1:], \"path\": os.environ[\"PATH\"], "
+                "\"api_version\": os.environ.get(\"HINDSIGHT_EMBED_API_VERSION\"), "
                 "\"nested_uvx\": shutil.which(\"uvx\"), "
                 "\"nested_npx\": shutil.which(\"npx\"), "
                 "\"nested_node\": shutil.which(\"node\")}))' "
@@ -86,6 +87,7 @@ class HindsightEmbedUvxTest(unittest.TestCase):
             self.assertEqual(observed["nested_uvx"], str(fake_uvx))
             self.assertEqual(observed["nested_npx"], str(fake_npx))
             self.assertEqual(observed["nested_node"], str(fake_node))
+            self.assertEqual(observed["api_version"], "0.9.2")
 
     def test_wrapper_ignores_path_without_a_configured_uvx(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

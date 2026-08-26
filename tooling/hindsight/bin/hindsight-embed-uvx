@@ -73,4 +73,11 @@ esac
 PATH="$uvx_directory:$npx_directory:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
+# The managed provider runtime is version-gated to Hindsight API 0.9.2. Older
+# installation generations do not carry this environment binding, so provide
+# the matching API version at the release-owned wrapper boundary. A current
+# installation may still bind the same value explicitly from provider policy.
+: "${HINDSIGHT_EMBED_API_VERSION:=0.9.2}"
+export HINDSIGHT_EMBED_API_VERSION
+
 exec "$uvx_executable" --from 'hindsight-embed==0.8.4' "$@"

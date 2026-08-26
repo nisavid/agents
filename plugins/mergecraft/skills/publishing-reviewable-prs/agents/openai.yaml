@@ -1,4 +1,4 @@
 interface:
   display_name: Publish Reviewable PRs
-  short_description: Publish verified PR text and readiness state.
-  default_prompt: Use $mergecraft:publishing-reviewable-prs to publish exact PR state.
+  short_description: Publish field-scoped PR text and readiness state.
+  default_prompt: Use $mergecraft:publishing-reviewable-prs to publish a validated PR text or readiness transition through the guarded helper.

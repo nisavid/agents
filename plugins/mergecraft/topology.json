@@ -46,7 +46,9 @@
         "modes": ["content-only"],
         "authority": "candidate PR title and body bytes only",
         "inputs": [
-          "exact-base-head-diff",
+          "exact-base-tip-head-and-unique-merge-base",
+          "reviewer-visible-merge-base-to-head-diff",
+          "caller-supplied-categorized-diff-and-stack-observations",
           "current-pr-text",
           "repository-policy"
         ],
@@ -109,7 +111,8 @@
         ],
         "outputs": [
           "review-bound-publication-receipt",
-          "authoritative-audit"
+          "authoritative-audit",
+          "pre-updater-no-op-classification-without-transition-receipt"
         ],
         "forbidden_reverse_calls": [
           "graphite",

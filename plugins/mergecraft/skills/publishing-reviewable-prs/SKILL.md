@@ -12,8 +12,22 @@ Graphite first creates stack draft transport.
 owns the `pr-content` operation: the complete title/body pair and its authorized
 text surface.
 Preserve unauthorized fields byte-for-byte. Helpers preflight, mutate once,
-reread, then atomically store a redacted local receipt; GitHub provides no
-conditional atomicity.
+reread, then atomically store a redacted local receipt. The publication lease
+serializes only cooperating processes that share the same local receipt root;
+it does not serialize another machine, user, bot, automation, or GitHub actor.
+GitHub provides no conditional write, so the read-write-reread sequence can
+race and the reread cannot prevent an intervening lost update.
+
+## Routing
+
+- Chat-only title/body proposals use the writer without this publisher.
+- Creation and stored title/body changes use this publisher, which invokes the
+  writer for the complete validated pair and manifest.
+- Ready-only work uses this publisher with the current writer-owned pair and
+  manifest; it never rewrites text as part of readiness.
+- Generic read-only inspection, comments, checks, labels, base changes, and
+  merge-only work use their own owners. Publication audit is the publisher's
+  narrow read-only exception.
 
 ## Workflow
 
@@ -86,8 +100,12 @@ Capture live title/body SHA-256, then run `scripts/update_reviewable_pr.py text`
 with exact identity/OIDs, state, absolute body/manifest paths, and authorized
 `body-only`, `title-only`, or `title-body`. Never default broad. It privately
 snapshots validated bytes, proves unauthorized fields unchanged, and publishes
-once. Reject a no-op before mutation. Preserve current custom content,
-exact-reread, and write a canonical receipt. For a new PR created through
+once. The GitHub command sends only the authorized field or fields. Classify an
+unchanged candidate as `no-op` before invoking the updater. That workflow
+terminal is not updater success and never mints a transition receipt; use the
+read-only audit when publication evidence is required. The updater rejects any
+no-op that reaches it. Preserve current custom content, exact-reread, and write
+a canonical receipt. For a new PR created through
 Graphite transport, pass the original token-bearing `--body-template`; the
 publisher performs the sole token substitution after Graphite assigns the PR.
 In required mode, reread the exact live preimage after review and block the
@@ -110,9 +128,11 @@ Receipts form an ordered append-only ledger per stable repository/PR number.
 Ordered identity epochs retain historical base/head OIDs while requiring the
 authoritative latest receipt to match the current complete identity. Their strict,
 versioned schema binds sequence and predecessor/content hashes, the exact
-mutation preimage and final reread, identity/OIDs, title/body and review-input
-SHA-256 digests, state, publisher/policy/schema versions, operation, timestamp,
-and provenance—never title/body bytes or credentials. Canonical v3 receipts
+last validated preflight observation and final reread, identity/OIDs, title/body
+and review-input SHA-256 digests, state, publisher/policy/schema versions,
+operation, timestamp, and provenance—never title/body bytes or credentials.
+Because GitHub provides no conditional write, a receipt does not prove the
+server-side mutation preimage or exclude a lost-update race. Canonical v3 receipts
 record either explicit `not-required` or `required`; required also binds the
 canonical publication-candidate digest, Task Witness launch-envelope digest,
 anchor generation/active record/trust/bundle, and Tricritical manifest/projection
@@ -130,7 +150,9 @@ writable store and hold an exclusive per-PR lease from final preflight through
 mutation, reread, and append. Standalone creation cannot address the per-PR
 ledger until GitHub assigns a number, so it first holds a head/base creation
 lease and proves the store, then prepares and locks the exact ledger before the
-canonical edit. The chain detects accidental gaps, forks, swaps, timestamp
+canonical edit. These local leases coordinate only publishers using the same
+receipt root; they cannot create conditional or atomic GitHub actuation. The
+chain detects accidental gaps, forks, swaps, timestamp
 rollback, reordering, and edits; it is not a cryptographic security boundary
 against a hostile process running as the same user.
 

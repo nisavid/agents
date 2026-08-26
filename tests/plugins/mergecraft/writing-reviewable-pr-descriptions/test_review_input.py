@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 PRODUCTION_SCRIPTS = (
@@ -629,6 +630,54 @@ class ReviewInputTests(unittest.TestCase):
         )
         self.assertTrue(any("65536" in error for error in errors))
 
+    def test_bounded_first_100_inventory_fails_closed_when_still_over_limit(
+        self,
+    ) -> None:
+        body = bounded_body() + "x" * 65536
+        value = manifest(body)
+        value["git_diff"].append(
+            {
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "operation": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "binary": False,
+            }
+        )
+        value["diff"].append(
+            {
+                "category": "IMPL",
+                "operation": "ATOMIC",
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "additions": 1,
+                "deletions": 0,
+            }
+        )
+        value["presentation"] = {
+            "selected_targets": [f"src/{index:03d}.ts" for index in range(100)],
+            "omitted_count": 1,
+            "comparison_url": "https://github.com/acme/app/compare/"
+            + "a" * 40
+            + "..."
+            + "b" * 40,
+        }
+
+        errors = PRODUCTION_VALIDATE(
+            body,
+            "acme/app",
+            2,
+            title="feat: widget",
+            review_input_path=self.write(reseal(value)),
+        )
+
+        self.assertGreater(len(body), 65536)
+        self.assertEqual(
+            errors,
+            ["PR body exceeds GitHub's 65536-character limit"],
+        )
+
     def test_public_validator_accepts_canonical_bounded_diff(self) -> None:
         body = bounded_body()
         value = manifest(body)
@@ -730,6 +779,14 @@ class ReviewInputTests(unittest.TestCase):
         for expected_error, body in mutations.items():
             broken = copy.deepcopy(value)
             broken["candidate"]["body_sha256"] = digest(body)
+            fragment = broken["baseline"]["fragments"][0]
+            fragment.update(
+                {
+                    "disposition": "replace",
+                    "replacement": body,
+                    "reason": "exercise sealed aggregate mismatch",
+                }
+            )
             with self.subTest(aggregate=expected_error):
                 errors = PRODUCTION_VALIDATE(
                     body,
@@ -1086,6 +1143,50 @@ class ReviewInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewInputError, "both live baseline"):
             self.bind(value, body=DIFF, stored_title="feat: widget")
 
+    def test_standalone_validation_requires_consistent_baseline_derivation(
+        self,
+    ) -> None:
+        wrong_replacement = manifest(DIFF)
+        fragment = wrong_replacement["baseline"]["fragments"][0]  # type: ignore[index]
+        fragment.update(
+            {
+                "disposition": "replace",
+                "replacement": "not the candidate",
+                "reason": "deliberately inconsistent fixture",
+            }
+        )
+        wrong_replacement = reseal(wrong_replacement)
+        self.assertTrue(
+            any(
+                "ordered fragment derivation" in error
+                for error in PRODUCTION_VALIDATE(
+                    DIFF,
+                    "acme/app",
+                    2,
+                    title="feat: widget",
+                    review_input_path=self.write(wrong_replacement),
+                )
+            )
+        )
+
+        wrong_source = manifest(DIFF)
+        fragment = wrong_source["baseline"]["fragments"][0]  # type: ignore[index]
+        fragment["text"] = DIFF + "unsealed suffix"
+        fragment["sha256"] = digest(fragment["text"])
+        wrong_source = reseal(wrong_source)
+        self.assertTrue(
+            any(
+                "sealed baseline body digest" in error
+                for error in PRODUCTION_VALIDATE(
+                    DIFF,
+                    "acme/app",
+                    2,
+                    title="feat: widget",
+                    review_input_path=self.write(wrong_source),
+                )
+            )
+        )
+
     def test_publishable_validation_reports_missing_diff_without_crashing(self) -> None:
         value = manifest(DIFF)
         value["candidate"]["body_sha256"] = digest("")  # type: ignore[index]
@@ -1155,6 +1256,43 @@ class ReviewInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr, "ERROR: Change navigation is invalid\n")
         self.assertNotIn(body_sentinel, result.stderr)
+
+    def test_cli_preserves_body_and_template_source_line_endings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for newline in ("\r\n", "\r"):
+                with self.subTest(newline=ascii(newline)):
+                    body = DIFF.replace("\n", newline)
+                    template = body + newline + PR_NUMBER_TOKEN
+                    body_path = directory / "body.md"
+                    template_path = directory / "template.md"
+                    body_path.write_bytes(body.encode("utf-8"))
+                    template_path.write_bytes(template.encode("utf-8"))
+                    argv = [
+                        str(SCRIPT),
+                        str(body_path),
+                        "--template-body",
+                        str(template_path),
+                        "--repository",
+                        "acme/app",
+                        "--pr",
+                        "2",
+                        "--title",
+                        "feat: widget",
+                        "--review-input",
+                        str(directory / "unused.json"),
+                    ]
+                    with (
+                        mock.patch.object(sys, "argv", argv),
+                        mock.patch.object(MODULE, "validate", return_value=[]) as call,
+                        mock.patch("builtins.print"),
+                    ):
+                        self.assertEqual(MODULE.main(), 0)
+                    self.assertEqual(call.call_args.args[0], body)
+                    self.assertEqual(
+                        call.call_args.kwargs["template_body"],
+                        template,
+                    )
 
     def test_rejects_head_repository_identity_drift(self) -> None:
         with self.assertRaisesRegex(ReviewInputError, "identity drifted"):
@@ -1235,6 +1373,96 @@ class ReviewInputTests(unittest.TestCase):
                 stored_title="feat: widget",
                 stored_body=stored_body,
             )
+
+    def test_opaque_suffix_is_preserved_byte_for_byte_by_fragment_derivation(
+        self,
+    ) -> None:
+        old_navigation = (
+            "<details>\r\n"
+            "<summary>Old navigation</summary>\r\n"
+            "</details>"
+        )
+        replacement = DIFF.split("\n\n## Summary", 1)[0]
+        suffix = (
+            "\r\n\r\n"
+            "## Summary\r\n"
+            "- Keep `inline code`, [links][ref], and literal <details> bytes.\r\n"
+            "\r\n"
+            "[ref]: https://example.com/docs\r\n"
+            "\r\n"
+            "| surface | result |\r\n"
+            "| --- | --- |\r\n"
+            "| suffix | opaque |\r\n"
+            "\r\n"
+            "> quoted\r\n"
+            "\r\n"
+            "<div data-note=\"raw\">HTML</div>\r\n"
+            "\r\n"
+            "```md\r\n"
+            "<details>\r\n"
+            "<summary>Example without reserved navigation badges</summary>\r\n"
+            "</details>\r\n"
+            "```\r\n"
+        )
+        stored_body = old_navigation + suffix
+        candidate = replacement + suffix
+        fragments = [
+            {
+                "id": "navigation",
+                "text": old_navigation,
+                "sha256": digest(old_navigation),
+                "disposition": "replace",
+                "replacement": replacement,
+                "reason": "refresh exact pushed state",
+            },
+            {
+                "id": "opaque-suffix",
+                "text": suffix,
+                "sha256": digest(suffix),
+                "disposition": "retain",
+                "replacement": None,
+                "reason": None,
+            },
+        ]
+        baseline = {
+            "mode": "existing",
+            "title_sha256": digest("feat: widget"),
+            "body_sha256": digest(stored_body),
+            "fragments": fragments,
+        }
+
+        self.assertEqual(MODULE.validate(candidate), [])
+        self.bind(
+            manifest(candidate, baseline=baseline),
+            body=candidate,
+            stored_title="feat: widget",
+            stored_body=stored_body,
+        )
+
+        mutations = {
+            "substitute-byte": candidate.replace("opaque", "opaqve", 1),
+            "drop-byte": candidate.replace("suffix", "suffi", 1),
+            "insert-byte": candidate.replace("suffix", "ssuffix", 1),
+            "remove-whole-suffix": replacement,
+            "duplicate-whole-suffix": candidate + suffix,
+            "reorder": candidate.replace(
+                "| suffix | opaque |\r\n\r\n> quoted",
+                "> quoted\r\n\r\n| suffix | opaque |",
+                1,
+            ),
+        }
+        for case, mutated in mutations.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(
+                    ReviewInputError,
+                    "ordered fragment derivation",
+                ):
+                    self.bind(
+                        manifest(mutated, baseline=baseline),
+                        body=mutated,
+                        stored_title="feat: widget",
+                        stored_body=stored_body,
+                    )
 
 
 if __name__ == "__main__":

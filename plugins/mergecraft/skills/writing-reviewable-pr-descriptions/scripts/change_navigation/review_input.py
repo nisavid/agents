@@ -1,4 +1,4 @@
-"""Immutable, content-addressed review-input manifests."""
+"""Content-addressed review-input manifests for local consistency checks."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .git_observer import GitObservationError, observe_git_diff
-from .parsing import extract_leading_details
+from .parsing import extract_leading_details, source_lines
 
 
 VERSION = 3
@@ -35,7 +35,7 @@ def digest(value: str) -> str:
 
 
 def _validate_new_pr_stack_template(template: str, repository: str) -> None:
-    blocks = extract_leading_details(template.splitlines())
+    blocks = extract_leading_details(source_lines(template))
     stack = blocks[0] if blocks else []
     current_rows = [line for line in stack if " **← this PR**<br>" in line]
     token = re.escape(PR_NUMBER_TOKEN)
@@ -635,30 +635,34 @@ def bind_review_input(  # noqa: C901
             raise ReviewInputError(
                 "existing-PR review input requires both live baseline title/body"
             )
+        source_body = "".join(
+            fragment["text"] for fragment in baseline["fragments"]
+        )
         if stored_title is not None and stored_body is not None:
             if (
                 digest(stored_title) != baseline["title_sha256"]
                 or digest(stored_body) != baseline["body_sha256"]
             ):
                 raise ReviewInputError("review input live baseline drifted")
-            source_body = "".join(
-                fragment["text"] for fragment in baseline["fragments"]
-            )
             if source_body != stored_body:
                 raise ReviewInputError(
                     "existing-PR baseline fragments must exhaustively partition "
                     "the stored body"
                 )
-            candidate_parts: list[str] = []
-            for fragment in baseline["fragments"]:
-                disposition = fragment["disposition"]
-                if disposition == "retain":
-                    candidate_parts.append(fragment["text"])
-                elif disposition == "replace":
-                    candidate_parts.append(fragment["replacement"])
-                else:
-                    candidate_parts.append("")
-            if "".join(candidate_parts) != body:
-                raise ReviewInputError(
-                    "candidate body is not the exact ordered fragment derivation"
-                )
+        elif digest(source_body) != baseline["body_sha256"]:
+            raise ReviewInputError(
+                "baseline fragments do not match the sealed baseline body digest"
+            )
+        candidate_parts: list[str] = []
+        for fragment in baseline["fragments"]:
+            disposition = fragment["disposition"]
+            if disposition == "retain":
+                candidate_parts.append(fragment["text"])
+            elif disposition == "replace":
+                candidate_parts.append(fragment["replacement"])
+            else:
+                candidate_parts.append("")
+        if "".join(candidate_parts) != body:
+            raise ReviewInputError(
+                "candidate body is not the exact ordered fragment derivation"
+            )

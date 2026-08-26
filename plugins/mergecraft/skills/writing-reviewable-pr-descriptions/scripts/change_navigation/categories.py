@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .model import line_metric_text
+
 
 @dataclass(frozen=True)
 class Category:
@@ -53,7 +55,7 @@ CATEGORY_COLORS = {category.visual_label: category.color for category in CATEGOR
 def category_title(label: str, additions: int, deletions: int) -> str:
     category = CATEGORY_BY_LABEL[label]
     return (
-        f"{category.semantic_name}: {additions} additions, {deletions} deletions "
+        f"{category.semantic_name}: {line_metric_text(additions, deletions)} "
         f"({category.description})"
     )
 

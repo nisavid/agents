@@ -4,7 +4,7 @@
     "managed_source_mutation": "not-granted",
     "release_eligibility": "not-asserted"
   },
-  "content_sha256": "sha256:82450ced596924a5ccf1e49ce17e38ef9717e852e9f465cf5c0441ef35b0a8fd",
+  "content_sha256": "sha256:637d9f1020b30dbc774d00cd2ddbd633e5593c85c4410064b4f510eef99c0d04",
   "contract": "coordinated-source-skill-disposition-ledger-v1",
   "dispositions": [
     {
@@ -247,18 +247,19 @@
         "release_eligibility": "not-asserted"
       },
       "contribution_id": "mergecraft-installed-source-relationship-unresolved",
-      "disposition": "absorb-or-refresh",
+      "disposition": "equivalent-or-stronger",
       "durable_owners": [
         "mergecraft"
       ],
       "evidence_paths": [
-        "plugins/mergecraft/plugin.json",
-        "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md"
+        "docs/superpowers/research/2026-08-26-mergecraft-statline-source-resync.md",
+        "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md",
+        "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/SKILL.md"
       ],
       "follow_up_issues": [
         45
       ],
-      "rationale": "The final release refresh must three-way reconcile the current personal source, its historical import, and the stronger coordinated-package contracts.",
+      "rationale": "The canonical duo now incorporates, corrects, supersedes, or explicitly excludes every material behavior observed at dotfiles source revision cd2071e4dd885d293325a3af063421db9579a7df. Issue #45 still owns release qualification, installation, migration, and retirement.",
       "skill_dispositions": [],
       "source_id": "ivan-mergecraft"
     },

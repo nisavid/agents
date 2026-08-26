@@ -262,6 +262,52 @@ class SourceSkillDispositionValidatorTests(unittest.TestCase):
         self.assertEqual(completed.stderr, "")
         self.assertEqual(completed.stdout, "source-skill-disposition-valid\n")
 
+    def test_mergecraft_three_way_source_relationship_is_settled_without_release_authority(
+        self,
+    ) -> None:
+        ledger = self.load(LEDGER)
+        mergecraft = next(
+            item
+            for item in ledger["dispositions"]
+            if item["contribution_id"]
+            == "mergecraft-installed-source-relationship-unresolved"
+        )
+
+        self.assertEqual(mergecraft["disposition"], "equivalent-or-stronger")
+        self.assertEqual(
+            mergecraft["evidence_paths"],
+            [
+                "docs/superpowers/research/2026-08-26-mergecraft-statline-source-resync.md",
+                "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md",
+                "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/SKILL.md",
+            ],
+        )
+        self.assertEqual(mergecraft["follow_up_issues"], [45])
+        self.assertEqual(mergecraft["authority"]["host_removal"], "not-granted")
+        self.assertEqual(
+            mergecraft["authority"]["managed_source_mutation"], "not-granted"
+        )
+        self.assertEqual(
+            mergecraft["authority"]["release_eligibility"], "not-asserted"
+        )
+        self.assertIn(
+            "cd2071e4dd885d293325a3af063421db9579a7df",
+            mergecraft["rationale"],
+        )
+
+    def test_mergecraft_disposition_rejects_host_removal_authority(self) -> None:
+        ledger = self.load(LEDGER)
+        mergecraft = next(
+            item
+            for item in ledger["dispositions"]
+            if item["contribution_id"]
+            == "mergecraft-installed-source-relationship-unresolved"
+        )
+        mergecraft["authority"]["host_removal"] = "granted"
+        self.write(LEDGER, ledger)
+
+        self.assert_rejected("source disposition grants host removal authority")
+
     def test_requires_exactly_one_disposition_per_evidence_contribution(self) -> None:
         ledger = self.load(LEDGER)
         ledger["dispositions"].pop()

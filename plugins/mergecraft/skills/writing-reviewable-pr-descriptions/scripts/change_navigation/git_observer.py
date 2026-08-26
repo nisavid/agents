@@ -41,6 +41,21 @@ def _path(value: bytes) -> str:
     return path
 
 
+def _review_diff_base(repository: Path, base_oid: str, head_oid: str) -> str:
+    merge_bases = _run(
+        repository,
+        "merge-base",
+        "--all",
+        base_oid,
+        head_oid,
+    ).decode("ascii", "strict").splitlines()
+    if len(merge_bases) != 1 or not OID.fullmatch(merge_bases[0]):
+        raise GitObservationError(
+            "exact base and head must have one unique merge base"
+        )
+    return merge_bases[0]
+
+
 def _numstat(
     repository: Path, base_oid: str, head_oid: str
 ) -> dict[tuple[str | None, str], tuple[int | None, int | None, bool]]:
@@ -100,7 +115,7 @@ def observe_git_diff(
     head_oid: str,
     require_clean: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return the exact raw file inventory for two commits in one bound repository."""
+    """Return the reviewer-visible three-dot inventory for exact base/head tips."""
     repository = repository.resolve(strict=True)
     if not repository.is_dir() or repository.is_symlink():
         raise GitObservationError("bound Git repository is invalid")
@@ -118,7 +133,8 @@ def observe_git_diff(
     if require_clean and _run(repository, "status", "--porcelain=v1", "-z"):
         raise GitObservationError("bound Git repository has dirty-state ambiguity")
 
-    numstat = _numstat(repository, base_oid, head_oid)
+    review_base = _review_diff_base(repository, base_oid, head_oid)
+    numstat = _numstat(repository, review_base, head_oid)
     output = _run(
         repository,
         "diff",
@@ -127,7 +143,7 @@ def observe_git_diff(
         "--find-renames=50%",
         "--find-copies=50%",
         "--find-copies-harder",
-        base_oid,
+        review_base,
         head_oid,
         "--",
     )

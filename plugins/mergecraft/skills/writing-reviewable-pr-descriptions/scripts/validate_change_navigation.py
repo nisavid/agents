@@ -19,9 +19,11 @@ from change_navigation.diff_files import (
 from change_navigation.metrics import category_metric_map
 from change_navigation.model import alt_values
 from change_navigation.parsing import (
-    extract_details,
     extract_leading_details,
-    first_nonempty_line,
+    opaque_suffix,
+    parse_navigation_prefix,
+    source_lines,
+    validate_reserved_suffix_signatures,
 )
 from change_navigation.review_input import (
     ReviewInputError,
@@ -51,38 +53,19 @@ def _validate_markup(  # noqa: C901
     if expected_pr < 1:
         errors.append("expected PR number must be positive")
     expected_identity = (expected_repository, expected_pr)
-    lines = body.splitlines()
-    first = first_nonempty_line(lines)
-    if first < 0:
-        return ["PR body is empty"]
-    if lines[first].strip() != "<details>":
-        errors.append("PR body must start with the Stack or Diff disclosure")
-
-    blocks = extract_leading_details(lines)
+    lines = source_lines(body)
+    prefix = parse_navigation_prefix(lines, errors)
+    blocks = list(prefix.blocks) if prefix is not None else []
     labels = classify_disclosures(blocks)
-    has_canonical_diff_prefix = bool(
-        labels
-        and labels[0] == "DIFF"
-        and all(label == "UNKNOWN" for label in labels[1:])
-    )
-    has_canonical_stack_prefix = bool(
-        labels[:2] == ["STACK", "DIFF"]
-        and all(label == "UNKNOWN" for label in labels[2:])
-    )
-    if not (has_canonical_diff_prefix or has_canonical_stack_prefix):
+    if labels not in (["DIFF"], ["STACK", "DIFF"]):
         errors.append(
             f"leading disclosure order must be [DIFF] or [STACK, DIFF], found {labels}"
         )
-    all_labels = classify_disclosures(extract_details(lines))
-    recognized_labels = [label for label in all_labels if label in {"STACK", "DIFF"}]
-    expected_labels = ["STACK", "DIFF"] if labels[:1] == ["STACK"] else ["DIFF"]
-    if recognized_labels != expected_labels:
-        errors.append(
-            "Stack and Diff disclosures must appear exactly once in the "
-            "canonical prefix"
+    if prefix is not None:
+        validate_reserved_suffix_signatures(
+            opaque_suffix(body, prefix.end_line),
+            errors,
         )
-    if _has_stack_heading(lines):
-        errors.append("do not add a separate ## Stack section")
 
     if labels and labels[0] == "STACK":
         validate_stack(blocks[0], errors)
@@ -136,29 +119,10 @@ def _validate_markup(  # noqa: C901
     else:
         errors.append("Diff disclosure is missing")
 
-    recognized_blocks = blocks[:2] if labels[:2] == ["STACK", "DIFF"] else blocks[:1]
+    recognized_blocks = blocks[:2] if labels == ["STACK", "DIFF"] else blocks[:1]
     navigation_text = "\n".join("\n".join(block) for block in recognized_blocks)
     validate_badges(navigation_text, errors)
     return errors
-
-
-def _has_stack_heading(lines: list[str]) -> bool:
-    fenced: tuple[str, int] | None = None
-    for line in lines:
-        stripped = line.lstrip()
-        marker = None
-        if stripped.startswith("```"):
-            marker = ("`", len(stripped) - len(stripped.lstrip("`")))
-        elif stripped.startswith("~~~"):
-            marker = ("~", len(stripped) - len(stripped.lstrip("~")))
-        if marker and (
-            fenced is None or (marker[0] == fenced[0] and marker[1] >= fenced[1])
-        ):
-            fenced = None if fenced else marker
-            continue
-        if fenced is None and re.match(r"^\s{0,3}#{1,6}\s+stack\s*#*\s*$", line, re.I):
-            return True
-    return False
 
 
 def _validate_manifest_semantics(
@@ -291,7 +255,7 @@ def validate(
     template_body: str | None = None,
     git_repository: Path | None = None,
 ) -> list[str]:
-    """Validate publishable review text against its immutable review input."""
+    """Validate review text against its content-addressed local review input."""
     if len(body) > 65536:
         return ["PR body exceeds GitHub's 65536-character limit"]
     secret_error = suspected_secret_error(body)
@@ -303,7 +267,7 @@ def validate(
     except ReviewInputError:
         bounded = False
     errors = _validate_markup(body, expected_repository, expected_pr, bounded=bounded)
-    blocks = extract_leading_details(body.splitlines())
+    blocks = extract_leading_details(source_lines(body))
     if not title.strip():
         errors.append("candidate title is empty")
     errors.extend(
@@ -319,6 +283,11 @@ def validate(
         )
     )
     return errors
+
+
+def _read_utf8(path: Path) -> str:
+    """Read exact source bytes without universal-newline normalization."""
+    return path.read_bytes().decode("utf-8")
 
 
 def main() -> int:
@@ -348,13 +317,13 @@ def main() -> int:
     )
     args = parser.parse_args()
     errors = validate(
-        args.body.read_text(encoding="utf-8"),
+        _read_utf8(args.body),
         args.repository,
         args.pr,
         title=args.title,
         review_input_path=args.review_input,
         template_body=(
-            args.template_body.read_text(encoding="utf-8")
+            _read_utf8(args.template_body)
             if args.template_body is not None
             else None
         ),

@@ -4431,6 +4431,123 @@ class OperationRecoveryContractTest(unittest.TestCase):
                         now=mismatched["created_at"],
                     )
 
+    def test_post_abort_v11_preserves_preexisting_failed_rows(self):
+        reference_snapshot = self.drain_snapshot(
+            completed_positions=set(range(6)),
+            failed_positions={6},
+            observed_at=1_786_390_000,
+        )
+        reference_snapshot["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        reference_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in reference_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        reference_backup = drain_backup_evidence()
+        reference_backup["source_authority"]["data_identity_digest"] = (
+            reference_snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        reference_backup["source_authority_digest"] = digest(
+            reference_backup["source_authority"]
+        )
+        reference = dict(
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                reference_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=reference_backup,
+                rollback_backup_path="/private/tmp/drain-backup.age",
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path="/private/tmp/drain-authorization.json",
+                application_receipt_path="/private/tmp/drain-application.json",
+                status_artifact_path="/private/tmp/drain-status.json",
+                verification_receipt_path="/private/tmp/drain-verification.json",
+                created_at=1_786_390_001,
+                schema_version=12,
+            )
+        )
+        snapshot = self.post_abort_v10_snapshot(reference)
+        preserved_failed_id = operation_rows()[6]["operation_id"]
+        reference_failed = next(
+            item
+            for item in reference["live_snapshot"]["operations"]
+            if item["operation_id"] == preserved_failed_id
+        )
+        snapshot["operations"] = [
+            deepcopy(reference_failed)
+            if item["operation_id"] == preserved_failed_id
+            else item
+            for item in snapshot["operations"]
+        ]
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in (
+                "cancelled",
+                "completed",
+                "failed",
+                "pending",
+                "processing",
+            )
+        }
+        snapshot["installation_authority"] = rebound_installation_authority()
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["data_identity_digest"] = snapshot[
+            "installation_authority"
+        ]["observed_data_identity_digest"]
+        for key in ("generation_before", "generation_after"):
+            backup["source_authority"][key] = snapshot[key]
+        backup["source_authority_digest"] = digest(backup["source_authority"])
+
+        plan = create_post_abort_recovery_plan(
+            reference,
+            snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v11-preserved-failed-backup.age",
+            rollback_bundle_path="/private/tmp/v11-preserved-failed-bundle.age",
+            authorization_receipt_path="/private/tmp/v11-preserved-failed-auth.json",
+            application_receipt_path="/private/tmp/v11-preserved-failed-app.json",
+            verification_receipt_path="/private/tmp/v11-preserved-failed-verify.json",
+            rollback_receipt_path="/private/tmp/v11-preserved-failed-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(reference)
+            ),
+            reference_application_progress_digest="e" * 64,
+            schema_version=11,
+            created_at=1_786_390_500,
+        )
+
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 8, "failed": 1},
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
     def test_post_abort_v10_preserves_changed_unowned_pending_row(self):
         reference_snapshot = self.drain_snapshot(
             completed_positions=set(range(7)),

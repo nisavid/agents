@@ -8108,7 +8108,8 @@ def _post_abort_v10_contract(
             for operation_id in current
         )
         or any(
-            current[operation_id]["current_status"] != "completed"
+            current[operation_id]["current_status"]
+            != reference_snapshot[operation_id]["current_status"]
             or current[operation_id]["row_digest"]
             != reference_snapshot[operation_id]["row_digest"]
             for operation_id in reference_preserved_ids
@@ -8277,7 +8278,7 @@ def _post_abort_v10_contract(
             current[operation_id]["current_status"] == status
             for operation_id in preserved_ids
         )
-        for status in ("completed", "pending")
+        for status in ("completed", "failed", "pending")
     }
     preserved_status_counts = {
         status: count

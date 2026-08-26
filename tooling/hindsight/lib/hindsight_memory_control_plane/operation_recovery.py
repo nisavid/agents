@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence, Set
 from datetime import datetime
+import hashlib
 import hmac
 import re
 import time
@@ -10329,7 +10330,12 @@ def _claim_release_row(
     value: Any,
     *,
     allow_pending: bool = False,
+    allow_terminal_exact: bool = False,
 ) -> dict[str, Any]:
+    if allow_pending and allow_terminal_exact:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release row mode is invalid"
+        )
     row = _closed(
         _normalized(value),
         CLAIM_RELEASE_ROW_KEYS,
@@ -10338,14 +10344,17 @@ def _claim_release_row(
     blocker = _queue_blocker(
         {key: row[key] for key in QUEUE_BLOCKER_KEYS},
         include_digest=True,
+        allow_terminal_reference_selected=allow_terminal_exact,
         allow_claimed_pending_reference_selected=allow_pending,
     )
+    exact_selected = allow_pending or allow_terminal_exact
+    expected_status = "pending" if allow_pending else "failed"
     if (
-        blocker["status"] != ("pending" if allow_pending else "failed")
+        blocker["status"] != expected_status
         or blocker["blocker_reason"]
-        != ("claimed_pending" if allow_pending else "claimed_failed")
-        or blocker["in_reference_cohort"] is not allow_pending
-        or blocker["in_reference_selected_set"] is not allow_pending
+        != f"claimed_{expected_status}"
+        or blocker["in_reference_cohort"] is not exact_selected
+        or blocker["in_reference_selected_set"] is not exact_selected
         or not blocker["worker_id_present"]
         or blocker["claimed_at"] is None
     ):
@@ -10686,8 +10695,9 @@ def create_claim_release_plan(
     return {**body, "plan_digest": digest(body)}
 
 
-def create_exact_drain_claim_release_plan(
+def _create_exact_drain_claim_release_plan(
     *,
+    schema_version: int,
     selected_rows: Sequence[Mapping[str, Any]],
     reference_cohort_operation_ids: Sequence[str],
     candidate_release: Mapping[str, Any],
@@ -10710,11 +10720,22 @@ def create_exact_drain_claim_release_plan(
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
     """Create an immutable plan to clear claims left by a quiescent exact drain."""
+    if schema_version not in {3, 4}:
+        raise OperationRecoveryError(
+            "operation-recovery exact-drain claim-release schema is invalid"
+        )
     planned_at = int(time.time()) if created_at is None else _integer(
         created_at,
         "claim-release plan created-at",
     )
-    rows = [_claim_release_row(row, allow_pending=True) for row in selected_rows]
+    rows = [
+        _claim_release_row(
+            row,
+            allow_pending=schema_version == 3,
+            allow_terminal_exact=schema_version == 4,
+        )
+        for row in selected_rows
+    ]
     rows.sort(key=lambda row: (row["created_at"], row["operation_id"]))
     cohort_ids = sorted(_operation_id(value) for value in reference_cohort_operation_ids)
     paths = _claim_release_artifact_paths(
@@ -10727,7 +10748,7 @@ def create_exact_drain_claim_release_plan(
         }
     )
     body = {
-        "schema_version": 3,
+        "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-claim-release-plan",
         "authority": "unapproved-plan",
         "mutation_authorized": False,
@@ -10793,6 +10814,118 @@ def create_exact_drain_claim_release_plan(
     )
 
 
+def _exact_drain_claim_worker_digest(plan_digest: str) -> str:
+    checked = _sha(plan_digest, "claim-release reference plan digest")
+    worker_id = f"operation-recovery-exact-drain-{checked[:12]}"
+    return hashlib.sha256(worker_id.encode("utf-8")).hexdigest()
+
+
+def create_exact_drain_claim_release_plan(
+    *,
+    selected_rows: Sequence[Mapping[str, Any]],
+    reference_cohort_operation_ids: Sequence[str],
+    candidate_release: Mapping[str, Any],
+    installation_authority: Mapping[str, Any],
+    reference_plan_digest: str,
+    reference_application_journal_digest: str,
+    reference_progress_digest: str,
+    reference_worker_identity: Mapping[str, Any],
+    reference_live_snapshot_digest: str,
+    preserved_unselected_row_set_digest: str,
+    pre_generation: str,
+    guard_contract_version: int,
+    guard_contract_digest: str,
+    rollback_encryption: Mapping[str, Any],
+    rollback_bundle_path: str,
+    authorization_receipt_path: str,
+    application_receipt_path: str,
+    verification_receipt_path: str,
+    rollback_receipt_path: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Clear claims from pending retries left by a quiescent exact drain."""
+    return _create_exact_drain_claim_release_plan(
+        schema_version=3,
+        selected_rows=selected_rows,
+        reference_cohort_operation_ids=reference_cohort_operation_ids,
+        candidate_release=candidate_release,
+        installation_authority=installation_authority,
+        reference_plan_digest=reference_plan_digest,
+        reference_application_journal_digest=(
+            reference_application_journal_digest
+        ),
+        reference_progress_digest=reference_progress_digest,
+        reference_worker_identity=reference_worker_identity,
+        reference_live_snapshot_digest=reference_live_snapshot_digest,
+        preserved_unselected_row_set_digest=(
+            preserved_unselected_row_set_digest
+        ),
+        pre_generation=pre_generation,
+        guard_contract_version=guard_contract_version,
+        guard_contract_digest=guard_contract_digest,
+        rollback_encryption=rollback_encryption,
+        rollback_bundle_path=rollback_bundle_path,
+        authorization_receipt_path=authorization_receipt_path,
+        application_receipt_path=application_receipt_path,
+        verification_receipt_path=verification_receipt_path,
+        rollback_receipt_path=rollback_receipt_path,
+        created_at=created_at,
+    )
+
+
+def create_exact_drain_terminal_claim_release_plan(
+    *,
+    selected_rows: Sequence[Mapping[str, Any]],
+    reference_cohort_operation_ids: Sequence[str],
+    candidate_release: Mapping[str, Any],
+    installation_authority: Mapping[str, Any],
+    reference_plan_digest: str,
+    reference_application_journal_digest: str,
+    reference_progress_digest: str,
+    reference_worker_identity: Mapping[str, Any],
+    reference_live_snapshot_digest: str,
+    preserved_unselected_row_set_digest: str,
+    pre_generation: str,
+    guard_contract_version: int,
+    guard_contract_digest: str,
+    rollback_encryption: Mapping[str, Any],
+    rollback_bundle_path: str,
+    authorization_receipt_path: str,
+    application_receipt_path: str,
+    verification_receipt_path: str,
+    rollback_receipt_path: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Clear claims from exhausted failures left by a quiescent exact drain."""
+    return _create_exact_drain_claim_release_plan(
+        schema_version=4,
+        selected_rows=selected_rows,
+        reference_cohort_operation_ids=reference_cohort_operation_ids,
+        candidate_release=candidate_release,
+        installation_authority=installation_authority,
+        reference_plan_digest=reference_plan_digest,
+        reference_application_journal_digest=(
+            reference_application_journal_digest
+        ),
+        reference_progress_digest=reference_progress_digest,
+        reference_worker_identity=reference_worker_identity,
+        reference_live_snapshot_digest=reference_live_snapshot_digest,
+        preserved_unselected_row_set_digest=(
+            preserved_unselected_row_set_digest
+        ),
+        pre_generation=pre_generation,
+        guard_contract_version=guard_contract_version,
+        guard_contract_digest=guard_contract_digest,
+        rollback_encryption=rollback_encryption,
+        rollback_bundle_path=rollback_bundle_path,
+        authorization_receipt_path=authorization_receipt_path,
+        application_receipt_path=application_receipt_path,
+        verification_receipt_path=verification_receipt_path,
+        rollback_receipt_path=rollback_receipt_path,
+        created_at=created_at,
+    )
+
+
 def _verify_exact_drain_claim_release_plan(
     value: Any,
     *,
@@ -10816,7 +10949,15 @@ def _verify_exact_drain_claim_release_plan(
         raise OperationRecoveryError(
             "operation-recovery exact-drain claim-release rows are invalid"
         )
-    rows = [_claim_release_row(row, allow_pending=True) for row in rows_value]
+    schema_version = plan["schema_version"]
+    rows = [
+        _claim_release_row(
+            row,
+            allow_pending=schema_version == 3,
+            allow_terminal_exact=schema_version == 4,
+        )
+        for row in rows_value
+    ]
     identifiers = [row["operation_id"] for row in rows]
     cohort_identifiers = [_operation_id(value) for value in cohort_value]
     created_at = _integer(plan["created_at"], "claim-release plan created-at")
@@ -10849,8 +10990,12 @@ def _verify_exact_drain_claim_release_plan(
         ),
     }
     selected_count = len(rows)
+    reference_plan_digest = _sha(
+        plan["reference_plan_digest"],
+        "claim-release reference plan digest",
+    )
     if (
-        plan["schema_version"] != 3
+        schema_version not in {3, 4}
         or plan["kind"]
         != "operation-recovery-exact-drain-claim-release-plan"
         or plan["authority"] != "unapproved-plan"
@@ -10870,8 +11015,23 @@ def _verify_exact_drain_claim_release_plan(
             row["bank_id"] != "engineering"
             or row["operation_type"] != "retain"
             or row["retry_count"] < 1
-            or row["next_retry_at"] is None
+            or (
+                schema_version == 3
+                and row["next_retry_at"] is None
+            )
+            or (
+                schema_version == 4
+                and row["next_retry_at"] is not None
+            )
             for row in rows
+        )
+        or (
+            schema_version == 4
+            and any(
+                row["worker_id_digest"]
+                != _exact_drain_claim_worker_digest(reference_plan_digest)
+                for row in rows
+            )
         )
         or plan["selected_row_set_digest"] != _claim_release_row_set_digest(rows)
         or plan["permitted_blocker_count"] != 0
@@ -10899,16 +11059,13 @@ def _verify_exact_drain_claim_release_plan(
     authority = _installation_authority(plan["installation_authority"])
     _assert_installation_authority_schema(authority, plan_schema_version=15)
     body = {
-        "schema_version": 3,
+        "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-claim-release-plan",
         "authority": "unapproved-plan",
         "mutation_authorized": False,
         "candidate_release": _candidate_release(plan["candidate_release"]),
         "installation_authority": authority,
-        "reference_plan_digest": _sha(
-            plan["reference_plan_digest"],
-            "claim-release reference plan digest",
-        ),
+        "reference_plan_digest": reference_plan_digest,
         "reference_application_journal_digest": _sha(
             plan["reference_application_journal_digest"],
             "claim-release reference application journal digest",
@@ -10984,7 +11141,10 @@ def verify_claim_release_plan(
     now: int | None = None,
     allow_expired: bool = False,
 ) -> Mapping[str, Any]:
-    if isinstance(value, Mapping) and value.get("schema_version") == 3:
+    if (
+        isinstance(value, Mapping)
+        and value.get("schema_version") in {3, 4}
+    ):
         return _verify_exact_drain_claim_release_plan(
             value,
             now=now,

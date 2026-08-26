@@ -7762,7 +7762,7 @@ def _claim_release_expected(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]
             and expected_count != EXPECTED_CLAIM_RELEASE_ROW_COUNT
         )
         or (
-            plan.get("schema_version") == 3
+            plan.get("schema_version") in {3, 4}
             and not 1 <= expected_count <= sum(EXPECTED_OPERATION_COUNTS.values())
         )
     ):
@@ -7791,7 +7791,7 @@ def _claim_release_permitted_expected(
     permitted_rows = plan.get("permitted_blocker_rows")
     permitted_count = plan.get("permitted_blocker_count")
     cohort_operation_ids = plan.get("reference_cohort_operation_ids")
-    if plan.get("schema_version") == 3:
+    if plan.get("schema_version") in {3, 4}:
         if permitted_rows != [] or permitted_count != 0:
             raise OperationRecoveryError(
                 "operation-recovery claim-release permitted blocker set is invalid"
@@ -7921,6 +7921,23 @@ def _claim_release_groups_match(
             _claim_release_before_matches(rows_by_id[operation_id], item)
             for operation_id, item in permitted.items()
         )
+    )
+
+
+def _claim_release_preserved_row_set_digest(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    selected_operation_ids: set[str],
+) -> str:
+    return digest(
+        [
+            {
+                "operation_id": row["operation_id"],
+                "row_digest": live_row_digest(row),
+            }
+            for row in sorted(rows, key=lambda item: item["operation_id"])
+            if row["operation_id"] not in selected_operation_ids
+        ]
     )
 
 
@@ -8847,6 +8864,28 @@ async def apply_claim_release_transaction(
             raise OperationRecoveryError(
                 "operation-recovery claim-release requires exclusive database access"
             )
+        if plan.get("schema_version") == 4:
+            cohort_rows = await read_safe_operation_rows(
+                connection,
+                schema=schema,
+                bank_id="engineering",
+                operation_ids=[
+                    str(operation_id)
+                    for operation_id in reference_cohort_identifiers
+                ],
+                lock_clause="FOR UPDATE",
+            )
+            if (
+                len(cohort_rows) != len(reference_cohort_identifiers)
+                or _claim_release_preserved_row_set_digest(
+                    cohort_rows,
+                    selected_operation_ids=set(expected),
+                )
+                != plan.get("preserved_unselected_row_set_digest")
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery terminal claim-release cohort drifted"
+                )
         if plan.get("schema_version") == 2:
             outside_blocker = await connection.fetchval(
                 f"""
@@ -8869,7 +8908,7 @@ async def apply_claim_release_transaction(
             reference_cohort_identifiers=reference_cohort_identifiers,
             reference_selected_identifiers=(
                 identifiers
-                if plan.get("schema_version") == 3
+                if plan.get("schema_version") in {3, 4}
                 else permitted_identifiers
             ),
             for_update=True,
@@ -8884,7 +8923,22 @@ async def apply_claim_release_transaction(
             raise OperationRecoveryError(
                 "operation-recovery claim-release selected row drifted"
             )
-        if plan.get("schema_version") == 3:
+        if plan.get("schema_version") in {3, 4}:
+            if (
+                plan.get("schema_version") == 4
+                and any(
+                    item.get("worker_id_digest")
+                    != hashlib.sha256(
+                        exact_drain_worker_id(
+                            plan["reference_plan_digest"]
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    for item in expected.values()
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact-drain claim owner differs"
+                )
             ownership = await connection.fetchrow(
                 f"""
                 SELECT
@@ -8898,12 +8952,21 @@ async def apply_claim_release_transaction(
                             WHERE selected.operation_id = ($1::uuid[])[1]
                         )
                           AND outside.operation_id <> ALL($1::uuid[])
-                          AND outside.status IN ('pending', 'processing')
+                          AND (
+                              $2::integer = 3
+                              AND outside.status IN ('pending', 'processing')
+                              OR $2::integer = 4
+                              AND (
+                                  outside.worker_id IS NOT NULL
+                                  OR outside.claimed_at IS NOT NULL
+                              )
+                          )
                     ) AS outside_claim_count
                 FROM {quoted_schema}.async_operations
                 WHERE operation_id = ANY($1::uuid[])
                 """,
                 identifiers,
+                plan.get("schema_version"),
             )
             if (
                 ownership is None
@@ -8951,7 +9014,7 @@ async def apply_claim_release_transaction(
             reference_cohort_identifiers=reference_cohort_identifiers,
             reference_selected_identifiers=(
                 identifiers
-                if plan.get("schema_version") == 3
+                if plan.get("schema_version") in {3, 4}
                 else permitted_identifiers
             ),
             for_update=False,
@@ -8966,6 +9029,27 @@ async def apply_claim_release_transaction(
             raise OperationRecoveryError(
                 "operation-recovery claim-release post-state differs"
             )
+        if plan.get("schema_version") == 4:
+            post_cohort_rows = await read_safe_operation_rows(
+                connection,
+                schema=schema,
+                bank_id="engineering",
+                operation_ids=[
+                    str(operation_id)
+                    for operation_id in reference_cohort_identifiers
+                ],
+            )
+            if (
+                len(post_cohort_rows) != len(reference_cohort_identifiers)
+                or _claim_release_preserved_row_set_digest(
+                    post_cohort_rows,
+                    selected_operation_ids=set(expected),
+                )
+                != plan.get("preserved_unselected_row_set_digest")
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery terminal claim-release post-cohort differs"
+                )
         await _configure_transaction_deadline(connection, expires_at)
         _assert_transaction_deadline(expires_at)
     return (

@@ -184,6 +184,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     close_exact_drain_grant_claim,
     create_claim_release_plan,
     create_cohort_manifest,
+    create_exact_drain_terminal_claim_release_plan,
     create_exact_drain_authorization_grant_plan,
     create_exact_drain_grant_authorization_receipt,
     create_exact_drain_grant_ledger,
@@ -7562,6 +7563,297 @@ def operation_recovery_claim_release_plan_command(
     )
 
 
+async def _terminal_claim_release_plan_evidence(
+    args: argparse.Namespace,
+    *,
+    snapshot: Mapping[str, Any],
+    selected_operation_ids: Sequence[str],
+) -> tuple[Mapping[str, Any], list[dict[str, Any]]]:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        system_identifier_before = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_before = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_before,
+        )
+        generation_before, generation_after, rows = (
+            await read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=selected_operation_ids,
+                reference_cohort_operation_ids=[
+                    item["operation_id"]
+                    for item in snapshot["operations"]
+                ],
+                reference_selected_operation_ids=selected_operation_ids,
+                expected_generation=snapshot["generation_before"],
+            )
+        )
+        system_identifier_after = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_after = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_after,
+        )
+    finally:
+        await connection.close()
+    if (
+        generation_before != generation_after
+        or generation_before != snapshot["generation_before"]
+        or system_identifier_before != system_identifier_after
+        or authority_before != authority_after
+        or authority_after != snapshot["installation_authority"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release authority drifted"
+        )
+    return authority_after, rows
+
+
+def operation_recovery_terminal_claim_release_plan_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    age = _operation_recovery_tool(Path(args.age), "age")
+    reference = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(
+            args.reference_plan,
+            "terminal claim-release reference exact drain plan",
+        ),
+        allow_expired=True,
+    )
+    if reference["schema_version"] != 15:
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release requires schema 15"
+        )
+    authorization, journal = _operation_recovery_post_abort_reference_artifacts(
+        reference
+    )
+    progress_digest = _operation_recovery_post_abort_reference_progress_digest(
+        reference,
+        journal,
+    )
+    if _operation_recovery_exact_journal_worker_active(journal):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release worker remains active"
+        )
+    progress = read_exact_drain_progress(
+        Path(reference["progress_artifact_path"]),
+        plan_digest=reference["plan_digest"],
+        progress_schema_version=reference["progress_schema_version"],
+    )
+    snapshot = verify_live_snapshot(
+        _operation_recovery_read_private_json(
+            args.snapshot,
+            "terminal claim-release live snapshot",
+        )
+    )
+    reference_cohort_ids = sorted(
+        item["operation_id"] for item in reference["cohort"]["operations"]
+    )
+    snapshot_by_id = {
+        item["operation_id"]: item for item in snapshot["operations"]
+    }
+    reference_selected = {
+        item["operation_id"]: item for item in reference["selected_operations"]
+    }
+    progress_failed = {
+        item["operation_id"]: item
+        for item in progress["tasks"]
+        if item["status"] == "failed"
+    }
+    if (
+        snapshot["cohort_digest"] != reference["cohort_digest"]
+        or snapshot["installation_authority"]
+        != reference["installation_authority"]
+        or snapshot["generation_before"] != snapshot["generation_after"]
+        or sorted(snapshot_by_id) != reference_cohort_ids
+        or not progress_failed
+        or not set(progress_failed).issubset(reference_selected)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release lineage differs"
+        )
+    for operation_id, task in progress_failed.items():
+        row = snapshot_by_id[operation_id]
+        failure = task.get("failure")
+        expected_worker_id_digest = hashlib.sha256(
+            exact_drain_worker_id(reference["plan_digest"]).encode("utf-8")
+        ).hexdigest()
+        if (
+            row["current_status"] != "failed"
+            or row["operation_type"] != "retain"
+            or row["operation_type"]
+            != reference_selected[operation_id]["operation_type"]
+            or row["task_payload_digest"]
+            != reference_selected[operation_id]["task_payload_digest"]
+            or row["retry_count"] < 1
+            or row["next_retry_at"] is not None
+            or row["worker_id_present"] is not True
+            or row["worker_id_digest"] != expected_worker_id_digest
+            or row["claimed_at"] is None
+            or not isinstance(failure, Mapping)
+            or failure.get("retryable") is not False
+            or failure.get("error_digest") != row["error_digest"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal claim-release row differs"
+            )
+    selected_ids = sorted(progress_failed)
+    authority, live_rows = asyncio.run(
+        _terminal_claim_release_plan_evidence(
+            args,
+            snapshot=snapshot,
+            selected_operation_ids=selected_ids,
+        )
+    )
+    live_by_id = {row["operation_id"]: row for row in live_rows}
+    if set(live_by_id) != set(selected_ids):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release live row set differs"
+        )
+    selected_rows = []
+    for operation_id in selected_ids:
+        live = live_by_id[operation_id]
+        row = snapshot_by_id[operation_id]
+        if (
+            live["bank_id"] != "engineering"
+            or live["operation_type"] != row["operation_type"]
+            or live["status"] != row["current_status"]
+            or any(
+                live[key] != row[key]
+                for key in (
+                    "created_at",
+                    "updated_at",
+                    "completed_at",
+                    "retry_count",
+                    "next_retry_at",
+                    "worker_id_present",
+                    "worker_id_digest",
+                    "claimed_at",
+                    "task_payload_present",
+                    "task_payload_digest",
+                )
+            )
+            or live["in_reference_cohort"] is not True
+            or live["in_reference_selected_set"] is not True
+            or live["blocker_reason"] != "claimed_failed"
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal claim-release live row differs"
+            )
+        body = {key: live[key] for key in CLAIM_RELEASE_BLOCKER_KEYS}
+        selected_rows.append(
+            {
+                **body,
+                "row_digest": digest(body),
+                "nonclaim_state_digest": live["nonclaim_state_digest"],
+            }
+        )
+    preserved_unselected = [
+        {
+            "operation_id": operation_id,
+            "row_digest": row["row_digest"],
+        }
+        for operation_id, row in sorted(snapshot_by_id.items())
+        if operation_id not in progress_failed
+    ]
+    plan = create_exact_drain_terminal_claim_release_plan(
+        selected_rows=selected_rows,
+        reference_cohort_operation_ids=reference_cohort_ids,
+        candidate_release=candidate,
+        installation_authority=authority,
+        reference_plan_digest=reference["plan_digest"],
+        reference_application_journal_digest=journal["receipt_digest"],
+        reference_progress_digest=progress_digest,
+        reference_worker_identity={
+            key: journal[key]
+            for key in (
+                "worker_pid",
+                "worker_start_time",
+                "worker_attempt",
+            )
+        },
+        reference_live_snapshot_digest=snapshot["snapshot_digest"],
+        preserved_unselected_row_set_digest=digest(preserved_unselected),
+        pre_generation=snapshot["generation_before"],
+        guard_contract_version=QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+        guard_contract_digest=QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+        rollback_encryption={
+            **_operation_recovery_rollback_encryption(
+                args.rollback_recipient
+            ),
+            "age_path": str(age),
+        },
+        rollback_bundle_path=args.rollback_bundle,
+        authorization_receipt_path=args.authorization_receipt,
+        application_receipt_path=args.application_receipt,
+        verification_receipt_path=args.verification_receipt,
+        rollback_receipt_path=args.rollback_receipt,
+    )
+    artifact_paths = [
+        str(Path(args.output).resolve()),
+        *(
+            value
+            for key, value in plan.items()
+            if key.endswith("_path") and isinstance(value, str)
+        ),
+    ]
+    if len(
+        {
+            unicodedata.normalize("NFD", value.casefold())
+            for value in artifact_paths
+        }
+    ) != len(artifact_paths):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release path aliases an artifact"
+        )
+    if (
+        _operation_recovery_candidate(args) != candidate
+        or verify_exact_drain_plan(
+            _operation_recovery_read_private_json(
+                args.reference_plan,
+                "terminal claim-release reference exact drain plan",
+            ),
+            allow_expired=True,
+        )
+        != reference
+        or verify_live_snapshot(
+            _operation_recovery_read_private_json(
+                args.snapshot,
+                "terminal claim-release live snapshot",
+            )
+        )
+        != snapshot
+        or authorization
+        != _operation_recovery_post_abort_reference_artifacts(reference)[0]
+        or journal
+        != _operation_recovery_post_abort_reference_artifacts(reference)[1]
+        or progress_digest
+        != _operation_recovery_post_abort_reference_progress_digest(
+            reference,
+            journal,
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release evidence drifted"
+        )
+    write_private(args.output, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "plan_digest": plan["plan_digest"],
+            "expires_at": plan["expires_at"],
+            "selected_row_count": plan["selected_row_count"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
 def operation_recovery_claim_release_status_command(
     args: argparse.Namespace,
 ) -> int:
@@ -7794,6 +8086,15 @@ def operation_recovery_claim_release_apply_command(
     ):
         raise OperationRecoveryError(
             "operation-recovery claim-release apply approval differs"
+        )
+    if (
+        plan.get("schema_version") == 4
+        and _operation_recovery_exact_journal_worker_active(
+            plan["reference_worker_identity"]
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery terminal claim-release worker remains active"
         )
     manager = _portable_manager(args)
     with _operation_recovery_precommit_artifacts() as precommit, (
@@ -8068,7 +8369,7 @@ async def _claim_release_verify_live(
                     row["operation_id"]
                     for row in (
                         plan["selected_rows"]
-                        if plan.get("schema_version") == 3
+                        if plan.get("schema_version") in {3, 4}
                         else plan["permitted_blocker_rows"]
                     )
                 ],
@@ -15408,6 +15709,51 @@ def parser() -> argparse.ArgumentParser:
     recovery_claim_release_plan.add_argument("--output", required=True)
     recovery_claim_release_plan.set_defaults(
         run=operation_recovery_claim_release_plan_command
+    )
+
+    recovery_terminal_claim_release_plan = (
+        recovery_claim_release_commands.add_parser("terminal-plan")
+    )
+    add_operation_recovery_authority(recovery_terminal_claim_release_plan)
+    recovery_terminal_claim_release_plan.add_argument(
+        "--reference-plan",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--snapshot",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument("--age", required=True)
+    recovery_terminal_claim_release_plan.add_argument(
+        "--rollback-recipient",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--rollback-bundle",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--authorization-receipt",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--application-receipt",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--verification-receipt",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--rollback-receipt",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.add_argument(
+        "--output",
+        required=True,
+    )
+    recovery_terminal_claim_release_plan.set_defaults(
+        run=operation_recovery_terminal_claim_release_plan_command
     )
 
     recovery_claim_release_apply = recovery_claim_release_commands.add_parser(

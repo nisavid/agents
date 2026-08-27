@@ -9609,7 +9609,12 @@ def _operation_recovery_exact_recovery_context(
             )
         ),
         "initial_origin_digest": None,
-        "post_abort_selected_operation_ids_digest": digest(selected_ids),
+        "post_abort_selected_operation_ids_digest": digest(
+            sorted(
+                item["operation_id"]
+                for item in recovery_plan["retry_recovery"]["operations"]
+            )
+        ),
         "post_abort_plan_digest": recovery_plan["plan_digest"],
         "post_abort_application_receipt_digest": application[
             "receipt_digest"

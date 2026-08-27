@@ -8358,14 +8358,37 @@ async def apply_post_abort_recovery_transaction(
         if verified["schema_version"] in {10, 11, 12, 13}
         else {}
     )
-    if retry_by_id and set(retry_by_id) != set(selected):
-        raise OperationRecoveryError(
-            "operation-recovery post-abort retry row set differs"
-        )
     snapshot = {
         item["operation_id"]: item
         for item in verified["live_snapshot"]["operations"]
     }
+    lineage_only_ids = set(retry_by_id) - set(selected)
+    reference_plan = verified.get("reference_plan")
+    mixed_retry_lineage_allowed = (
+        bool(lineage_only_ids)
+        and verified["schema_version"] == 11
+        and isinstance(reference_plan, Mapping)
+        and reference_plan.get("schema_version") == 15
+        and verified["retry_recovery"].get("schema_version") == 2
+        and all(
+            operation_id in snapshot
+            and snapshot[operation_id]["current_status"] == "pending"
+            and retry_by_id[operation_id]["expected_status"] == "pending"
+            and retry_by_id[operation_id]["reset_applied"] is False
+            and retry_by_id[operation_id]["retry_count_before"]
+            == snapshot[operation_id]["retry_count"]
+            and retry_by_id[operation_id]["retry_count_after"]
+            == snapshot[operation_id]["retry_count"]
+            for operation_id in lineage_only_ids
+        )
+    )
+    if retry_by_id and (
+        not set(selected).issubset(retry_by_id)
+        or (lineage_only_ids and not mixed_retry_lineage_allowed)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry row set differs"
+        )
     selected_identifiers = [uuid.UUID(value) for value in selected]
     expires_at = verified["expires_at"]
     transaction_expires_at = min(

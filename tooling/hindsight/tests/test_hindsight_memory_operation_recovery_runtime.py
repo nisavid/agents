@@ -8077,6 +8077,65 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     ("systalyze:public:123", "systalyze:public:124"),
                 )
 
+        mixed_plan = {
+            **plan,
+            "schema_version": 11,
+            "reference_plan": {"schema_version": 15},
+            "live_snapshot": {
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "current_status": before["status"],
+                        "retry_count": before["retry_count"],
+                        "row_digest": live_row_digest(before),
+                    },
+                    {
+                        "operation_id": preserved["operation_id"],
+                        "current_status": preserved["status"],
+                        "retry_count": preserved["retry_count"],
+                        "row_digest": live_row_digest(preserved),
+                    },
+                ]
+            },
+            "retry_recovery": {
+                "schema_version": 2,
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "expected_status": "failed",
+                        "retry_count_before": 3,
+                        "retry_count_after": 0,
+                        "reset_applied": True,
+                    },
+                    {
+                        "operation_id": preserved["operation_id"],
+                        "expected_status": "pending",
+                        "retry_count_before": 1,
+                        "retry_count_after": 1,
+                        "reset_applied": False,
+                    },
+                ],
+            },
+        }
+        with patch.object(
+            operation_recovery_runtime,
+            "verify_post_abort_recovery_plan",
+            side_effect=lambda value: value,
+        ):
+            generations = asyncio.run(
+                apply_post_abort_recovery_transaction(
+                    PostAbortConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=mixed_plan,
+                )
+            )
+        self.assertEqual(
+            generations,
+            ("systalyze:public:123", "systalyze:public:124"),
+        )
+
     def test_rollback_reconciles_claimed_selected_preimage(self):
         restored = {
             "operation_id": "00000000-0000-4000-8000-000000000001",

@@ -7141,23 +7141,21 @@ def _post_abort_worker_digest(reference_plan_digest: str) -> str:
     ).hexdigest()
 
 
-def _post_abort_released_operation_ids(
+def _post_abort_progress_evidence(
     reference_plan: Mapping[str, Any],
     *,
     expected_progress_digest: str,
-) -> frozenset[str]:
-    """Return rows durably marked released by the reference worker.
+) -> dict[str, Any] | None:
+    """Return authenticated payload-free progress for the reference worker.
 
-    A repaired worker can persist a retain checkpoint and then release its
-    claim while shutting down.  The row is consequently unowned in the
-    post-abort snapshot even though its durable metadata changed during the
-    worker attempt.  Keep the proof tied to the plan-bound, payload-free
-    progress artifact; absent artifacts retain the historical contract used
-    by older plans and fixtures.
+    Keep all progress-derived recovery evidence tied to the plan digest, the
+    expected progress digest, and (for schema 15) the exact authorization
+    grant.  Absent artifacts retain the historical contract used by older
+    plans and fixtures.
     """
     progress_path = Path(reference_plan["progress_artifact_path"])
     if not progress_path.exists():
-        return frozenset()
+        return None
     # Import lazily: the progress module imports this contract module for its
     # shared error type and archive-path helper.
     from .operation_recovery_progress import read_exact_drain_progress
@@ -7186,11 +7184,51 @@ def _post_abort_released_operation_ids(
         raise OperationRecoveryError(
             "operation-recovery post-abort progress differs"
         )
+    return progress
+
+
+def _post_abort_released_operation_ids(
+    reference_plan: Mapping[str, Any],
+    *,
+    expected_progress_digest: str,
+) -> frozenset[str]:
+    """Return rows durably marked released by the reference worker."""
+    progress = _post_abort_progress_evidence(
+        reference_plan,
+        expected_progress_digest=expected_progress_digest,
+    )
+    if progress is None:
+        return frozenset()
     return frozenset(
         item["operation_id"]
         for item in progress["tasks"]
         if item["status"] == "pending" and item["stage"] == "released"
     )
+
+
+def _post_abort_queued_reference_rows(
+    reference_plan: Mapping[str, Any],
+    *,
+    expected_progress_digest: str,
+) -> dict[str, tuple[str, float]]:
+    """Return queued rows proven untouched when reference progress closed."""
+    progress = _post_abort_progress_evidence(
+        reference_plan,
+        expected_progress_digest=expected_progress_digest,
+    )
+    if progress is None:
+        return {}
+    return {
+        item["operation_id"]: (
+            item["row_digest"],
+            float(progress["observed_at"]),
+        )
+        for item in progress["tasks"]
+        if item["status"] == "pending"
+        and item["stage"] == "queued"
+        and item.get("failure") is None
+        and item.get("checkpoint") is None
+    }
 
 
 def _post_abort_reference_application_journal(
@@ -7663,6 +7701,7 @@ def _post_abort_v11_retry_recovery(
     prior_retry_recovery_value: Mapping[str, Any] | None,
     *,
     reference_application_progress_digest: str,
+    safe_omitted_pending_ids: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     context = reference_plan.get("recovery_context")
     if (
@@ -7703,7 +7742,7 @@ def _post_abort_v11_retry_recovery(
     recovery_epoch_before = context["recovery_epoch"]
     recovery_epoch_after = recovery_epoch_before + 1
     release_only_recovery = recovery_epoch_before == 2
-    # A schema-12 worker may have durably released a subset of its claimed
+    # A repaired worker may have durably released a subset of its claimed
     # rows before the worker stopped.  Those rows are authenticated by the
     # progress artifact and must not be selected again merely because the
     # recovery is still at epoch one.  Keep the older epoch-one contract
@@ -7715,7 +7754,7 @@ def _post_abort_v11_retry_recovery(
                 reference_application_progress_digest
             ),
         )
-        if reference_plan["schema_version"] == 12
+        if reference_plan["schema_version"] in {12, 15}
         else frozenset()
     )
     omitted_operation_ids = set(reference_selected) - selected_ids
@@ -7758,8 +7797,14 @@ def _post_abort_v11_retry_recovery(
                 and current[operation_id]["worker_id_present"] is False
                 and current[operation_id]["worker_id_digest"] is None
                 and current[operation_id]["claimed_at"] is None
-                and current[operation_id]["row_digest"]
-                == reference_snapshot[operation_id]["row_digest"]
+                and (
+                    current[operation_id]["row_digest"]
+                    == reference_snapshot[operation_id]["row_digest"]
+                    or (
+                        safe_omitted_pending_ids is not None
+                        and operation_id in safe_omitted_pending_ids
+                    )
+                )
             )
             for operation_id in omitted_operation_ids
         )
@@ -7808,8 +7853,18 @@ def _post_abort_v11_retry_recovery(
         raise OperationRecoveryError(
             "operation-recovery post-abort retry recovery is invalid"
         )
+    lineage_items = list(selected)
+    lineage_items.extend(
+        {
+            "operation_id": operation_id,
+            "expected_status": "pending",
+        }
+        for operation_id in sorted(
+            (safe_omitted_pending_ids or frozenset()) - selected_ids
+        )
+    )
     operations = []
-    for item in selected:
+    for item in lineage_items:
         operation_id = item["operation_id"]
         row = current[operation_id]
         prior = prior_by_id.get(operation_id)
@@ -8117,6 +8172,15 @@ def _post_abort_v10_contract(
 ]:
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
     recovery_context = reference_plan.get("recovery_context")
+    schema_fifteen_epoch_one_progress_capable = (
+        schema_version == 11
+        and isinstance(recovery_context, Mapping)
+        and recovery_context.get("schema_version") == 1
+        and reference_plan.get("schema_version") == 15
+        and recovery_context.get("origin") == "post-abort"
+        and recovery_context.get("recovery_epoch") == 1
+        and reference_plan.get("progress_schema_version") == 6
+    )
     released_checkpoint_capable = (
         schema_version in {12, 13}
         or (
@@ -8130,8 +8194,14 @@ def _post_abort_v10_contract(
                 )
                 or (
                     reference_plan.get("schema_version") == 15
-                    and recovery_context.get("origin") == "initial-snapshot"
-                    and recovery_context.get("recovery_epoch") == 0
+                    and (
+                        (
+                            recovery_context.get("origin")
+                            == "initial-snapshot"
+                            and recovery_context.get("recovery_epoch") == 0
+                        )
+                        or schema_fifteen_epoch_one_progress_capable
+                    )
                 )
             )
         )
@@ -8145,6 +8215,16 @@ def _post_abort_v10_contract(
         )
         if released_checkpoint_capable
         else frozenset()
+    )
+    queued_reference_rows = (
+        _post_abort_queued_reference_rows(
+            reference_plan,
+            expected_progress_digest=(
+                reference_application_progress_digest
+            ),
+        )
+        if schema_fifteen_epoch_one_progress_capable
+        else {}
     )
     reference_selected = {
         item["operation_id"]: item
@@ -8196,6 +8276,7 @@ def _post_abort_v10_contract(
         )
 
     selected = []
+    safe_changed_pending_ids: set[str] = set()
     for operation_id in sorted(reference_selected):
         row = current[operation_id]
         status = row["current_status"]
@@ -8246,6 +8327,10 @@ def _post_abort_v10_contract(
             )
             released_retry_checkpoint_advanced = (
                 released_checkpoint_capable
+                and (
+                    not schema_fifteen_epoch_one_progress_capable
+                    or operation_id in released_operation_ids
+                )
                 and row["result_metadata_digest"] is not None
                 and row["result_metadata_digest"]
                 != reference_row["result_metadata_digest"]
@@ -8274,6 +8359,23 @@ def _post_abort_v10_contract(
                 and current_updated_at is not None
                 and current_updated_at > reference_updated_at
             )
+            retry_only_checkpoint_advanced = (
+                schema_fifteen_epoch_one_progress_capable
+                and operation_id in queued_reference_rows
+                and queued_reference_rows[operation_id][0]
+                == reference_row["row_digest"]
+                and row["retry_count"] == reference_row["retry_count"] + 1
+                and reference_updated_at is not None
+                and current_updated_at is not None
+                and current_updated_at > reference_updated_at
+                and current_updated_at
+                > queued_reference_rows[operation_id][1]
+                and all(
+                    row[key] == value
+                    for key, value in reference_row.items()
+                    if key not in {"retry_count", "row_digest", "updated_at"}
+                )
+            )
             if (
                 reference_row["current_status"] != "pending"
                 or not reference_wholly_unowned
@@ -8286,6 +8388,7 @@ def _post_abort_v10_contract(
                     and not (
                         released_retry_checkpoint_advanced
                         or released_worker_checkpoint_advanced
+                        or retry_only_checkpoint_advanced
                     )
                 )
                 or (
@@ -8319,6 +8422,8 @@ def _post_abort_v10_contract(
                 raise OperationRecoveryError(
                     "operation-recovery post-abort row set is invalid"
                 )
+            if row["row_digest"] != reference_row["row_digest"]:
+                safe_changed_pending_ids.add(operation_id)
         elif status == "completed" and owned:
             if (
                 row["completed_at"] is None
@@ -8382,6 +8487,9 @@ def _post_abort_v10_contract(
             prior_retry_recovery,
             reference_application_progress_digest=(
                 reference_application_progress_digest
+            ),
+            safe_omitted_pending_ids=frozenset(
+                safe_changed_pending_ids
             ),
         )
     )

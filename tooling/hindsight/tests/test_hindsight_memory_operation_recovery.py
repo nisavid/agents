@@ -900,6 +900,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             self.standing_grant_fixture()
         )
         released_id = plan["selected_operations"][0]["operation_id"]
+        queued = plan["selected_operations"][1]
 
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             progress_path = Path(directory) / "progress.json"
@@ -934,6 +935,17 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ),
                 frozenset({released_id}),
             )
+            queued_reference_rows = (
+                recovery_contract._post_abort_queued_reference_rows(
+                    reference,
+                    expected_progress_digest=progress["progress_digest"],
+                )
+            )
+            self.assertEqual(
+                queued_reference_rows[queued["operation_id"]],
+                (queued["row_digest"], float(progress["observed_at"])),
+            )
+            self.assertNotIn(released_id, queued_reference_rows)
             with self.assertRaisesRegex(
                 OperationRecoveryError,
                 "post-abort progress differs",
@@ -2027,6 +2039,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         initial = self.drain_plan(schema_version=12)
         reference = deepcopy(initial)
         reference["schema_version"] = 15
+        reference["progress_schema_version"] = 6
         rebound_authority = rebound_installation_authority()
         reference["installation_authority"] = rebound_authority
         reference["live_snapshot"]["installation_authority"] = (
@@ -2157,6 +2170,304 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 [failed],
                 foreign_completed,
                 prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
+    def test_schema_fifteen_epoch_one_retry_accepts_safe_pending_progress(self):
+        """Epoch one preserves released and retry-only pending rows."""
+        initial = self.drain_plan(schema_version=12)
+        reference = deepcopy(initial)
+        reference["schema_version"] = 15
+        reference["progress_schema_version"] = 6
+        rebound_authority = rebound_installation_authority()
+        reference["installation_authority"] = rebound_authority
+        reference["live_snapshot"]["installation_authority"] = (
+            rebound_authority
+        )
+        reference_selected = reference["selected_operations"]
+        current = {
+            item["operation_id"]: deepcopy(item)
+            for item in reference["live_snapshot"]["operations"]
+        }
+        prior = recovery_contract._post_abort_v10_retry_recovery(
+            reference,
+            reference_selected,
+            current,
+        )
+        selected_ids = sorted(
+            item["operation_id"] for item in reference_selected
+        )
+        reference["recovery_context"] = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": "systalyze:public:124",
+            "recovery_epoch": 1,
+            "candidate_release_digest": release_identity()["release_digest"],
+            "selected_operation_ids_digest": digest(selected_ids),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": digest(selected_ids),
+            "post_abort_plan_digest": initial["plan_digest"],
+            "post_abort_application_receipt_digest": "a" * 64,
+            "post_abort_verification_receipt_digest": "b" * 64,
+            "retry_recovery_digest": digest(prior),
+            "selected_checkpoint_set_digest": "c" * 64,
+            "preserved_row_set_digest": "d" * 64,
+        }
+        failed_id = reference_selected[0]["operation_id"]
+        completed_id = reference_selected[1]["operation_id"]
+        released_id = reference_selected[2]["operation_id"]
+        retry_only_id = reference_selected[3]["operation_id"]
+        retry_only_reference_digest = current[retry_only_id]["row_digest"]
+        worker_digest = recovery_contract._post_abort_worker_digest(
+            reference["plan_digest"]
+        )
+        for operation_id, status in (
+            (failed_id, "failed"),
+            (completed_id, "completed"),
+        ):
+            row = current[operation_id]
+            row.update(
+                current_status=status,
+                completed_at="2026-08-20T15:00:00.000000Z",
+                updated_at="2026-08-20T15:00:00.000000Z",
+                retry_count=3 if status == "failed" else 1,
+                worker_id_present=True,
+                worker_id_digest=worker_digest,
+                claimed_at="2026-08-20T14:00:00.000000Z",
+            )
+            row["row_digest"] = digest(
+                {key: value for key, value in row.items() if key != "row_digest"}
+            )
+        released = current[released_id]
+        released.update(
+            updated_at="2026-08-20T15:00:00.000000Z",
+            retry_count=released["retry_count"] + 1,
+            next_retry_at="2026-08-20T14:59:00.000000Z",
+            result_metadata_digest="e" * 64,
+            error_category="provider_transport",
+            error_digest="f" * 64,
+        )
+        released["row_digest"] = digest(
+            {
+                key: value
+                for key, value in released.items()
+                if key != "row_digest"
+            }
+        )
+        retry_only = current[retry_only_id]
+        retry_only.update(
+            updated_at="2026-08-20T15:00:00.000000Z",
+            retry_count=retry_only["retry_count"] + 1,
+        )
+        retry_only["row_digest"] = digest(
+            {
+                key: value
+                for key, value in retry_only.items()
+                if key != "row_digest"
+            }
+        )
+        snapshot = deepcopy(reference["live_snapshot"])
+        snapshot.update(
+            operations=list(current.values()),
+            observed_at=1_787_300_000,
+        )
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+
+        with (
+            patch.object(
+                recovery_contract,
+                "_post_abort_released_operation_ids",
+                return_value=frozenset({released_id}),
+            ),
+            patch.object(
+                recovery_contract,
+                "_post_abort_queued_reference_rows",
+                return_value={
+                    retry_only_id: (retry_only_reference_digest, 0.0)
+                },
+            ),
+        ):
+            result = recovery_contract._post_abort_v10_contract(
+                reference,
+                snapshot,
+                schema_version=11,
+                prior_retry_recovery=prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
+        self.assertEqual(
+            [item["operation_id"] for item in result[0]],
+            [failed_id],
+        )
+        self.assertEqual(result[5]["retry_recovery"]["schema_version"], 2)
+        retry_recovery = result[5]["retry_recovery"]
+        self.assertEqual(retry_recovery["operation_count"], 3)
+        self.assertEqual(retry_recovery["failed_reset_count"], 1)
+        self.assertEqual(
+            {
+                item["operation_id"]: item["reset_applied"]
+                for item in retry_recovery["operations"]
+            },
+            {
+                failed_id: True,
+                released_id: False,
+                retry_only_id: False,
+            },
+        )
+
+        with (
+            patch.object(
+                recovery_contract,
+                "_post_abort_released_operation_ids",
+                return_value=frozenset({released_id}),
+            ),
+            patch.object(
+                recovery_contract,
+                "_post_abort_queued_reference_rows",
+                return_value={},
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "row set is invalid",
+            ),
+        ):
+            recovery_contract._post_abort_v10_contract(
+                reference,
+                snapshot,
+                schema_version=11,
+                prior_retry_recovery=prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
+        invalid_delta = deepcopy(snapshot)
+        invalid_delta_row = next(
+            item
+            for item in invalid_delta["operations"]
+            if item["operation_id"] == retry_only_id
+        )
+        invalid_delta_row["retry_count"] += 1
+        invalid_delta_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in invalid_delta_row.items()
+                if key != "row_digest"
+            }
+        )
+        invalid_delta["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in invalid_delta.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with (
+            patch.object(
+                recovery_contract,
+                "_post_abort_released_operation_ids",
+                return_value=frozenset({released_id}),
+            ),
+            patch.object(
+                recovery_contract,
+                "_post_abort_queued_reference_rows",
+                return_value={
+                    retry_only_id: (retry_only_reference_digest, 0.0)
+                },
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "row set is invalid",
+            ),
+        ):
+            recovery_contract._post_abort_v10_contract(
+                reference,
+                invalid_delta,
+                schema_version=11,
+                prior_retry_recovery=prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
+        invalid = deepcopy(snapshot)
+        invalid_retry_only = next(
+            item
+            for item in invalid["operations"]
+            if item["operation_id"] == retry_only_id
+        )
+        invalid_retry_only.update(
+            error_category="unknown",
+            error_digest="0" * 64,
+        )
+        invalid_retry_only["row_digest"] = digest(
+            {
+                key: value
+                for key, value in invalid_retry_only.items()
+                if key != "row_digest"
+            }
+        )
+        invalid["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in invalid.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with (
+            patch.object(
+                recovery_contract,
+                "_post_abort_released_operation_ids",
+                return_value=frozenset({released_id}),
+            ),
+            patch.object(
+                recovery_contract,
+                "_post_abort_queued_reference_rows",
+                return_value={
+                    retry_only_id: (retry_only_reference_digest, 0.0)
+                },
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "row set is invalid",
+            ),
+        ):
+            recovery_contract._post_abort_v10_contract(
+                reference,
+                invalid,
+                schema_version=11,
+                prior_retry_recovery=prior,
+                reference_application_progress_digest="f" * 64,
+            )
+
+        legacy = deepcopy(reference)
+        legacy["schema_version"] = 12
+        with (
+            patch.object(
+                recovery_contract,
+                "_post_abort_released_operation_ids",
+                return_value=frozenset({released_id}),
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "row set is invalid",
+            ),
+        ):
+            recovery_contract._post_abort_v10_contract(
+                legacy,
+                snapshot,
+                schema_version=11,
+                prior_retry_recovery=prior,
                 reference_application_progress_digest="f" * 64,
             )
 

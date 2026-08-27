@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Re-prove the original account binding before every task continuation, bind
+  alternate-account Codex CLI resumes with explicit `CODEX_HOME`, and reject
+  ambient resumes before sending task data when account affinity is unproven.
 - Define target, relationship, ownership, transport, and assurance as
   independent delegation dimensions, with model choice kept separate.
 - Require controller-observed evidence for every fact an ordinary consumer

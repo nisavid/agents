@@ -3461,10 +3461,37 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "recovery_epoch_after": 2,
                 "recovery_epoch_ceiling": 2,
             }
+            selected_ids = {
+                item["operation_id"]
+                for item in recovery["selected_operations"]
+            }
+            preserved_row = next(
+                item
+                for item in snapshot["operations"]
+                if item["operation_id"] not in selected_ids
+                and item["current_status"] == "pending"
+            )
+            retry_template = recovery["retry_recovery"]["operations"][0]
+            recovery["retry_recovery"]["operations"].append(
+                {
+                    **retry_template,
+                    "operation_id": preserved_row["operation_id"],
+                    "expected_status": preserved_row["current_status"],
+                    "retry_count_before": preserved_row["retry_count"],
+                    "retry_count_after": preserved_row["retry_count"],
+                    "reset_applied": False,
+                }
+            )
             application = documents[recovery["application_receipt_path"]]
             verification = documents[
                 recovery["verification_receipt_path"]
             ]
+            successor_candidate = {
+                **recovery["candidate_release"],
+                "source_commit": "6" * 40,
+                "version": "2026.08.27+6666666.operation-recovery.104",
+                "release_digest": "7" * 64,
+            }
             replacements = {
                 "verify_post_abort_recovery_plan": (
                     lambda _value, *, allow_expired: recovery
@@ -3487,6 +3514,80 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     snapshot=snapshot,
                     candidate_release=recovery["candidate_release"],
                 )
+                successor_context = helper(
+                    SimpleNamespace(recovery_plan=str(recovery_path)),
+                    snapshot=snapshot,
+                    candidate_release=successor_candidate,
+                )
+                rebound_generation_snapshot = deepcopy(snapshot)
+                rebound_generation_snapshot["generation_before"] = (
+                    "systalyze:public:999"
+                )
+                rebound_generation_snapshot["generation_after"] = (
+                    "systalyze:public:999"
+                )
+                with self.assertRaisesRegex(
+                    Exception,
+                    "recovery handoff differs",
+                ):
+                    helper(
+                        SimpleNamespace(recovery_plan=str(recovery_path)),
+                        snapshot=rebound_generation_snapshot,
+                        candidate_release=successor_candidate,
+                    )
+                drifted_snapshot = deepcopy(snapshot)
+                selected_row = next(
+                    item
+                    for item in drifted_snapshot["operations"]
+                    if item["operation_id"] in selected_ids
+                )
+                selected_row["task_payload_digest"] = "8" * 64
+                with self.assertRaisesRegex(
+                    Exception,
+                    "recovery handoff differs",
+                ):
+                    helper(
+                        SimpleNamespace(recovery_plan=str(recovery_path)),
+                        snapshot=drifted_snapshot,
+                        candidate_release=successor_candidate,
+                    )
+                missing_selected_retry = recovery["retry_recovery"][
+                    "operations"
+                ].pop(0)
+                try:
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "recovery handoff differs",
+                    ):
+                        helper(
+                            SimpleNamespace(
+                                recovery_plan=str(recovery_path)
+                            ),
+                            snapshot=snapshot,
+                            candidate_release=recovery["candidate_release"],
+                        )
+                finally:
+                    recovery["retry_recovery"]["operations"].insert(
+                        0,
+                        missing_selected_retry,
+                    )
+                drifted_lineage_snapshot = deepcopy(snapshot)
+                drifted_lineage_row = next(
+                    item
+                    for item in drifted_lineage_snapshot["operations"]
+                    if item["operation_id"]
+                    == preserved_row["operation_id"]
+                )
+                drifted_lineage_row["retry_count"] += 1
+                with self.assertRaisesRegex(
+                    Exception,
+                    "recovery handoff differs",
+                ):
+                    helper(
+                        SimpleNamespace(recovery_plan=str(recovery_path)),
+                        snapshot=drifted_lineage_snapshot,
+                        candidate_release=recovery["candidate_release"],
+                    )
             finally:
                 globals_.update(originals)
 
@@ -3495,6 +3596,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(
                 context["post_abort_plan_digest"],
                 recovery["plan_digest"],
+            )
+            self.assertEqual(
+                successor_context["candidate_release_digest"],
+                successor_candidate["release_digest"],
             )
 
     def test_post_terminal_handoff_allows_approved_candidate_repair(self):

@@ -850,6 +850,174 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     predecessor_plan_digest=reference["plan_digest"],
                 )
 
+    def test_schema_fifteen_accepts_epoch_two_reference_context(self):
+        created_at = 1_785_462_000
+        snapshot = self.drain_snapshot()
+        candidate = release_identity()
+        context = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": snapshot["generation_before"],
+            "recovery_epoch": 2,
+            "candidate_release_digest": candidate["release_digest"],
+            "selected_operation_ids_digest": digest(
+                sorted(
+                    item["operation_id"]
+                    for item in snapshot["operations"]
+                    if item["current_status"] == "pending"
+                )
+            ),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": "1" * 64,
+            "post_abort_plan_digest": "2" * 64,
+            "post_abort_application_receipt_digest": "3" * 64,
+            "post_abort_verification_receipt_digest": "4" * 64,
+            "retry_recovery_digest": "5" * 64,
+            "selected_checkpoint_set_digest": "6" * 64,
+            "preserved_row_set_digest": "7" * 64,
+        }
+
+        def create_plan(
+            *,
+            schema_version,
+            recovery_context=context,
+            grant=None,
+            predecessor=None,
+        ):
+            return recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                snapshot,
+                candidate_release=candidate,
+                rollback_backup=drain_backup_evidence(),
+                rollback_backup_path=(
+                    f"/private/tmp/epoch-two-v{schema_version}-backup.age"
+                ),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=(
+                    f"/private/tmp/epoch-two-v{schema_version}-auth.json"
+                ),
+                application_receipt_path=(
+                    f"/private/tmp/epoch-two-v{schema_version}-app.json"
+                ),
+                status_artifact_path=(
+                    f"/private/tmp/epoch-two-v{schema_version}-status.json"
+                ),
+                verification_receipt_path=(
+                    f"/private/tmp/epoch-two-v{schema_version}-verify.json"
+                ),
+                recovery_context=recovery_context,
+                hatchery_capability_receipt=(
+                    recovery_contract.create_hatchery_capability_receipt(
+                        provider_policy_digest="9" * 64,
+                        provider_identity_digest="a" * 64,
+                        model_digest="b" * 64,
+                        observed_at=created_at,
+                        successful=True,
+                    )
+                    if schema_version == 15
+                    else None
+                ),
+                candidate_runtime_snapshot_schema_version=8,
+                authorization_grant=grant,
+                grant_predecessor_plan_digest=predecessor,
+                created_at=created_at,
+                schema_version=schema_version,
+            )
+
+        reference = create_plan(schema_version=12)
+        grant_plan = (
+            recovery_contract.create_exact_drain_authorization_grant_plan(
+                reference,
+                grant_id="77777777-7777-4777-8777-777777777777",
+                maximum_recovery_epoch=2,
+                maximum_reconciliation_cycle=0,
+                maximum_plan_claims=1,
+                maximum_worker_attempts=reference["worker_max_attempts"] + 1,
+                maximum_execution_seconds=(
+                    recovery_contract.EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS
+                ),
+                maximum_concurrent_drains=1,
+                created_at=created_at,
+                expires_at=created_at + 172_800,
+            )
+        )
+        grant = recovery_contract.activate_exact_drain_authorization_grant(
+            grant_plan,
+            approval_digest=grant_plan["grant_plan_digest"],
+            approved_at=created_at,
+        )
+        descendant = create_plan(
+            schema_version=15,
+            grant=grant,
+            predecessor=reference["plan_digest"],
+        )
+        self.assertEqual(descendant["recovery_context"], context)
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                descendant,
+                now=created_at,
+            ),
+            descendant,
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "recovery context is invalid",
+        ):
+            create_plan(
+                schema_version=15,
+                recovery_context={
+                    **context,
+                    "candidate_release_digest": "f" * 64,
+                },
+                grant=grant,
+                predecessor=reference["plan_digest"],
+            )
+        for field in (
+            "post_abort_selected_operation_ids_digest",
+            "post_abort_plan_digest",
+            "post_abort_application_receipt_digest",
+            "post_abort_verification_receipt_digest",
+            "retry_recovery_digest",
+            "selected_checkpoint_set_digest",
+            "preserved_row_set_digest",
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                OperationRecoveryError,
+                "exact drain grant scope differs",
+            ):
+                create_plan(
+                    schema_version=15,
+                    recovery_context={**context, field: "f" * 64},
+                    grant=grant,
+                    predecessor=reference["plan_digest"],
+                )
+        wrong_predecessor = create_plan(
+            schema_version=15,
+            grant=grant,
+            predecessor="0" * 64,
+        )
+        ledger = recovery_contract.create_exact_drain_grant_ledger(
+            grant,
+            ledger_nonce="8" * 64,
+            created_at=created_at,
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain grant continuity differs",
+        ):
+            recovery_contract.claim_exact_drain_grant(
+                ledger,
+                wrong_predecessor,
+                expected_ledger_digest=ledger["ledger_digest"],
+                claim_nonce="9" * 64,
+                ledger_nonce="a" * 64,
+                claimed_at=created_at,
+            )
+
     def test_schema_fifteen_separates_request_and_operation_deadlines(self):
         reference, _grant, plan, _create_plan = self.standing_grant_fixture()
 

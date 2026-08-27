@@ -4443,7 +4443,7 @@ def _exact_drain_recovery_context(
             not in {(1, 1), (2, 2), (3, 3)}
             or (
                 body["schema_version"] == 2
-                and plan_schema_version not in {11, 12}
+                and plan_schema_version not in {11, 12, 15}
             )
             or (
                 body["schema_version"] == 3
@@ -4559,6 +4559,10 @@ def _exact_drain_assert_grant_scope(
             == scope["initial_reference_plan_digest"]
             and (
                 plan["pre_generation"] != scope["initial_generation"]
+                or plan["recovery_context_digest"]
+                != grant["grant_plan"]["reference_plan"][
+                    "recovery_context_digest"
+                ]
                 or recovery_epoch != scope["minimum_recovery_epoch"]
                 or reconciliation_cycle
                 != scope["minimum_reconciliation_cycle"]

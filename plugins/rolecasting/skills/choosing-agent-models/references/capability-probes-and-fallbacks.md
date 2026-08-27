@@ -18,6 +18,12 @@ Model selection does not grant authority to invoke a model, peer, CLI, API, or e
 
 During an already authorized no-task-data refresh, you may inspect route metadata exposed for unrelated tasks, including advertised model availability; this does not authorize reading task data. An existing task is eligible only when delegation created it for the current source task and bounded purpose, or the operator identified it as a same-purpose companion. Do not use an unrelated task as an execution or authorization route for current-task work, including to execute with its model or under its account, entitlement, permissions, or context.
 
+## Re-prove Continuation Capability
+
+Initial capability proof does not prove continuation capability. Before sending continuation task data, run a fresh no-task-data refresh against the same private account binding and require the exact selected model to remain exposed on the continuation surface. A task or session ID and its stored provider or model are useful identity facts, but a shared session database is not account-affinity evidence.
+
+Require the continuation actuator to select and observe the same private account binding used for the successful initial dispatch. If it cannot, treat capability as unproven and fail closed without sending the continuation payload. A newly created dedicated task or session still requires the owning workflow's creation authority and a fresh capability proof; it does not make an unrelated task eligible.
+
 ## Handle Probe Failure
 
 Treat capability as unproven when the executable is absent, a probe exits nonzero, output is malformed or unparseable, or the surface cannot isolate the requested scope and authority. Record the attempted surface, probe, and result. Never invent a slug, selection field, or dispatch.

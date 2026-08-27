@@ -58,6 +58,10 @@ authorization. The leader reviews and integrates every result.
 
 A peer, sibling, companion, or dedicated task is newly created for the current source task and bounded scope unless the operator explicitly identifies an existing same-purpose companion. Do not message, fork from, steer, or execute current-task work through an unrelated user-owned task. Route-metadata inspection does not make that task eligible or authorize executing with its model or under its account, entitlement, permissions, or context. Model routing supplies no task-creation or steering authority; creating or steering a user-owned task requires explicit consent. If an isolated task cannot be created or verified, return `NEEDS_CONTEXT` or `BLOCKED`; unrelated-task reuse is never a fallback.
 
+Treat every follow-up or resume as a new dispatch gate. Before sending continuation task data, revalidate the same authorized task or session, account binding, model, data boundary, workspace, tools, and external-action scope. The task ID, stored model, and visibility in a shared session database do not prove that the continuation will use the original account route.
+
+For a Codex CLI continuation through a privately bound alternate account home, explicitly set `CODEX_HOME` for the initial `codex exec` and every `codex exec resume`, and pass the exact model proven by the fresh no-task-data refresh. Never rely on the ambient default account to recover account affinity. If a task API, app, or CLI continuation cannot select and observe the authorized binding before accepting continuation data, fail closed before sending the payload. Use a newly created dedicated task or session only with the required creation authority and fresh route proof; otherwise return `NEEDS_CONTEXT` or `BLOCKED`.
+
 For a read-only dispatch, prove that each selected execution has a distinct
 session and isolated context, immutable input delivery, enforced read-only
 access, and default-denied subdelegation and external-action authority. A

@@ -21,7 +21,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             for skill in SKILLS
         }
 
-    def test_rolecasting_has_exactly_twenty_four_detailed_scenarios(self) -> None:
+    def test_rolecasting_has_exactly_twenty_five_detailed_scenarios(self) -> None:
         observed = {
             item["name"]
             for document in self.documents.values()
@@ -54,6 +54,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "batch-small-same-shape-work",
                 "bounded-wait-and-live-child-reconciliation",
                 "isolated-task-companion-boundary",
+                "dedicated-daybreak-resume-rebinds-account-route",
             },
         )
 
@@ -129,6 +130,63 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             with self.subTest(skill="delegating-cross-agent-work", phrase=phrase):
                 self.assertIn(phrase, delegating)
         self.assertNotIn("to obtain its model", delegating)
+
+    def test_daybreak_continuation_rebinds_account_route_before_payload(
+        self,
+    ) -> None:
+        choosing_root = PLUGIN_ROOT / "skills" / "choosing-agent-models"
+        delegating_root = PLUGIN_ROOT / "skills" / "delegating-cross-agent-work"
+        capabilities = " ".join(
+            (
+                choosing_root
+                / "references"
+                / "capability-probes-and-fallbacks.md"
+            )
+            .read_text()
+            .split()
+        ).lower()
+        foreign_peers = " ".join(
+            (
+                delegating_root / "references" / "foreign-harness-peers.md"
+            )
+            .read_text()
+            .split()
+        ).lower()
+
+        for phrase in (
+            "initial capability proof does not prove continuation capability",
+            "before sending continuation task data",
+            "same private account binding",
+            "shared session database is not account-affinity evidence",
+        ):
+            with self.subTest(source="capability", phrase=phrase):
+                self.assertIn(phrase, capabilities)
+
+        for phrase in (
+            "every follow-up or resume as a new dispatch gate",
+            "explicitly set `codex_home`",
+            "`codex exec resume`",
+            "ambient default account",
+            "fail closed before sending the payload",
+        ):
+            with self.subTest(source="delegation", phrase=phrase):
+                self.assertIn(phrase, foreign_peers)
+
+        continuation_eval = next(
+            item
+            for item in self.documents["delegating-cross-agent-work"]["evals"]
+            if item["name"] == "dedicated-daybreak-resume-rebinds-account-route"
+        )
+        expected_output = continuation_eval["expected_output"].lower()
+        for phrase in (
+            "no-task-data refresh",
+            "same private account binding",
+            "explicit `codex_home`",
+            "exact daybreak model",
+            "send no continuation task data",
+        ):
+            with self.subTest(source="eval", phrase=phrase):
+                self.assertIn(phrase, expected_output)
 
     def test_delegation_skill_batches_small_same_shape_work(self) -> None:
         skill = (

@@ -1087,6 +1087,110 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 claimed_at=created_at,
             )
 
+    def test_schema_fifteen_accepts_epoch_three_post_abort_context(self):
+        """A schema-15 descendant may continue an authenticated epoch-three handoff."""
+        created_at = 1_785_462_000
+        snapshot = self.drain_snapshot()
+        candidate = release_identity()
+        selected_ids = sorted(
+            item["operation_id"]
+            for item in snapshot["operations"]
+            if item["current_status"] == "pending"
+        )
+        context = {
+            "schema_version": 3,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": snapshot["generation_before"],
+            "recovery_epoch": 3,
+            "candidate_release_digest": candidate["release_digest"],
+            "selected_operation_ids_digest": digest(selected_ids),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": "1" * 64,
+            "post_abort_plan_digest": "2" * 64,
+            "post_abort_application_receipt_digest": "3" * 64,
+            "post_abort_verification_receipt_digest": "4" * 64,
+            "retry_recovery_digest": "5" * 64,
+            "selected_checkpoint_set_digest": "6" * 64,
+            "preserved_row_set_digest": "7" * 64,
+        }
+        capability = recovery_contract.create_provider_capability_receipt(
+            provider_id="openai-luna",
+            provider_policy_digest="9" * 64,
+            provider_identity_digest="6" * 64,
+            model_digest="5" * 64,
+            observed_at=created_at,
+            successful=True,
+        )
+        reference = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            snapshot,
+            candidate_release=candidate,
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/epoch-three-reference-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/epoch-three-reference-auth.json",
+            application_receipt_path="/private/tmp/epoch-three-reference-app.json",
+            status_artifact_path="/private/tmp/epoch-three-reference-status.json",
+            verification_receipt_path="/private/tmp/epoch-three-reference-verify.json",
+            recovery_context=context,
+            candidate_runtime_snapshot_schema_version=8,
+            created_at=created_at,
+            schema_version=12,
+        )
+        grant_plan = (
+            recovery_contract.create_exact_drain_authorization_grant_plan(
+                reference,
+                grant_id="88888888-8888-4888-8888-888888888888",
+                maximum_recovery_epoch=3,
+                maximum_reconciliation_cycle=1,
+                maximum_plan_claims=1,
+                maximum_worker_attempts=reference["worker_max_attempts"] + 1,
+                maximum_execution_seconds=(
+                    recovery_contract.EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS
+                ),
+                maximum_concurrent_drains=1,
+                created_at=created_at,
+                expires_at=created_at + 172_800,
+            )
+        )
+        grant = recovery_contract.activate_exact_drain_authorization_grant(
+            grant_plan,
+            approval_digest=grant_plan["grant_plan_digest"],
+            approved_at=created_at,
+        )
+        plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            snapshot,
+            candidate_release=candidate,
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/epoch-three-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/epoch-three-auth.json",
+            application_receipt_path="/private/tmp/epoch-three-app.json",
+            status_artifact_path="/private/tmp/epoch-three-status.json",
+            verification_receipt_path="/private/tmp/epoch-three-verify.json",
+            recovery_context=context,
+            provider_capability_receipt=capability,
+            candidate_runtime_snapshot_schema_version=8,
+            authorization_grant=grant,
+            grant_predecessor_plan_digest=reference["plan_digest"],
+            created_at=created_at,
+            schema_version=15,
+        )
+        self.assertEqual(plan["recovery_context"], context)
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                plan,
+                now=created_at,
+            ),
+            plan,
+        )
+
     def test_schema_fifteen_separates_request_and_operation_deadlines(self):
         reference, _grant, plan, _create_plan = self.standing_grant_fixture()
 

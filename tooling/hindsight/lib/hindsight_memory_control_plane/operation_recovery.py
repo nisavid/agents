@@ -4567,7 +4567,7 @@ def _exact_drain_recovery_context(
             )
             or (
                 body["schema_version"] == 3
-                and plan_schema_version != 12
+                and plan_schema_version not in {12, 15}
             )
             or not all(provenance.values())
             or body["initial_origin_digest"] is not None

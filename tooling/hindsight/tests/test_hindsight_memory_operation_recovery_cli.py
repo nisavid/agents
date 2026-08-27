@@ -4063,6 +4063,170 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         finally:
             globals_.update(originals)
 
+    def test_schema_15_candidate_repair_accepts_interrupted_idle_poller(self):
+        helper = self.controller[
+            "_operation_recovery_exact_candidate_repair_context"
+        ]
+        globals_ = helper.__globals__
+        old_candidate = {
+            "source_commit": "1" * 40,
+            "version": "2026.08.27+1111111.operation-recovery.107",
+            "release_digest": "2" * 64,
+        }
+        new_candidate = {
+            "source_commit": "3" * 40,
+            "version": "2026.08.27+3333333.operation-recovery.110",
+            "release_digest": "4" * 64,
+        }
+        row = {
+            "operation_id": "retain-1",
+            "operation_type": "retain",
+            "row_digest": "5" * 64,
+            "current_status": "pending",
+        }
+        reference_snapshot = {
+            "cohort_digest": "6" * 64,
+            "installation_authority": {"authority": "stable"},
+            "generation_before": "systalyze:public:10",
+            "generation_after": "systalyze:public:10",
+            "status_counts": {"pending": 1},
+            "operations": [row],
+        }
+        snapshot = {
+            **reference_snapshot,
+            "generation_before": "systalyze:public:11",
+            "generation_after": "systalyze:public:11",
+        }
+        context = {
+            "schema_version": 2,
+            "origin": "post-abort",
+            "recovery_epoch": 2,
+            "candidate_release_digest": old_candidate["release_digest"],
+        }
+        reference_plan = {
+            "schema_version": 15,
+            "candidate_release": old_candidate,
+            "recovery_context": context,
+            "authorization_receipt_path": "authorization.json",
+            "application_receipt_path": "application.json",
+            "progress_artifact_path": "progress.json",
+            "status_artifact_path": "status.json",
+            "selected_operations": [
+                {
+                    "operation_id": row["operation_id"],
+                    "operation_type": row["operation_type"],
+                    "row_digest": row["row_digest"],
+                }
+            ],
+            "live_snapshot": reference_snapshot,
+            "cohort_digest": reference_snapshot["cohort_digest"],
+            "installation_authority": reference_snapshot[
+                "installation_authority"
+            ],
+            "pre_generation": reference_snapshot["generation_before"],
+            "preserved_status_counts": {"completed": 13, "failed": 3},
+            "selected_operation_count": 1,
+            "worker_max_attempts": 1,
+            "progress_schema_version": 6,
+            "plan_digest": "7" * 64,
+        }
+        journal = {
+            "worker_pid": 123,
+            "worker_start_time": "darwin:7:8",
+            "worker_attempt": 1,
+        }
+        progress = {
+            **journal,
+            "worker_status": "running",
+            "worker_stage": "worker.poller.running",
+            "worker_failure_stage": None,
+            "worker_failure": None,
+            "worker_exit_code": None,
+            "active_provider_requests": [],
+            "provider_counters": [],
+            "prior_attempts": [],
+            "cooldowns": [],
+            "selected_status_counts": {"pending": 1},
+            "tasks": [
+                {
+                    "operation_id": row["operation_id"],
+                    "operation_type": row["operation_type"],
+                    "row_digest": row["row_digest"],
+                    "status": "pending",
+                    "stage": "queued",
+                    "checkpoint": None,
+                    "failure": None,
+                    "failure_stage": None,
+                }
+            ],
+        }
+        interrupted_status = {
+            "generation_before": snapshot["generation_before"],
+            "generation_after": snapshot["generation_after"],
+            "selected_status_counts": {"pending": 1},
+            "preserved_status_counts": reference_plan[
+                "preserved_status_counts"
+            ],
+            "outside_nonterminal_counts": [],
+        }
+        replacements = {
+            "verify_exact_drain_plan": (
+                lambda _value, *, allow_expired: reference_plan
+            ),
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: reference_plan
+            ),
+            "_operation_recovery_post_abort_reference_artifacts": (
+                lambda _plan: ({}, journal)
+            ),
+            "_operation_recovery_exact_journal_worker_active": (
+                lambda _journal: False
+            ),
+            "read_exact_drain_progress": (
+                lambda _path, *, plan_digest, progress_schema_version: progress
+            ),
+            "verify_exact_drain_status": (
+                lambda _value, *, plan: interrupted_status
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            repaired = helper(
+                snapshot=snapshot,
+                candidate_release=new_candidate,
+                reference_plan_path="reference.json",
+            )
+            self.assertEqual(repaired["schema_version"], 2)
+            self.assertEqual(repaired["recovery_epoch"], 2)
+            self.assertEqual(
+                repaired["candidate_release_digest"],
+                new_candidate["release_digest"],
+            )
+            progress["active_provider_requests"] = [{"request": "x"}]
+            with self.assertRaisesRegex(
+                Exception,
+                "candidate-repair execution evidence differs",
+            ):
+                helper(
+                    snapshot=snapshot,
+                    candidate_release=new_candidate,
+                    reference_plan_path="reference.json",
+                )
+            progress["active_provider_requests"] = []
+            interrupted_status["generation_before"] = "systalyze:public:12"
+            with self.assertRaisesRegex(
+                Exception,
+                "candidate-repair row evidence differs",
+            ):
+                helper(
+                    snapshot=snapshot,
+                    candidate_release=new_candidate,
+                    reference_plan_path="reference.json",
+                )
+        finally:
+            globals_.update(originals)
+
     def test_exact_drain_plan_command_hands_off_verified_recovery_sources(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__

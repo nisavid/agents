@@ -9205,9 +9205,21 @@ def _operation_recovery_exact_candidate_repair_context(
         and reference_context.get("recovery_epoch") == 3
         and reference_context.get("reconciliation_cycle") == 1
     )
+    interrupted_schema_15_poller_repair = (
+        reference_plan["schema_version"] == 15
+        and isinstance(reference_context, Mapping)
+        and reference_context.get("origin") == "post-abort"
+        and reference_context.get("schema_version")
+        == reference_context.get("recovery_epoch")
+        and reference_context.get("recovery_epoch") in {1, 2, 3}
+    )
     if (
         reference_plan["candidate_release"] == candidate_release
-        or not (ordinary_preexecution_repair or quiescent_schema_15_repair)
+        or not (
+            ordinary_preexecution_repair
+            or quiescent_schema_15_repair
+            or interrupted_schema_15_poller_repair
+        )
         or reference_context.get("candidate_release_digest")
         != reference_plan["candidate_release"]["release_digest"]
     ):
@@ -9229,6 +9241,120 @@ def _operation_recovery_exact_candidate_repair_context(
             "progress_schema_version", 1
         ),
     )
+    if interrupted_schema_15_poller_repair:
+        if (
+            any(
+                progress.get(key) != journal[key]
+                for key in ("worker_pid", "worker_start_time", "worker_attempt")
+            )
+            or progress.get("worker_status") != "running"
+            or progress.get("worker_stage") != "worker.poller.running"
+            or progress.get("worker_failure_stage") is not None
+            or progress.get("worker_failure") is not None
+            or progress.get("worker_exit_code") is not None
+            or progress.get("active_provider_requests")
+            or progress.get("provider_counters")
+            or progress.get("prior_attempts")
+            or progress.get("cooldowns")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery candidate-repair execution evidence differs"
+            )
+
+        expected_tasks = {
+            item["operation_id"]: (
+                item["operation_type"],
+                item["row_digest"],
+            )
+            for item in reference_plan["selected_operations"]
+        }
+        observed_tasks: dict[str, tuple[Any, Any]] = {}
+        tasks = progress.get("tasks")
+        tasks_valid = isinstance(tasks, list)
+        if tasks_valid:
+            for item in tasks:
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("operation_id") in observed_tasks
+                    or item.get("operation_id") not in expected_tasks
+                    or item.get("status") != "pending"
+                    or item.get("stage") != "queued"
+                    or item.get("checkpoint") is not None
+                    or item.get("failure") is not None
+                    or item.get("failure_stage") is not None
+                ):
+                    tasks_valid = False
+                    break
+                observed_tasks[item["operation_id"]] = (
+                    item.get("operation_type"),
+                    item.get("row_digest"),
+                )
+        if (
+            not tasks_valid
+            or observed_tasks != expected_tasks
+            or progress.get("selected_status_counts")
+            != {"pending": len(expected_tasks)}
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery candidate-repair task evidence differs"
+            )
+
+        interrupted_status = verify_exact_drain_status(
+            _operation_recovery_read_private_json(
+                reference_plan["status_artifact_path"],
+                "candidate-repair interrupted exact drain status",
+            ),
+            plan=reference_plan,
+        )
+        reference_snapshot = reference_plan["live_snapshot"]
+        reference_rows = {
+            item["operation_id"]: item
+            for item in reference_snapshot["operations"]
+        }
+        current_rows = {
+            item["operation_id"]: item for item in snapshot["operations"]
+        }
+        if (
+            set(current_rows) != set(reference_rows)
+            or any(
+                current_rows[operation_id]["row_digest"]
+                != reference_rows[operation_id]["row_digest"]
+                for operation_id in reference_rows
+            )
+            or snapshot["cohort_digest"] != reference_plan["cohort_digest"]
+            or snapshot["installation_authority"]
+            != reference_plan["installation_authority"]
+            or snapshot["generation_before"] != snapshot["generation_after"]
+            or snapshot["status_counts"] != reference_snapshot["status_counts"]
+            or interrupted_status["generation_before"]
+            != snapshot["generation_before"]
+            or interrupted_status["generation_after"]
+            != snapshot["generation_after"]
+            or interrupted_status["selected_status_counts"]
+            != {"pending": len(expected_tasks)}
+            or interrupted_status["preserved_status_counts"]
+            != reference_plan["preserved_status_counts"]
+            or any(
+                item["status"] == "processing"
+                for item in interrupted_status["outside_nonterminal_counts"]
+            )
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery candidate-repair row evidence differs"
+            )
+
+        return {
+            **reference_context,
+            "generation": snapshot["generation_before"],
+            "candidate_release_digest": candidate_release["release_digest"],
+            "selected_operation_ids_digest": digest(
+                sorted(
+                    item["operation_id"]
+                    for item in snapshot["operations"]
+                    if item["current_status"] == "pending"
+                )
+            ),
+        }
     if quiescent_schema_15_repair:
         if (
             any(

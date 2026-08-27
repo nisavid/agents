@@ -56,7 +56,7 @@ authorization. The leader reviews and integrates every result.
 
 ## Task And Thread Isolation
 
-A peer, sibling, companion, or dedicated task is newly created for the current source task and bounded scope unless the operator explicitly identifies an existing same-purpose companion. Never message, fork from, or repurpose an unrelated user-owned task to obtain its model, account, entitlement, permissions, or context. Model routing supplies no task-creation or steering authority; creating or steering a user-owned task requires explicit consent. If an isolated task cannot be created or verified, return `NEEDS_CONTEXT` or `BLOCKED`; unrelated-task reuse is never a fallback.
+A peer, sibling, companion, or dedicated task is newly created for the current source task and bounded scope unless the operator explicitly identifies an existing same-purpose companion. Do not message, fork from, steer, or execute current-task work through an unrelated user-owned task. Route-metadata inspection does not make that task eligible or authorize executing with its model or under its account, entitlement, permissions, or context. Model routing supplies no task-creation or steering authority; creating or steering a user-owned task requires explicit consent. If an isolated task cannot be created or verified, return `NEEDS_CONTEXT` or `BLOCKED`; unrelated-task reuse is never a fallback.
 
 For a read-only dispatch, prove that each selected execution has a distinct
 session and isolated context, immutable input delivery, enforced read-only

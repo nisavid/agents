@@ -1177,6 +1177,23 @@ class OperationRecoveryCliTest(unittest.TestCase):
                         "receipt_digest": "3" * 64,
                     }
                 ),
+                "_operation_recovery_provider_capability_receipt": (
+                    lambda _policy, **_kwargs: {
+                        "schema_version": 1,
+                        "kind": "operation-recovery-provider-capability-receipt",
+                        "provider_id": "openai-luna",
+                        "attempted_provider_ids": [
+                            "hatchery",
+                            "openai-luna",
+                        ],
+                        "provider_policy_digest": "9" * 64,
+                        "provider_identity_digest": "1" * 64,
+                        "model_digest": "2" * 64,
+                        "observed_at": now,
+                        "successful": True,
+                        "receipt_digest": "4" * 64,
+                    }
+                ),
                 "_operation_recovery_exact_runtime_digest": (
                     lambda _args, **_kwargs: "a" * 64
                 ),
@@ -1267,6 +1284,10 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 globals_.update(grant_originals)
             self.assertEqual(captured["schema_version"], 15)
             self.assertIs(captured["authorization_grant"], grant)
+            self.assertEqual(
+                captured["provider_capability_receipt"]["provider_id"],
+                "openai-luna",
+            )
             self.assertEqual(
                 captured["grant_predecessor_plan_digest"],
                 grant["scope"]["initial_reference_plan_digest"],
@@ -7460,6 +7481,172 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     ),
                 )
             )
+
+    def test_schema_fifteen_capability_probe_falls_back_to_luna(self):
+        probe = self.controller[
+            "_operation_recovery_provider_capability_receipt"
+        ]
+        globals_ = probe.__globals__
+        policy = self.controller["ProviderRuntimePolicy"].load(
+            _exact_split_timeout_policy_data()
+        )
+        expected = {"provider_id": "openai-luna"}
+        calls = []
+        replacements = {
+            "_operation_recovery_hatchery_capability_receipt": (
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    self.controller["OperationRecoveryError"](
+                        "closed Hatchery failure"
+                    )
+                )
+            ),
+            "_operation_recovery_luna_capability_receipt": (
+                lambda *_args, **_kwargs: calls.append("openai-luna")
+                or expected
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            observed = probe(
+                policy,
+                provider_policy_digest="9" * 64,
+                manager=object(),
+            )
+        finally:
+            globals_.update(originals)
+        self.assertIs(observed, expected)
+        self.assertEqual(calls, ["openai-luna"])
+
+    def test_luna_capability_probe_uses_medium_reasoning_without_retaining_key(self):
+        probe = self.controller["_operation_recovery_luna_capability_receipt"]
+        globals_ = probe.__globals__
+        policy = self.controller["ProviderRuntimePolicy"].load(
+            _exact_split_timeout_policy_data()
+        )
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def geturl(self):
+                return "https://api.openai.com/v1/responses"
+
+            def read(self, _limit):
+                return b'{"id":"resp_test","status":"completed"}'
+
+        replacements = {
+            "_operation_recovery_resolve_provider_api_key": (
+                lambda *_args, **_kwargs: "test-project-key"
+            ),
+            "urlopen": (
+                lambda request, **_kwargs: requests.append(request)
+                or Response()
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            receipt = probe(
+                policy,
+                provider_policy_digest="9" * 64,
+                manager=object(),
+            )
+        finally:
+            globals_.update(originals)
+        self.assertEqual(receipt["provider_id"], "openai-luna")
+        self.assertNotIn("test-project-key", json.dumps(receipt))
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(
+            request.get_header("Authorization"),
+            "Bearer test-project-key",
+        )
+        body = json.loads(request.data)
+        self.assertEqual(body["model"], "gpt-5.6-luna")
+        self.assertEqual(body["reasoning"], {"effort": "medium"})
+        self.assertIs(body["store"], False)
+
+    def test_planner_resolves_luna_key_through_protected_locator_only(self):
+        resolve = self.controller[
+            "_operation_recovery_resolve_provider_api_key"
+        ]
+        globals_ = resolve.__globals__
+        observed = {}
+
+        class Process:
+            returncode = 0
+            pid = 1234
+
+            def communicate(self, request, timeout):
+                observed["request"] = json.loads(request)
+                observed["timeout"] = timeout
+                return (
+                    b'{"schema_version":1,"values":'
+                    b'{"OPENAI_API_KEY":"test-project-key"}}',
+                    None,
+                )
+
+        def popen(argv, **kwargs):
+            observed["argv"] = argv
+            observed["environment"] = kwargs["env"]
+            return Process()
+
+        manager = SimpleNamespace(
+            config=SimpleNamespace(
+                credential_resolver=SimpleNamespace(
+                    path=Path("/private/tmp/resolve-hindsight-credential"),
+                    sha256="a" * 64,
+                )
+            )
+        )
+        replacements = {
+            "_protected_executable_bytes": lambda *_args: b"protected",
+            "pwd": SimpleNamespace(
+                getpwuid=lambda _uid: SimpleNamespace(
+                    pw_dir="/Users/test",
+                    pw_name="test",
+                )
+            ),
+            "subprocess": SimpleNamespace(
+                PIPE=subprocess.PIPE,
+                DEVNULL=subprocess.DEVNULL,
+                Popen=popen,
+                SubprocessError=subprocess.SubprocessError,
+                TimeoutExpired=subprocess.TimeoutExpired,
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            key = resolve(
+                manager,
+                locator="api-key:hindsight-openai",
+                marker="provider-policy:openai-luna",
+            )
+        finally:
+            globals_.update(originals)
+        self.assertEqual(key, "test-project-key")
+        self.assertEqual(
+            observed["request"],
+            {
+                "schema_version": 1,
+                "credentials": [
+                    {
+                        "environment": "OPENAI_API_KEY",
+                        "locator": "api-key:hindsight-openai",
+                    }
+                ],
+            },
+        )
+        self.assertNotIn("OPENAI_API_KEY", observed["environment"])
+        self.assertEqual(observed["timeout"], 30)
 
     def test_exact_drain_effective_profile_requires_the_policy_projection(self):
         policy_path = (

@@ -809,6 +809,75 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan,
         )
 
+        legacy_body = {
+            key: deepcopy(value)
+            for key, value in plan.items()
+            if key
+            not in {
+                "plan_digest",
+                "provider_capability_receipt",
+                "provider_capability_receipt_digest",
+            }
+        }
+        legacy_body["hatchery_capability_receipt"] = capability
+        legacy_body["hatchery_capability_receipt_digest"] = capability[
+            "receipt_digest"
+        ]
+        legacy_plan = {**legacy_body, "plan_digest": digest(legacy_body)}
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                legacy_plan,
+                now=created_at,
+            ),
+            legacy_plan,
+        )
+
+        luna_capability = recovery_contract.create_provider_capability_receipt(
+            provider_id="openai-luna",
+            provider_policy_digest="9" * 64,
+            provider_identity_digest="6" * 64,
+            model_digest="5" * 64,
+            observed_at=created_at,
+            successful=True,
+        )
+        luna_plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            self.drain_snapshot(),
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/luna-drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/luna-drain-auth.json",
+            application_receipt_path="/private/tmp/luna-drain-app.json",
+            status_artifact_path="/private/tmp/luna-drain-status.json",
+            verification_receipt_path="/private/tmp/luna-drain-verify.json",
+            provider_capability_receipt=luna_capability,
+            authorization_grant=grant,
+            grant_predecessor_plan_digest=reference["plan_digest"],
+            created_at=created_at,
+            schema_version=15,
+        )
+        self.assertEqual(
+            luna_plan["provider_capability_receipt"]["provider_id"],
+            "openai-luna",
+        )
+        self.assertEqual(
+            luna_plan["provider_capability_receipt"][
+                "attempted_provider_ids"
+            ],
+            ["hatchery", "openai-luna"],
+        )
+        self.assertNotIn("hatchery_capability_receipt", luna_plan)
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                luna_plan,
+                now=created_at,
+            ),
+            luna_plan,
+        )
+
         drifted_release = {**release_identity(), "release_digest": "f" * 64}
         with self.assertRaisesRegex(
             OperationRecoveryError,

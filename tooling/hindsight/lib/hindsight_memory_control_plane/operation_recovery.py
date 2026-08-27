@@ -955,14 +955,23 @@ EXACT_DRAIN_PLAN_V14_KEYS = EXACT_DRAIN_PLAN_V13_KEYS | frozenset(
         "checkpoint_continuation_handoff_digest",
     }
 )
-EXACT_DRAIN_PLAN_V15_KEYS = EXACT_DRAIN_PLAN_V13_KEYS | frozenset(
+EXACT_DRAIN_PLAN_V15_LEGACY_KEYS = EXACT_DRAIN_PLAN_V14_KEYS | frozenset(
     {
-        "checkpoint_continuation_handoff",
-        "checkpoint_continuation_handoff_digest",
         "authorization_grant",
         "grant_id",
         "grant_digest",
         "grant_predecessor_plan_digest",
+    }
+)
+EXACT_DRAIN_PLAN_V15_KEYS = (
+    EXACT_DRAIN_PLAN_V15_LEGACY_KEYS
+    - frozenset(
+        {"hatchery_capability_receipt", "hatchery_capability_receipt_digest"}
+    )
+) | frozenset(
+    {
+        "provider_capability_receipt",
+        "provider_capability_receipt_digest",
     }
 )
 HATCHERY_CAPABILITY_RECEIPT_KEYS = frozenset(
@@ -977,6 +986,9 @@ HATCHERY_CAPABILITY_RECEIPT_KEYS = frozenset(
         "successful",
         "receipt_digest",
     }
+)
+PROVIDER_CAPABILITY_RECEIPT_KEYS = HATCHERY_CAPABILITY_RECEIPT_KEYS | frozenset(
+    {"attempted_provider_ids"}
 )
 EXACT_DRAIN_GRANT_SCOPE_KEYS = frozenset(
     {
@@ -4024,6 +4036,114 @@ def verify_hatchery_capability_receipt(value: Any) -> Mapping[str, Any]:
     return {**body, "receipt_digest": receipt["receipt_digest"]}
 
 
+def create_provider_capability_receipt(
+    *,
+    provider_id: str,
+    provider_policy_digest: str,
+    provider_identity_digest: str,
+    model_digest: str,
+    observed_at: int | None = None,
+    successful: bool,
+) -> Mapping[str, Any]:
+    """Create payload-free evidence for one admitted failover route."""
+    if (
+        provider_id not in {"hatchery", "openai-luna"}
+        or type(successful) is not bool
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery provider capability result is invalid"
+        )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-provider-capability-receipt",
+        "provider_id": provider_id,
+        "attempted_provider_ids": (
+            ["hatchery"]
+            if provider_id == "hatchery"
+            else ["hatchery", "openai-luna"]
+        ),
+        "provider_policy_digest": _sha(
+            provider_policy_digest,
+            "provider capability provider policy digest",
+        ),
+        "provider_identity_digest": _sha(
+            provider_identity_digest,
+            "provider capability provider identity digest",
+        ),
+        "model_digest": _sha(
+            model_digest,
+            "provider capability model digest",
+        ),
+        "observed_at": (
+            int(time.time())
+            if observed_at is None
+            else _integer(observed_at, "provider capability observed-at")
+        ),
+        "successful": successful,
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
+def verify_provider_capability_receipt(value: Any) -> Mapping[str, Any]:
+    receipt = _closed(
+        _normalized(value),
+        PROVIDER_CAPABILITY_RECEIPT_KEYS,
+        "provider capability receipt",
+    )
+    body = {
+        "schema_version": _integer(
+            receipt["schema_version"],
+            "provider capability schema version",
+        ),
+        "kind": _text(receipt["kind"], "provider capability kind"),
+        "provider_id": _text(
+            receipt["provider_id"],
+            "provider capability provider ID",
+        ),
+        "attempted_provider_ids": _normalized(
+            receipt["attempted_provider_ids"]
+        ),
+        "provider_policy_digest": _sha(
+            receipt["provider_policy_digest"],
+            "provider capability provider policy digest",
+        ),
+        "provider_identity_digest": _sha(
+            receipt["provider_identity_digest"],
+            "provider capability provider identity digest",
+        ),
+        "model_digest": _sha(
+            receipt["model_digest"],
+            "provider capability model digest",
+        ),
+        "observed_at": _integer(
+            receipt["observed_at"],
+            "provider capability observed-at",
+        ),
+        "successful": receipt["successful"],
+    }
+    if (
+        type(body["successful"]) is not bool
+        or body["schema_version"] != 1
+        or body["kind"] != "operation-recovery-provider-capability-receipt"
+        or body["provider_id"] not in {"hatchery", "openai-luna"}
+        or body["attempted_provider_ids"]
+        != (
+            ["hatchery"]
+            if body["provider_id"] == "hatchery"
+            else ["hatchery", "openai-luna"]
+        )
+        or _sha(
+            receipt["receipt_digest"],
+            "provider capability receipt digest",
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery provider capability receipt is invalid"
+        )
+    return {**body, "receipt_digest": receipt["receipt_digest"]}
+
+
 def _exact_drain_recovery_context(
     value: Mapping[str, Any] | None,
     *,
@@ -4590,6 +4710,7 @@ def create_exact_drain_plan(
     verification_receipt_path: str,
     recovery_context: Mapping[str, Any] | None = None,
     hatchery_capability_receipt: Mapping[str, Any] | None = None,
+    provider_capability_receipt: Mapping[str, Any] | None = None,
     checkpoint_continuation_handoff: Mapping[str, Any] | None = None,
     candidate_runtime_snapshot_schema_version: int | None = None,
     authorization_grant: Mapping[str, Any] | None = None,
@@ -4789,7 +4910,7 @@ def create_exact_drain_plan(
         plan_schema_version=schema_version,
     )
     capability_fields = {}
-    if schema_version in {13, 14, 15}:
+    if schema_version in {13, 14}:
         if hatchery_capability_receipt is None:
             raise OperationRecoveryError(
                 "operation-recovery Hatchery capability receipt is required"
@@ -4814,6 +4935,51 @@ def create_exact_drain_plan(
                 "receipt_digest"
             ],
         }
+    elif schema_version == 15:
+        if provider_capability_receipt is None:
+            if hatchery_capability_receipt is None:
+                raise OperationRecoveryError(
+                    "operation-recovery provider capability receipt is required"
+                )
+            legacy_capability = verify_hatchery_capability_receipt(
+                hatchery_capability_receipt
+            )
+            provider_capability_receipt = create_provider_capability_receipt(
+                provider_id="hatchery",
+                provider_policy_digest=legacy_capability[
+                    "provider_policy_digest"
+                ],
+                provider_identity_digest=legacy_capability[
+                    "provider_identity_digest"
+                ],
+                model_digest=legacy_capability["model_digest"],
+                observed_at=legacy_capability["observed_at"],
+                successful=legacy_capability["successful"],
+            )
+        capability = verify_provider_capability_receipt(
+            provider_capability_receipt
+        )
+        if (
+            not capability["successful"]
+            or capability["provider_policy_digest"]
+            != _sha(provider_policy_digest, "provider policy digest")
+            or capability["observed_at"] > planned_at
+            or planned_at - capability["observed_at"]
+            > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery provider capability receipt is invalid"
+            )
+        capability_fields = {
+            "provider_capability_receipt": capability,
+            "provider_capability_receipt_digest": capability[
+                "receipt_digest"
+            ],
+        }
+    elif provider_capability_receipt is not None:
+        raise OperationRecoveryError(
+            "operation-recovery provider capability receipt is unsupported"
+        )
     if schema_version == 15:
         if authorization_grant is None:
             raise OperationRecoveryError(
@@ -5028,25 +5194,43 @@ def verify_exact_drain_plan(
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
         )
+    schema_fifteen_legacy_capability = False
+    plan_keys = {
+        1: EXACT_DRAIN_PLAN_KEYS,
+        2: EXACT_DRAIN_PLAN_V2_KEYS,
+        3: EXACT_DRAIN_PLAN_V3_KEYS,
+        4: EXACT_DRAIN_PLAN_V4_KEYS,
+        5: EXACT_DRAIN_PLAN_V5_KEYS,
+        6: EXACT_DRAIN_PLAN_V6_KEYS,
+        7: EXACT_DRAIN_PLAN_V7_KEYS,
+        8: EXACT_DRAIN_PLAN_V8_KEYS,
+        9: EXACT_DRAIN_PLAN_V9_KEYS,
+        10: EXACT_DRAIN_PLAN_V10_KEYS,
+        11: EXACT_DRAIN_PLAN_V11_KEYS,
+        12: EXACT_DRAIN_PLAN_V12_KEYS,
+        13: EXACT_DRAIN_PLAN_V13_KEYS,
+        14: EXACT_DRAIN_PLAN_V14_KEYS,
+        15: EXACT_DRAIN_PLAN_V15_KEYS,
+    }[schema_version]
+    if schema_version == 15:
+        has_provider_capability = {
+            "provider_capability_receipt",
+            "provider_capability_receipt_digest",
+        }.issubset(normalized)
+        has_hatchery_capability = {
+            "hatchery_capability_receipt",
+            "hatchery_capability_receipt_digest",
+        }.issubset(normalized)
+        if has_provider_capability == has_hatchery_capability:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain plan is invalid"
+            )
+        if has_hatchery_capability:
+            schema_fifteen_legacy_capability = True
+            plan_keys = EXACT_DRAIN_PLAN_V15_LEGACY_KEYS
     plan = _closed(
         normalized,
-        {
-            1: EXACT_DRAIN_PLAN_KEYS,
-            2: EXACT_DRAIN_PLAN_V2_KEYS,
-            3: EXACT_DRAIN_PLAN_V3_KEYS,
-            4: EXACT_DRAIN_PLAN_V4_KEYS,
-            5: EXACT_DRAIN_PLAN_V5_KEYS,
-            6: EXACT_DRAIN_PLAN_V6_KEYS,
-            7: EXACT_DRAIN_PLAN_V7_KEYS,
-            8: EXACT_DRAIN_PLAN_V8_KEYS,
-            9: EXACT_DRAIN_PLAN_V9_KEYS,
-            10: EXACT_DRAIN_PLAN_V10_KEYS,
-            11: EXACT_DRAIN_PLAN_V11_KEYS,
-            12: EXACT_DRAIN_PLAN_V12_KEYS,
-            13: EXACT_DRAIN_PLAN_V13_KEYS,
-            14: EXACT_DRAIN_PLAN_V14_KEYS,
-            15: EXACT_DRAIN_PLAN_V15_KEYS,
-        }[schema_version],
+        plan_keys,
         "operation-recovery exact drain plan",
     )
     cohort = verify_cohort_manifest(plan["cohort"])
@@ -5261,7 +5445,7 @@ def verify_exact_drain_plan(
         provider_timeout_contract = None
         operation_attempt_timeout_disposition = None
     capability_fields = {}
-    if schema_version in {13, 14, 15}:
+    if schema_version in {13, 14}:
         capability = verify_hatchery_capability_receipt(
             plan["hatchery_capability_receipt"]
         )
@@ -5272,6 +5456,30 @@ def verify_exact_drain_plan(
         capability_fields = {
             "hatchery_capability_receipt": capability,
             "hatchery_capability_receipt_digest": capability_digest,
+        }
+    elif schema_version == 15 and schema_fifteen_legacy_capability:
+        capability = verify_hatchery_capability_receipt(
+            plan["hatchery_capability_receipt"]
+        )
+        capability_digest = _sha(
+            plan["hatchery_capability_receipt_digest"],
+            "Hatchery capability receipt digest",
+        )
+        capability_fields = {
+            "hatchery_capability_receipt": capability,
+            "hatchery_capability_receipt_digest": capability_digest,
+        }
+    elif schema_version == 15:
+        capability = verify_provider_capability_receipt(
+            plan["provider_capability_receipt"]
+        )
+        capability_digest = _sha(
+            plan["provider_capability_receipt_digest"],
+            "provider capability receipt digest",
+        )
+        capability_fields = {
+            "provider_capability_receipt": capability,
+            "provider_capability_receipt_digest": capability_digest,
         }
     if schema_version == 15:
         authorization_grant = verify_exact_drain_authorization_grant(
@@ -5614,7 +5822,7 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {13, 14, 15}
+            schema_version in {13, 14}
             and (
                 capability_fields["hatchery_capability_receipt_digest"]
                 != capability_fields["hatchery_capability_receipt"][
@@ -5633,6 +5841,58 @@ def verify_exact_drain_plan(
                 > created_at
                 or created_at
                 - capability_fields["hatchery_capability_receipt"][
+                    "observed_at"
+                ]
+                > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+            )
+        )
+        or (
+            schema_version == 15
+            and schema_fifteen_legacy_capability
+            and (
+                capability_fields["hatchery_capability_receipt_digest"]
+                != capability_fields["hatchery_capability_receipt"][
+                    "receipt_digest"
+                ]
+                or capability_fields["hatchery_capability_receipt"][
+                    "provider_policy_digest"
+                ]
+                != plan["provider_policy_digest"]
+                or not capability_fields["hatchery_capability_receipt"][
+                    "successful"
+                ]
+                or capability_fields["hatchery_capability_receipt"][
+                    "observed_at"
+                ]
+                > created_at
+                or created_at
+                - capability_fields["hatchery_capability_receipt"][
+                    "observed_at"
+                ]
+                > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+            )
+        )
+        or (
+            schema_version == 15
+            and not schema_fifteen_legacy_capability
+            and (
+                capability_fields["provider_capability_receipt_digest"]
+                != capability_fields["provider_capability_receipt"][
+                    "receipt_digest"
+                ]
+                or capability_fields["provider_capability_receipt"][
+                    "provider_policy_digest"
+                ]
+                != plan["provider_policy_digest"]
+                or not capability_fields["provider_capability_receipt"][
+                    "successful"
+                ]
+                or capability_fields["provider_capability_receipt"][
+                    "observed_at"
+                ]
+                > created_at
+                or created_at
+                - capability_fields["provider_capability_receipt"][
                     "observed_at"
                 ]
                 > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS

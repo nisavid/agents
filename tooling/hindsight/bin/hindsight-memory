@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
 import select
@@ -168,6 +169,7 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
     InstallationConfig,
     PortableInstallError,
     PortableInstallationManager,
+    _protected_executable_bytes,
     _release_manifest,
 )
 from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
@@ -191,6 +193,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     create_exact_drain_plan,
     create_global_queue_blocker_classification,
     create_hatchery_capability_receipt,
+    create_provider_capability_receipt,
     create_live_snapshot,
     create_post_abort_recovery_plan,
     create_requeue_plan,
@@ -8961,6 +8964,210 @@ def _operation_recovery_hatchery_capability_receipt(
     )
 
 
+def _operation_recovery_resolve_provider_api_key(
+    manager: PortableInstallationManager,
+    *,
+    locator: str,
+    marker: str,
+) -> str:
+    """Resolve one policy-bound key without exporting it to ambient state."""
+    resolver = manager.config.credential_resolver
+    try:
+        _protected_executable_bytes(
+            resolver.path,
+            "credential resolver",
+            resolver.sha256,
+        )
+        account = pwd.getpwuid(os.geteuid())
+        request_body = canonical_bytes(
+            {
+                "schema_version": 1,
+                "credentials": [
+                    {
+                        "environment": "OPENAI_API_KEY",
+                        "locator": locator,
+                    }
+                ],
+            }
+        )
+        process = subprocess.Popen(
+            [str(resolver.path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": account.pw_dir,
+                "USER": account.pw_name,
+                "LOGNAME": account.pw_name,
+            },
+            start_new_session=True,
+        )
+        try:
+            response_body, _ = process.communicate(request_body, timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            raise
+        if process.returncode != 0 or len(response_body) > 1024 * 1024:
+            raise ValueError("credential resolver failed")
+        response = strict_json_loads(response_body)
+    except (
+        KeyError,
+        OSError,
+        PortableInstallError,
+        StrictJsonError,
+        subprocess.SubprocessError,
+        ValueError,
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery provider credential resolution failed"
+        ) from None
+    if (
+        not isinstance(response, Mapping)
+        or set(response) != {"schema_version", "values"}
+        or response["schema_version"] != 1
+        or not isinstance(response["values"], Mapping)
+        or set(response["values"]) != {"OPENAI_API_KEY"}
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery provider credential resolution failed"
+        )
+    api_key = response["values"]["OPENAI_API_KEY"]
+    if (
+        not isinstance(api_key, str)
+        or not api_key
+        or len(api_key) > 8192
+        or api_key != api_key.strip()
+        or any(character.isspace() for character in api_key)
+        or api_key == marker
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery provider credential resolution failed"
+        )
+    return api_key
+
+
+def _operation_recovery_luna_capability_receipt(
+    policy: ProviderRuntimePolicy,
+    *,
+    provider_policy_digest: str,
+    manager: PortableInstallationManager,
+) -> Mapping[str, Any]:
+    """Probe the exact Luna fallback without retaining credentials or payloads."""
+    member = policy.member("openai-luna")
+    identity = member.identity
+    if member.credential_locator is None:
+        raise OperationRecoveryError(
+            "operation-recovery Luna capability binding is invalid"
+        )
+    api_key = _operation_recovery_resolve_provider_api_key(
+        manager,
+        locator=member.credential_locator,
+        marker=identity.credential_marker,
+    )
+    endpoint = "https://api.openai.com/v1/responses"
+    request = Request(
+        endpoint,
+        data=canonical_bytes(
+            {
+                "input": "Reply with OK.",
+                "max_output_tokens": 16,
+                "model": identity.model,
+                "reasoning": {"effort": "medium"},
+                "store": False,
+            }
+        ),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Connection": "close",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=125) as response:
+            if response.status < 200 or response.status >= 300:
+                raise OperationRecoveryError(
+                    "operation-recovery Luna capability probe failed"
+                )
+            if response.geturl() != endpoint:
+                raise OperationRecoveryError(
+                    "operation-recovery Luna capability route differed"
+                )
+            response_body = response.read(1024 * 1024 + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery Luna capability probe failed"
+        ) from error
+    if len(response_body) > 1024 * 1024:
+        raise OperationRecoveryError(
+            "operation-recovery Luna capability response is invalid"
+        )
+    try:
+        completion = strict_json_loads(response_body)
+    except StrictJsonError as error:
+        raise OperationRecoveryError(
+            "operation-recovery Luna capability response is invalid"
+        ) from error
+    if (
+        not isinstance(completion, Mapping)
+        or not isinstance(completion.get("id"), str)
+        or completion.get("status") not in {"completed", "incomplete"}
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery Luna capability response is invalid"
+        )
+    return create_provider_capability_receipt(
+        provider_id=member.id,
+        provider_policy_digest=provider_policy_digest,
+        provider_identity_digest=digest(
+            {
+                "provider_id": member.id,
+                "provider": identity.provider,
+                "model": identity.model,
+                "base_url": identity.base_url,
+            }
+        ),
+        model_digest=hashlib.sha256(identity.model.encode("utf-8")).hexdigest(),
+        observed_at=int(time.time()),
+        successful=True,
+    )
+
+
+def _operation_recovery_provider_capability_receipt(
+    policy: ProviderRuntimePolicy,
+    *,
+    provider_policy_digest: str,
+    manager: PortableInstallationManager,
+) -> Mapping[str, Any]:
+    """Admit Hatchery when reachable, otherwise the exact Luna fallback."""
+    try:
+        hatchery = _operation_recovery_hatchery_capability_receipt(
+            policy,
+            provider_policy_digest=provider_policy_digest,
+        )
+    except OperationRecoveryError:
+        return _operation_recovery_luna_capability_receipt(
+            policy,
+            provider_policy_digest=provider_policy_digest,
+            manager=manager,
+        )
+    return create_provider_capability_receipt(
+        provider_id="hatchery",
+        provider_policy_digest=hatchery["provider_policy_digest"],
+        provider_identity_digest=hatchery["provider_identity_digest"],
+        model_digest=hatchery["model_digest"],
+        observed_at=hatchery["observed_at"],
+        successful=hatchery["successful"],
+    )
+
+
 def _operation_recovery_validate_exact_worker_provider_runtime(
     policy: ProviderRuntimePolicy,
     worker_runtime: str | Path,
@@ -9956,7 +10163,16 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
             provider_policy,
             provider_policy_digest=provider_policy_digest,
         )
-        if plan_schema_version in {13, 14, 15}
+        if plan_schema_version in {13, 14}
+        else None
+    )
+    provider_capability_receipt = (
+        _operation_recovery_provider_capability_receipt(
+            provider_policy,
+            provider_policy_digest=provider_policy_digest,
+            manager=grant_manager,
+        )
+        if plan_schema_version == 15 and grant_manager is not None
         else None
     )
 
@@ -10113,6 +10329,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         verification_receipt_path=args.verification_receipt,
         recovery_context=recovery_context,
         hatchery_capability_receipt=hatchery_capability_receipt,
+        provider_capability_receipt=provider_capability_receipt,
         checkpoint_continuation_handoff=checkpoint_continuation_handoff,
         candidate_runtime_snapshot_schema_version=(
             candidate_runtime_snapshot["schema_version"]

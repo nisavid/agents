@@ -3623,7 +3623,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 successor_candidate["release_digest"],
             )
 
-    def test_epoch_three_schema_twelve_repair_requires_same_source_commit(self):
+    def test_epoch_three_schema_twelve_repair_allows_source_revision(self):
         helper = self.controller[
             "_operation_recovery_exact_recovery_context"
         ]
@@ -3688,15 +3688,17 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     **replacement,
                     "source_commit": "8" * 40,
                 }
-                with self.assertRaisesRegex(
-                    Exception,
-                    "recovery handoff differs",
-                ):
-                    helper(
-                        SimpleNamespace(recovery_plan=str(recovery_path)),
-                        snapshot=snapshot,
-                        candidate_release=different_source,
-                    )
+                revised_context = helper(
+                    SimpleNamespace(recovery_plan=str(recovery_path)),
+                    snapshot=snapshot,
+                    candidate_release=different_source,
+                )
+                self.assertEqual(revised_context["schema_version"], 3)
+                self.assertEqual(revised_context["recovery_epoch"], 3)
+                self.assertEqual(
+                    revised_context["candidate_release_digest"],
+                    different_source["release_digest"],
+                )
             finally:
                 globals_.update(originals)
 

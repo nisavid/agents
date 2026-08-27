@@ -9798,9 +9798,10 @@ def _operation_recovery_exact_recovery_context(
     # assembly metadata file was packaged under the runtime root, while the
     # worker remained quiescent and the database recovery was already
     # authenticated.  Permit a replacement only when the post-abort retry
-    # handoff is exactly epoch 2 -> 3 and both immutable candidates identify
-    # the same source commit.  The durable row checks below still require the
-    # replacement to preserve every payload/result field before planning.
+    # handoff is exactly epoch 2 -> 3.  The replacement is independently
+    # sealed and verified below, so a source revision change is permitted at
+    # this quiescent packaging boundary; the durable row checks still require
+    # the replacement to preserve every payload/result field before planning.
     schema12_epoch_three_packaging_repair = (
         not candidate_release_matches
         and recovery_plan["schema_version"] == 12
@@ -9808,8 +9809,6 @@ def _operation_recovery_exact_recovery_context(
         and retry_recovery.get("recovery_epoch_before") == 2
         and retry_recovery.get("recovery_epoch_after") == 3
         and retry_recovery.get("recovery_epoch_ceiling") == 3
-        and recovery_plan["candidate_release"].get("source_commit")
-        == candidate_release.get("source_commit")
     )
     candidate_repair = (
         not candidate_release_matches
@@ -9826,7 +9825,7 @@ def _operation_recovery_exact_recovery_context(
     # either verified row-state handoff because the context binds both the
     # recovery-plan digest and the replacement candidate digest. The schema-12
     # epoch-three packaging repair above is equally constrained by the
-    # authenticated retry handoff and same-source identity; earlier recovery
+    # authenticated retry handoff and durable row evidence; earlier recovery
     # schemas still require one candidate throughout their state-mutating
     # lineage.
     if (

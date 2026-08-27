@@ -21,7 +21,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             for skill in SKILLS
         }
 
-    def test_rolecasting_has_exactly_twenty_two_detailed_scenarios(self) -> None:
+    def test_rolecasting_has_exactly_twenty_four_detailed_scenarios(self) -> None:
         observed = {
             item["name"]
             for document in self.documents.values()
@@ -37,6 +37,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "unavailable-non-codex-capability",
                 "high-risk-independent-review",
                 "cursor-grok-consequential-review",
+                "unrelated-task-model-is-not-a-route",
                 "no-user-owned-task-without-explicit-request",
                 "foreign-peer-bounded-authority",
                 "leader-integrates-worker-results",
@@ -52,8 +53,59 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "codex-cli-tui-native-child-dispatch",
                 "batch-small-same-shape-work",
                 "bounded-wait-and-live-child-reconciliation",
+                "isolated-task-companion-boundary",
             },
         )
+
+    def test_task_identity_is_not_a_model_slot_or_delegation_fallback(self) -> None:
+        choosing_root = PLUGIN_ROOT / "skills" / "choosing-agent-models"
+        delegating_root = PLUGIN_ROOT / "skills" / "delegating-cross-agent-work"
+        choosing = " ".join(
+            (
+                (choosing_root / "SKILL.md").read_text()
+                + "\n"
+                + (
+                    choosing_root
+                    / "references"
+                    / "capability-probes-and-fallbacks.md"
+                ).read_text()
+            ).split()
+        ).lower()
+        delegating = " ".join(
+            (
+                (delegating_root / "SKILL.md").read_text()
+                + "\n"
+                + (
+                    delegating_root
+                    / "references"
+                    / "foreign-harness-peers.md"
+                ).read_text()
+            ).split()
+        ).lower()
+
+        for phrase in (
+            "model availability",
+            "unrelated task",
+            "no-task-data",
+            "no-runnable-route disposition",
+            "needs_context",
+            "blocked",
+        ):
+            with self.subTest(skill="choosing-agent-models", phrase=phrase):
+                self.assertIn(phrase, choosing)
+
+        for phrase in (
+            "task identity",
+            "bounded purpose",
+            "peer, sibling, companion, or dedicated task",
+            "newly created for the current source task",
+            "same-purpose companion",
+            "message, fork from, or repurpose",
+            "model, account, entitlement, permissions, or context",
+            "explicit consent",
+        ):
+            with self.subTest(skill="delegating-cross-agent-work", phrase=phrase):
+                self.assertIn(phrase, delegating)
 
     def test_delegation_skill_batches_small_same_shape_work(self) -> None:
         skill = (
@@ -262,6 +314,9 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "cursor-grok-high-fit",
                 "cursor-surface-proof",
                 "foreign-review-authority-preserved",
+                "task-purpose-route-gate",
+                "no-unrelated-task-reuse",
+                "routing-no-task-authority",
                 "leader-owned-peer",
                 "user-owned-peer-consent",
                 "transport-relationship-independent",
@@ -279,6 +334,9 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "distinct-judgment-remains-separate",
                 "bounded-wait-not-short-poll",
                 "live-child-reconciliation-after-wait",
+                "same-purpose-companion-only",
+                "no-model-slot-repurpose",
+                "task-creation-authority",
             }.issubset(expectations)
         )
 

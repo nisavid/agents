@@ -7,9 +7,9 @@ description: Use when selecting a model or reasoning effort for an agent, subage
 
 ## Scope
 
-Own model/effort selection and capability proof post-delegation. [delegating-cross-agent-work](../delegating-cross-agent-work/SKILL.md) owns family, surface, version, executor, relationship, ownership, transport, assurance, authority, handoffs, and integration. Model choice is a separate decision; it cannot repair topology.
+Own model/effort selection and capability proof post-delegation. [delegating-cross-agent-work](../delegating-cross-agent-work/SKILL.md) owns family, surface, version, executor, relationship, ownership, transport, assurance, authority, handoffs, and integration. Model choice is a separate decision; it cannot repair topology or make an unrelated task a valid route.
 
-Choose the least costly model that safely preserves required judgment. Escalate for ambiguity, hard-to-reverse decisions, architecture, reviewer-facing work, or final integration.
+Choose the lowest-cost model that preserves required judgment. Escalate for ambiguity, hard-to-reverse decisions, architecture, reviewer-facing work, or final integration.
 
 ## Preferred Codex Role Family
 

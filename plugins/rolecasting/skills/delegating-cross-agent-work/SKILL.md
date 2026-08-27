@@ -23,7 +23,7 @@ Choose each axis independently:
 
 Do not infer one axis from another. Use a leader-owned child for bounded work the leader creates and ends. A leader-owned peer may have an independent session while remaining leader-controlled. A user-owned peer or task requires explicit user consent to create or steer. Use an external worker only when crossing the selected product or control boundary materially helps.
 
-Read [foreign-harness-peers.md](references/foreign-harness-peers.md) before probing a non-native or separately owned surface.
+Task identity and bounded purpose are route gates: model availability never makes an unrelated task valid. Read [foreign-harness-peers.md](references/foreign-harness-peers.md) before probing a non-native, separately owned, companion, sibling, or dedicated-task surface.
 
 ## Kickoff
 
@@ -31,15 +31,12 @@ Record the leader, repository, branch, immutable base, dirty state, submodules, 
 
 ## Bounded Handoff
 
-Every prompt is a bounded task contract: goal and success criteria; worktree and immutable base; relevant facts and target behavior; allowed scope and read/write authority; subdelegation and external-action authority; verification; output; and stop conditions. Unstated authority is absent. Workers preserve user and peer edits.
+Every prompt is a bounded task contract: goal, success criteria, worktree, immutable base, relevant facts, target behavior, scope, read/write and subdelegation authority, external-action authority, verification, output, and stop conditions. Unstated authority is absent. Workers preserve existing edits.
 
 For native ChatGPT Codex or Codex CLI/TUI children, follow
-[native-codex-subagents.md](references/native-codex-subagents.md): freeze before
-spawning and record only host-protocol observations.
+[native-codex-subagents.md](references/native-codex-subagents.md).
 
-For a caller that needs a frozen multi-worker dispatch plan, issue the portable
-contract defined by [invocation-topology-receipt.md](references/invocation-topology-receipt.md).
-The harness adapter serializes it as `adapter:rolecasting-invocation-topology-receipt`; model selection remains separate and never supplies dispatch authority. For witnessed execution and assurance minima, use [dispatch-evidence.md](references/dispatch-evidence.md).
+For frozen multi-worker plans, issue [invocation-topology-receipt.md](references/invocation-topology-receipt.md); the harness adapter serializes it as `adapter:rolecasting-invocation-topology-receipt`. Model selection never supplies dispatch authority. Use [dispatch-evidence.md](references/dispatch-evidence.md) for witnessed execution and assurance minima.
 
 Ask workers to return one status:
 

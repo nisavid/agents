@@ -9791,9 +9791,32 @@ def _operation_recovery_exact_recovery_context(
     candidate_release_matches = (
         recovery_plan["candidate_release"] == candidate_release
     )
+    retry_recovery = recovery_plan["retry_recovery"]
+    # Schema 12 normally keeps one immutable candidate throughout its
+    # post-abort lineage.  Epoch-three recovery is the one narrow exception:
+    # candidate112 was never able to produce a valid runtime because an
+    # assembly metadata file was packaged under the runtime root, while the
+    # worker remained quiescent and the database recovery was already
+    # authenticated.  Permit a replacement only when the post-abort retry
+    # handoff is exactly epoch 2 -> 3 and both immutable candidates identify
+    # the same source commit.  The durable row checks below still require the
+    # replacement to preserve every payload/result field before planning.
+    schema12_epoch_three_packaging_repair = (
+        not candidate_release_matches
+        and recovery_plan["schema_version"] == 12
+        and retry_recovery.get("schema_version") == 3
+        and retry_recovery.get("recovery_epoch_before") == 2
+        and retry_recovery.get("recovery_epoch_after") == 3
+        and retry_recovery.get("recovery_epoch_ceiling") == 3
+        and recovery_plan["candidate_release"].get("source_commit")
+        == candidate_release.get("source_commit")
+    )
     candidate_repair = (
         not candidate_release_matches
-        and recovery_plan["schema_version"] in {11, 13}
+        and (
+            recovery_plan["schema_version"] in {11, 13}
+            or schema12_epoch_three_packaging_repair
+        )
     )
     generation_rebind = (
         candidate_repair and recovery_plan["schema_version"] == 13
@@ -9801,9 +9824,11 @@ def _operation_recovery_exact_recovery_context(
     # Schemas 11 and 13 authenticate completed recovery mutations plus their
     # verification receipts. A newly approved immutable candidate may reuse
     # either verified row-state handoff because the context binds both the
-    # recovery-plan digest and the replacement candidate digest. Earlier
-    # recovery schemas still require one candidate throughout their
-    # state-mutating lineage.
+    # recovery-plan digest and the replacement candidate digest. The schema-12
+    # epoch-three packaging repair above is equally constrained by the
+    # authenticated retry handoff and same-source identity; earlier recovery
+    # schemas still require one candidate throughout their state-mutating
+    # lineage.
     if (
         (
             not candidate_release_matches

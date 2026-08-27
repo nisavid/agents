@@ -3623,6 +3623,83 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 successor_candidate["release_digest"],
             )
 
+    def test_epoch_three_schema_twelve_repair_requires_same_source_commit(self):
+        helper = self.controller[
+            "_operation_recovery_exact_recovery_context"
+        ]
+        globals_ = helper.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-epoch-three-packaging-repair-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            recovery, snapshot, documents, recovery_path = (
+                self._schema_10_recovery_handoff(root)
+            )
+            recovery = deepcopy(recovery)
+            recovery["schema_version"] = 12
+            recovery["retry_recovery"] = {
+                **recovery["retry_recovery"],
+                "schema_version": 3,
+                "recovery_epoch_before": 2,
+                "recovery_epoch_after": 3,
+                "recovery_epoch_ceiling": 3,
+            }
+            application = documents[recovery["application_receipt_path"]]
+            verification = documents[
+                recovery["verification_receipt_path"]
+            ]
+            replacement = {
+                **recovery["candidate_release"],
+                "version": "2026.08.27+3333333.operation-recovery.113",
+                "release_digest": "7" * 64,
+            }
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, *, allow_expired: recovery
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda _path, _label: documents[str(_path)]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_operation_recovery_post_abort_validate_verification": (
+                    lambda _value, *, plan, application, authority: verification
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                context = helper(
+                    SimpleNamespace(recovery_plan=str(recovery_path)),
+                    snapshot=snapshot,
+                    candidate_release=replacement,
+                )
+                self.assertEqual(context["schema_version"], 3)
+                self.assertEqual(context["recovery_epoch"], 3)
+                self.assertEqual(
+                    context["candidate_release_digest"],
+                    replacement["release_digest"],
+                )
+
+                different_source = {
+                    **replacement,
+                    "source_commit": "8" * 40,
+                }
+                with self.assertRaisesRegex(
+                    Exception,
+                    "recovery handoff differs",
+                ):
+                    helper(
+                        SimpleNamespace(recovery_plan=str(recovery_path)),
+                        snapshot=snapshot,
+                        candidate_release=different_source,
+                    )
+            finally:
+                globals_.update(originals)
+
     def test_post_terminal_handoff_allows_approved_candidate_repair(self):
         helper = self.controller[
             "_operation_recovery_exact_recovery_context"

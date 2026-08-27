@@ -7573,55 +7573,24 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(body["reasoning"], {"effort": "medium"})
         self.assertIs(body["store"], False)
 
-    def test_planner_resolves_luna_key_through_protected_locator_only(self):
+    def test_planner_resolves_luna_key_from_runtime_bound_private_file(self):
         resolve = self.controller[
             "_operation_recovery_resolve_provider_api_key"
         ]
         globals_ = resolve.__globals__
         observed = {}
 
-        class Process:
-            returncode = 0
-            pid = 1234
-
-            def communicate(self, request, timeout):
-                observed["request"] = json.loads(request)
-                observed["timeout"] = timeout
-                return (
-                    b'{"schema_version":1,"values":'
-                    b'{"OPENAI_API_KEY":"test-project-key"}}',
-                    None,
-                )
-
-        def popen(argv, **kwargs):
-            observed["argv"] = argv
-            observed["environment"] = kwargs["env"]
-            return Process()
-
         manager = SimpleNamespace(
             config=SimpleNamespace(
-                credential_resolver=SimpleNamespace(
-                    path=Path("/private/tmp/resolve-hindsight-credential"),
-                    sha256="a" * 64,
-                )
+                state_root=Path("/Users/test/.local/state/hindsight-control-plane")
             )
         )
-        replacements = {
-            "_protected_executable_bytes": lambda *_args: b"protected",
-            "pwd": SimpleNamespace(
-                getpwuid=lambda _uid: SimpleNamespace(
-                    pw_dir="/Users/test",
-                    pw_name="test",
-                )
-            ),
-            "subprocess": SimpleNamespace(
-                PIPE=subprocess.PIPE,
-                DEVNULL=subprocess.DEVNULL,
-                Popen=popen,
-                SubprocessError=subprocess.SubprocessError,
-                TimeoutExpired=subprocess.TimeoutExpired,
-            ),
-        }
+        def read_private(path, label):
+            observed["path"] = path
+            observed["label"] = label
+            return b"HINDSIGHT_OPENAI_API_KEY=test-project-key\n"
+
+        replacements = {"_operation_recovery_read_private_bytes": read_private}
         originals = {key: globals_[key] for key in replacements}
         globals_.update(replacements)
         try:
@@ -7634,19 +7603,29 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             globals_.update(originals)
         self.assertEqual(key, "test-project-key")
         self.assertEqual(
-            observed["request"],
-            {
-                "schema_version": 1,
-                "credentials": [
-                    {
-                        "environment": "OPENAI_API_KEY",
-                        "locator": "api-key:hindsight-openai",
-                    }
-                ],
-            },
+            observed["path"],
+            manager.config.state_root / ".hindsight-openai.env",
         )
-        self.assertNotIn("OPENAI_API_KEY", observed["environment"])
-        self.assertEqual(observed["timeout"], 30)
+        self.assertEqual(observed["label"], "Hindsight OpenAI API key")
+
+    def test_planner_rejects_unbound_luna_key_locator(self):
+        resolve = self.controller[
+            "_operation_recovery_resolve_provider_api_key"
+        ]
+        manager = SimpleNamespace(
+            config=SimpleNamespace(
+                state_root=Path("/Users/test/.local/state/hindsight-control-plane")
+            )
+        )
+        with self.assertRaisesRegex(
+            self.controller["OperationRecoveryError"],
+            "credential resolution failed",
+        ):
+            resolve(
+                manager,
+                locator="api-key:other-project",
+                marker="provider-policy:openai-luna",
+            )
 
     def test_exact_drain_effective_profile_requires_the_policy_projection(self):
         policy_path = (

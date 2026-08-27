@@ -15,7 +15,6 @@ import json
 import math
 import os
 from pathlib import Path
-import pwd
 import re
 import secrets
 import select
@@ -169,7 +168,6 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
     InstallationConfig,
     PortableInstallError,
     PortableInstallationManager,
-    _protected_executable_bytes,
     _release_manifest,
 )
 from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
@@ -8970,86 +8968,33 @@ def _operation_recovery_resolve_provider_api_key(
     locator: str,
     marker: str,
 ) -> str:
-    """Resolve one policy-bound key without exporting it to ambient state."""
-    resolver = manager.config.credential_resolver
+    """Resolve the runtime-bound project key without exporting it."""
     try:
-        _protected_executable_bytes(
-            resolver.path,
-            "credential resolver",
-            resolver.sha256,
+        if (
+            locator != "api-key:hindsight-openai"
+            or marker != "provider-policy:openai-luna"
+        ):
+            raise ValueError("provider credential binding differs")
+        payload = _operation_recovery_read_private_bytes(
+            manager.config.state_root / ".hindsight-openai.env",
+            "Hindsight OpenAI API key",
         )
-        account = pwd.getpwuid(os.geteuid())
-        request_body = canonical_bytes(
-            {
-                "schema_version": 1,
-                "credentials": [
-                    {
-                        "environment": "OPENAI_API_KEY",
-                        "locator": locator,
-                    }
-                ],
-            }
+        match = re.fullmatch(
+            r"HINDSIGHT_OPENAI_API_KEY=([!-~]{1,8192})\n?",
+            payload.decode("utf-8"),
         )
-        process = subprocess.Popen(
-            [str(resolver.path)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd="/",
-            env={
-                "PATH": "/usr/bin:/bin",
-                "HOME": account.pw_dir,
-                "USER": account.pw_name,
-                "LOGNAME": account.pw_name,
-            },
-            start_new_session=True,
-        )
-        try:
-            response_body, _ = process.communicate(request_body, timeout=30)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=5)
-            raise
-        if process.returncode != 0 or len(response_body) > 1024 * 1024:
-            raise ValueError("credential resolver failed")
-        response = strict_json_loads(response_body)
+        if match is None:
+            raise ValueError("provider credential file is invalid")
     except (
-        KeyError,
-        OSError,
-        PortableInstallError,
-        StrictJsonError,
-        subprocess.SubprocessError,
+        AttributeError,
+        OperationRecoveryError,
+        UnicodeError,
         ValueError,
     ):
         raise OperationRecoveryError(
             "operation-recovery provider credential resolution failed"
         ) from None
-    if (
-        not isinstance(response, Mapping)
-        or set(response) != {"schema_version", "values"}
-        or response["schema_version"] != 1
-        or not isinstance(response["values"], Mapping)
-        or set(response["values"]) != {"OPENAI_API_KEY"}
-    ):
-        raise OperationRecoveryError(
-            "operation-recovery provider credential resolution failed"
-        )
-    api_key = response["values"]["OPENAI_API_KEY"]
-    if (
-        not isinstance(api_key, str)
-        or not api_key
-        or len(api_key) > 8192
-        or api_key != api_key.strip()
-        or any(character.isspace() for character in api_key)
-        or api_key == marker
-    ):
-        raise OperationRecoveryError(
-            "operation-recovery provider credential resolution failed"
-        )
-    return api_key
+    return match.group(1)
 
 
 def _operation_recovery_luna_capability_receipt(

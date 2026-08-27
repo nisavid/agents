@@ -95,17 +95,40 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 self.assertIn(phrase, choosing)
 
         for phrase in (
+            "already authorized no-task-data refresh",
+            "inspect route metadata exposed for unrelated tasks",
+            "does not authorize reading task data",
+            "execution or authorization route for current-task work",
+            "when a task that must be isolated",
+        ):
+            with self.subTest(skill="choosing-agent-models", phrase=phrase):
+                self.assertIn(phrase, choosing)
+        self.assertNotIn("reuse an unrelated task to obtain", choosing)
+        self.assertNotIn("a required isolated task", choosing)
+
+        choosing_eval = next(
+            item
+            for item in self.documents["choosing-agent-models"]["evals"]
+            if item["name"] == "unrelated-task-model-is-not-a-route"
+        )
+        expected_output = choosing_eval["expected_output"].lower()
+        self.assertIn("already authorized no-task-data observation", expected_output)
+        self.assertIn("execution or authorization route", expected_output)
+
+        for phrase in (
             "task identity",
             "bounded purpose",
             "peer, sibling, companion, or dedicated task",
             "newly created for the current source task",
             "same-purpose companion",
-            "message, fork from, or repurpose",
-            "model, account, entitlement, permissions, or context",
+            "message, fork from, steer, or execute current-task work through",
+            "route-metadata inspection",
+            "model or under its account, entitlement, permissions, or context",
             "explicit consent",
         ):
             with self.subTest(skill="delegating-cross-agent-work", phrase=phrase):
                 self.assertIn(phrase, delegating)
+        self.assertNotIn("to obtain its model", delegating)
 
     def test_delegation_skill_batches_small_same_shape_work(self) -> None:
         skill = (

@@ -145,6 +145,10 @@ _OPENAI_EMBEDDINGS_API_KEY_VARIABLE = (
 _OPENAI_EMBEDDINGS_MODEL = "text-embedding-3-small"
 _OPENAI_LUNA_PROVIDER = "openai-responses"
 _OPENAI_LUNA_MODEL = "gpt-5.6-luna"
+_EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT_ENV = (
+    "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT"
+)
+_EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT = 2
 
 
 class _CodexRequestCompatibilityClient:
@@ -1068,6 +1072,43 @@ class _ProviderRuntime:
         self._gates: dict[str, _PriorityGate] = {}
         self._resolved_oauth_homes: dict[str, Path] = {}
         self._oauth_home_owners: dict[Path, str] = {}
+        self._exact_drain_admission: asyncio.Semaphore | None = None
+        self._exact_drain_admission_loop: asyncio.AbstractEventLoop | None = None
+
+    def _exact_drain_admission_gate(
+        self,
+        scope: str,
+    ) -> asyncio.Semaphore | None:
+        """Return the drain-wide gate before provider progress is recorded.
+
+        Hindsight's retain producer can create many extraction tasks before the
+        upstream LLM semaphore is reached.  Exact-drain workers opt into this
+        gate through their already-bound retain concurrency environment value,
+        so queued tasks never appear as active provider requests.
+        """
+        if (
+            self._progress_recorder is None
+            or not scope.startswith("retain")
+            or _EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT_ENV not in os.environ
+        ):
+            return None
+        try:
+            limit = int(
+                os.environ[_EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT_ENV]
+            )
+        except (TypeError, ValueError) as error:
+            raise ProviderRuntimeCompatibilityError(
+                "exact drain retain concurrency is invalid"
+            ) from error
+        if limit != _EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT:
+            raise ProviderRuntimeCompatibilityError(
+                "exact drain retain concurrency authority differs"
+            )
+        loop = asyncio.get_running_loop()
+        if self._exact_drain_admission_loop is not loop:
+            self._exact_drain_admission = asyncio.Semaphore(limit)
+            self._exact_drain_admission_loop = loop
+        return self._exact_drain_admission
 
     def managed_api_key(
         self,
@@ -1309,6 +1350,35 @@ class _ProviderRuntime:
                     self._progress_recorder.clear_cooldown(member_id)
 
     async def dispatch(
+        self,
+        runtime_members: list[Any],
+        method_name: str,
+        kwargs: dict[str, Any],
+        should_failover: Callable[[BaseException], bool],
+        *,
+        strategy_mode: str,
+    ) -> Any:
+        admission = self._exact_drain_admission_gate(
+            str(kwargs.get("scope", ""))
+        )
+        if admission is None:
+            return await self._dispatch_unbounded(
+                runtime_members,
+                method_name,
+                kwargs,
+                should_failover,
+                strategy_mode=strategy_mode,
+            )
+        async with admission:
+            return await self._dispatch_unbounded(
+                runtime_members,
+                method_name,
+                kwargs,
+                should_failover,
+                strategy_mode=strategy_mode,
+            )
+
+    async def _dispatch_unbounded(
         self,
         runtime_members: list[Any],
         method_name: str,

@@ -217,6 +217,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS,
+    EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT,
     EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
@@ -11433,6 +11434,9 @@ def _operation_recovery_profile_environment() -> dict[str, str]:
             "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
                 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
             ),
+            "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT": (
+                EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT
+            ),
             "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
                 EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS
             ),
@@ -11523,6 +11527,9 @@ def _operation_recovery_exact_worker_environment(
             "HINDSIGHT_API_RETAIN_BATCH_ENABLED": "0",
             "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
                 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
+            ),
+            "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT": (
+                EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT
             ),
             "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
                 EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS

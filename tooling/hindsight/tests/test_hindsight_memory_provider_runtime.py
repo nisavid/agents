@@ -1656,6 +1656,92 @@ print("accepted")
         self.assertEqual(finished["active_provider_requests"], [])
         self.assertEqual(finished["provider_counters"][0]["succeeded"], 1)
 
+    def test_exact_drain_admission_bounds_tracked_provider_requests(self) -> None:
+        """The drain gate must cap provider starts before progress accounting."""
+        value = split_timeout_policy_data()
+        value["failover_order"] = ["fallback"]
+        value["members"] = [value["members"][2]]
+        policy = ProviderRuntimePolicy.load(value)
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest="a" * 64,
+                worker_pid=os.getpid(),
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=5,
+            )
+            provider_runtime.set_exact_drain_progress_recorder(recorder)
+            self.addCleanup(
+                provider_runtime.set_exact_drain_progress_recorder,
+                None,
+            )
+            runtime = provider_runtime._ProviderRuntime(
+                policy,
+                credential_resolver=lambda _locator: "/tmp/unread-oauth-home",
+                logger=logging.getLogger("test-provider-runtime-admission"),
+            )
+            member = StaticMember(
+                "lmstudio",
+                "private-fallback-model",
+                "http://inference.example.test:13305/v1",
+                "",
+                "done",
+            )
+            entered = 0
+            two_entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocked_call(**_kwargs):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    two_entered.set()
+                request_digest = provider_runtime._PROVIDER_REQUEST_DIGEST.get()
+                self.assertIsNotNone(request_digest)
+                recorder.provider_executing(request_digest)
+                await release.wait()
+                return "done"
+
+            member.call = blocked_call
+
+            async def scenario():
+                with mock.patch.dict(
+                    os.environ,
+                    {"HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT": "2"},
+                ):
+                    pending = [
+                        asyncio.create_task(
+                            runtime.dispatch(
+                                [member],
+                                "call",
+                                {"scope": "retain_extract_facts"},
+                                lambda exc: isinstance(exc, Exception),
+                                strategy_mode="failover",
+                            )
+                        )
+                        for _index in range(3)
+                    ]
+                    await asyncio.wait_for(two_entered.wait(), timeout=1)
+                    await asyncio.sleep(0)
+                    active = read_exact_drain_progress(
+                        progress_path,
+                        plan_digest="a" * 64,
+                        progress_schema_version=5,
+                    )
+                    self.assertEqual(entered, 2)
+                    self.assertEqual(len(active["active_provider_requests"]), 2)
+                    release.set()
+                    return await asyncio.gather(*pending)
+
+            self.assertEqual(
+                asyncio.run(asyncio.wait_for(scenario(), timeout=2)),
+                ["done", "done", "done"],
+            )
+
     def test_managed_provider_timeout_is_a_total_wall_clock_deadline(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             progress_path = Path(directory) / "progress.json"

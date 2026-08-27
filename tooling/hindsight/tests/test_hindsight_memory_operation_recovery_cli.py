@@ -5087,6 +5087,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(environment[key], "0")
         self.assertEqual(environment["HINDSIGHT_API_RETAIN_LLM_TIMEOUT"], "3600")
         self.assertEqual(
+            environment["HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT"], "2"
+        )
+        self.assertEqual(
             environment["HINDSIGHT_API_RETAIN_MAX_CONCURRENT"], "2"
         )
         self.assertEqual(

@@ -49,6 +49,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     ExactDrainWorkerMainShutdownBridge,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS,
+    EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT,
     EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS,
     exact_drain_candidate_provider_root,
     exact_drain_effective_profile_digest,
@@ -193,6 +194,9 @@ def _validate_worker_environment(
             "HINDSIGHT_API_RETAIN_BATCH_ENABLED": "0",
             "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
                 EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
+            ),
+            "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT": (
+                EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT
             ),
             "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
                 EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS

@@ -37,9 +37,9 @@ def badge(
     title: Optional[str] = None,
     label_color: Optional[str] = None,
 ) -> str:
-    category = __import__("re").fullmatch(
-        r"(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, (\d+) deletions", alt
-    )
+    from change_navigation.model import CATEGORY_METRIC_SHAPE_RE
+
+    category = CATEGORY_METRIC_SHAPE_RE.fullmatch(alt)
     if category and title is None:
         from change_navigation.categories import category_title
 
@@ -167,6 +167,25 @@ STACK = stack_body() + "\n"
 
 
 class ValidateChangeNavigationTests(unittest.TestCase):
+    def test_badge_helper_adds_category_title_for_singular_metrics(self) -> None:
+        for alt, path, expected_title in (
+            (
+                "IMPL: 1 addition, 0 deletions",
+                "IMPL-%2B1%20%E2%88%920-0969DA",
+                "Implementation: 1 addition, 0 deletions (non-test source and configuration)",
+            ),
+            (
+                "IMPL: 0 additions, 1 deletion",
+                "IMPL-%2B0%20%E2%88%921-0969DA",
+                "Implementation: 0 additions, 1 deletion (non-test source and configuration)",
+            ),
+        ):
+            with self.subTest(alt=alt):
+                self.assertIn(
+                    f'title="{expected_title}"',
+                    badge(alt, path),
+                )
+
     def test_rejects_secret_shaped_candidate_without_echoing_value(self) -> None:
         secret = "ghp_123456789012345678901234567890"
 

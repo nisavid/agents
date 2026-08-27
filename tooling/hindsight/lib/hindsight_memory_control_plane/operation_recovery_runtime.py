@@ -2064,8 +2064,16 @@ def install_exact_drain_runtime_guards(
 
     async def scan_active_schemas(
         _poller: Any,
-        schemas: Sequence[str | None],
+        *arguments: Any,
     ) -> set[str | None]:
+        if len(arguments) == 1:
+            (schemas,) = arguments
+        elif len(arguments) == 2:
+            _connection, schemas = arguments
+        else:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain schema-scan seam differs"
+            )
         if None in schemas:
             return {None}
         if "public" in schemas:
@@ -2358,22 +2366,23 @@ def install_exact_drain_runtime_guards(
 
     async def claim_exact_batch(
         poller: Any,
-        schema: str | None,
-        reserved_limits: Mapping[str, int],
-        shared_limit: int,
+        *arguments: Any,
     ) -> Any:
+        if len(arguments) == 3:
+            schema, reserved_limits, shared_limit = arguments
+        elif len(arguments) == 4:
+            _connection, schema, reserved_limits, shared_limit = arguments
+        else:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain claim seam differs"
+            )
         async with claim_lifecycle_lock(poller):
             shutdown = getattr(poller, "_shutdown", None)
             shutdown_is_set = getattr(shutdown, "is_set", None)
             if callable(shutdown_is_set) and shutdown_is_set():
                 return []
             tasks = await retry_serializable_mutation(
-                lambda: upstream_claim_batch_inner(
-                    poller,
-                    schema,
-                    reserved_limits,
-                    shared_limit,
-                )
+                lambda: upstream_claim_batch_inner(poller, *arguments)
             )
             try:
                 adapter.claim_committed(tasks)
@@ -2389,16 +2398,10 @@ def install_exact_drain_runtime_guards(
 
     async def claim_exact_batch_public(
         poller: Any,
-        schema: str | None,
-        reserved_limits: Mapping[str, int],
-        shared_limit: int,
+        *arguments: Any,
     ) -> Any:
         """Do not convert a committed-claim evidence failure into an empty poll."""
-        return await poller._claim_batch_for_schema_inner(
-            schema,
-            reserved_limits,
-            shared_limit,
-        )
+        return await poller._claim_batch_for_schema_inner(*arguments)
 
     def record_exact_task_error(
         poller: Any,
@@ -3789,7 +3792,7 @@ def _patch_exact_drain_memory_engine(
 
 
 def _patch_exact_drain_poller(source: bytes) -> bytes:
-    """Keep exception type when the upstream poller records a final failure."""
+    """Keep typed task errors and fail closed on polling-loop failures."""
     try:
         text = source.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -3846,6 +3849,17 @@ def _patch_exact_drain_poller(source: bytes) -> bytes:
             "                )",
             "poller typed terminal error",
         )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "            except Exception as e:\n"
+        "                logger.error(f\"Worker {self._worker_id} error in polling loop: {format_task_error(e)}\", exc_info=True)\n"
+        "                # Backoff on error\n"
+        "                await asyncio.sleep(1)\n",
+        "            except Exception as e:\n"
+        "                logger.error(f\"Worker {self._worker_id} error in polling loop: {format_task_error(e)}\", exc_info=True)\n"
+        "                raise\n",
+        "poller fail-closed polling loop",
+    )
     try:
         compile(text, "hindsight_api/worker/poller.py", "exec")
     except SyntaxError as error:

@@ -1363,6 +1363,97 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             ],
         )
 
+    def test_runtime_guard_schema_scan_accepts_poller_connection_argument(self):
+        events = []
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                connection,
+                schema,
+                reserved_limits,
+                shared_limit,
+            ):
+                events.append(
+                    (
+                        connection,
+                        schema,
+                        reserved_limits,
+                        shared_limit,
+                    )
+                )
+                return []
+
+            async def _claim_batch_for_schema(
+                self,
+                connection,
+                schema,
+                reserved_limits,
+                shared_limit,
+            ):
+                return await self._claim_batch_for_schema_inner(
+                    connection,
+                    schema,
+                    reserved_limits,
+                    shared_limit,
+                )
+
+            async def _scan_active_schemas(self, _connection, _schemas):
+                return set()
+
+            async def run(self):
+                return None
+
+        class MemoryEngine:
+            async def initialize(self):
+                return None
+
+        class Adapter:
+            def __init__(self):
+                self._plan = {"progress_schema_version": 6}
+
+            def claim_committed(self, _tasks):
+                return None
+
+            def abort_after_committed_claim_failure(self):
+                raise AssertionError("claim evidence unexpectedly failed")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            connection = object()
+            poller = WorkerPoller()
+            active = await poller._scan_active_schemas(
+                connection,
+                [None, "public"],
+            )
+            claimed = await poller._claim_batch_for_schema(
+                connection,
+                None,
+                {"retain": 1},
+                1,
+            )
+            return connection, active, claimed
+
+        connection, active, claimed = asyncio.run(exercise())
+        self.assertEqual(active, {None})
+        self.assertEqual(claimed, [])
+        self.assertEqual(
+            events,
+            [(connection, None, {"retain": 1}, 1)],
+        )
+
     def test_shutdown_bridge_deduplicates_internal_request_after_signal(self):
         external_handlers = []
         worker_callbacks = []
@@ -6718,18 +6809,26 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
             async def _claim_batch_for_schema_inner(
                 self,
+                _connection,
                 _schema,
                 _reserved_limits,
                 _shared_limit,
             ):
                 return []
 
-            async def _claim_batch_for_schema(self, schema, reserved, shared):
+            async def _claim_batch_for_schema(
+                self,
+                connection,
+                schema,
+                reserved,
+                shared,
+            ):
                 return await self._claim_batch_for_schema_inner(
+                    connection,
                     schema, reserved, shared
                 )
 
-            async def _scan_active_schemas(self, schemas):
+            async def _scan_active_schemas(self, _connection, schemas):
                 events.append(("upstream-scan", schemas))
                 return set(schemas)
 
@@ -6767,6 +6866,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 1,
             )
             active = await WorkerPoller()._scan_active_schemas(
+                "connection",
                 ["tenant-a", None, "tenant-b"]
             )
             recovered = await WorkerPoller().recover_own_tasks()

@@ -5501,6 +5501,17 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "            )"
                 in poller_source
             )
+            self.assertIn(
+                "logger.error(f\"Worker {self._worker_id} error in polling loop: "
+                "{format_task_error(e)}\", exc_info=True)\n"
+                "                raise",
+                poller_source,
+            )
+            self.assertNotIn(
+                "# Backoff on error\n"
+                "                await asyncio.sleep(1)",
+                poller_source,
+            )
             memory_tree = ast.parse(memory_engine_source)
             diagnostic_functions = ast.Module(
                 body=[

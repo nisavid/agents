@@ -3933,6 +3933,20 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 repaired["candidate_release_digest"],
                 new_candidate["release_digest"],
             )
+            reference_plan["schema_version"] = 15
+            context["schema_version"] = 3
+            context["recovery_epoch"] = 3
+            repaired_schema_15 = helper(
+                snapshot=snapshot,
+                candidate_release=new_candidate,
+                reference_plan_path="reference.json",
+            )
+            self.assertEqual(repaired_schema_15["schema_version"], 3)
+            self.assertEqual(repaired_schema_15["recovery_epoch"], 3)
+            self.assertEqual(
+                repaired_schema_15["candidate_release_digest"],
+                new_candidate["release_digest"],
+            )
             progress["active_provider_requests"] = [{"request": "x"}]
             with self.assertRaisesRegex(
                 Exception,

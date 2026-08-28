@@ -9248,7 +9248,13 @@ def _operation_recovery_exact_candidate_repair_context(
             "progress_schema_version", 1
         ),
     )
-    if interrupted_schema_15_poller_repair and not allow_partial_completion:
+    schema_15_idle_poller_repair = (
+        interrupted_schema_15_poller_repair
+        and not allow_partial_completion
+        and progress.get("worker_status") == "running"
+        and progress.get("worker_stage") == "worker.poller.running"
+    )
+    if schema_15_idle_poller_repair:
         if (
             any(
                 progress.get(key) != journal[key]

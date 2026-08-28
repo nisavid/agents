@@ -4306,6 +4306,246 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         finally:
             globals_.update(originals)
 
+    def test_schema_15_partial_completion_reconciles_remaining_rows(self):
+        helper = self.controller[
+            "_operation_recovery_exact_candidate_repair_context"
+        ]
+        globals_ = helper.__globals__
+        old_candidate = {
+            "source_commit": "1" * 40,
+            "version": "2026.08.27+1111111.operation-recovery.115",
+            "release_digest": "2" * 64,
+        }
+        new_candidate = {
+            "source_commit": "3" * 40,
+            "version": "2026.08.28+3333333.operation-recovery.116",
+            "release_digest": "4" * 64,
+        }
+
+        def row(operation_id, row_digest, *, status="pending"):
+            return {
+                "operation_id": operation_id,
+                "operation_type": "retain",
+                "row_digest": row_digest,
+                "current_status": status,
+                "created_at": "2026-08-27T00:00:00Z",
+                "completed_at": (
+                    "2026-08-27T00:01:00Z" if status == "completed" else None
+                ),
+                "task_payload_digest": "5" * 64,
+                "result_metadata_digest": "6" * 64,
+                "worker_id_present": status == "completed",
+                "worker_id_digest": None,
+                "claimed_at": (
+                    "2026-08-27T00:00:01Z" if status == "completed" else None
+                ),
+            }
+
+        old_rows = [row("retain-1", "7" * 64), row("retain-2", "8" * 64)]
+        completed_row = row("retain-1", "9" * 64, status="completed")
+        completed_row["worker_id_digest"] = "a" * 64
+        pending_row = row("retain-2", "8" * 64)
+        reference_snapshot = {
+            "cohort_digest": "b" * 64,
+            "installation_authority": {"authority": "stable"},
+            "generation_before": "systalyze:public:20",
+            "generation_after": "systalyze:public:20",
+            "status_counts": {"pending": 2},
+            "operations": old_rows,
+        }
+        snapshot = {
+            "cohort_digest": "c" * 64,
+            "installation_authority": reference_snapshot[
+                "installation_authority"
+            ],
+            "generation_before": "systalyze:public:21",
+            "generation_after": "systalyze:public:21",
+            "status_counts": {"completed": 1, "pending": 1},
+            "operations": [completed_row, pending_row],
+        }
+        context = {
+            "schema_version": 3,
+            "origin": "post-abort",
+            "recovery_epoch": 3,
+            "candidate_release_digest": old_candidate["release_digest"],
+        }
+        reference_plan = {
+            "schema_version": 15,
+            "candidate_release": old_candidate,
+            "recovery_context": context,
+            "authorization_receipt_path": "authorization.json",
+            "application_receipt_path": "application.json",
+            "progress_artifact_path": "progress.json",
+            "status_artifact_path": "status.json",
+            "selected_operations": [
+                {
+                    "operation_id": item["operation_id"],
+                    "operation_type": item["operation_type"],
+                    "row_digest": item["row_digest"],
+                }
+                for item in old_rows
+            ],
+            "cohort": {
+                "operations": [
+                    {
+                        "operation_id": item["operation_id"],
+                        "operation_type": item["operation_type"],
+                        "task_payload_digest": item["task_payload_digest"],
+                    }
+                    for item in old_rows
+                ]
+            },
+            "live_snapshot": reference_snapshot,
+            "cohort_digest": reference_snapshot["cohort_digest"],
+            "installation_authority": reference_snapshot[
+                "installation_authority"
+            ],
+            "pre_generation": reference_snapshot["generation_before"],
+            "preserved_status_counts": {"completed": 13, "failed": 3},
+            "selected_operation_count": 2,
+            "worker_max_attempts": 1,
+            "progress_schema_version": 6,
+            "plan_digest": "d" * 64,
+        }
+        completed_row["worker_id_digest"] = globals_[
+            "_post_abort_worker_digest"
+        ](reference_plan["plan_digest"])
+        journal = {
+            "worker_pid": 123,
+            "worker_start_time": "darwin:7:8",
+            "worker_attempt": 1,
+        }
+        progress = {
+            **journal,
+            "worker_status": "failed",
+            "worker_stage": "failed",
+            "worker_failure_stage": "worker.poller.running",
+            "worker_failure": {
+                "category": "worker_runtime_failure",
+                "retryable": False,
+            },
+            "worker_exit_code": 1,
+            "active_provider_requests": [],
+            "provider_counters": [],
+            "prior_attempts": [],
+            "cooldowns": [],
+            "selected_status_counts": {"completed": 1, "pending": 1},
+            "tasks": [
+                {
+                    "operation_id": "retain-1",
+                    "operation_type": "retain",
+                    "row_digest": "7" * 64,
+                    "status": "completed",
+                    "stage": "completed",
+                    "checkpoint": {"facts_committed": True},
+                    "failure": None,
+                    "failure_stage": None,
+                },
+                {
+                    "operation_id": "retain-2",
+                    "operation_type": "retain",
+                    "row_digest": "8" * 64,
+                    "status": "pending",
+                    "stage": "queued",
+                    "checkpoint": None,
+                    "failure": None,
+                    "failure_stage": None,
+                },
+            ],
+        }
+        originals = {
+            key: globals_[key]
+            for key in (
+                "verify_exact_drain_plan",
+                "_operation_recovery_read_private_json",
+                "_operation_recovery_post_abort_reference_artifacts",
+                "_operation_recovery_exact_journal_worker_active",
+                "read_exact_drain_progress",
+            )
+        }
+        globals_.update(
+            {
+                "verify_exact_drain_plan": (
+                    lambda _value, *, allow_expired: reference_plan
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda _path, _label: reference_plan
+                ),
+                "_operation_recovery_post_abort_reference_artifacts": (
+                    lambda _plan: ({}, journal)
+                ),
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
+                "read_exact_drain_progress": (
+                    lambda _path, *, plan_digest, progress_schema_version: progress
+                ),
+            }
+        )
+        try:
+            repaired = helper(
+                snapshot=snapshot,
+                candidate_release=new_candidate,
+                reference_plan_path="reference.json",
+                allow_partial_completion=True,
+            )
+            self.assertEqual(repaired["recovery_epoch"], 3)
+            self.assertEqual(
+                repaired["selected_operation_ids_digest"],
+                self.controller["digest"](["retain-2"]),
+            )
+            self.assertEqual(
+                repaired["candidate_release_digest"],
+                new_candidate["release_digest"],
+            )
+            self.assertNotEqual(
+                repaired["preserved_row_set_digest"],
+                self.controller["digest"](["retain-2"]),
+            )
+            snapshot["operations"][0]["worker_id_digest"] = "e" * 64
+            with self.assertRaisesRegex(
+                Exception,
+                "partial-completion row set is invalid",
+            ):
+                helper(
+                    snapshot=snapshot,
+                    candidate_release=new_candidate,
+                    reference_plan_path="reference.json",
+                    allow_partial_completion=True,
+                )
+        finally:
+            globals_.update(originals)
+
+    def test_partial_completion_handoff_routes_to_partial_repair(self):
+        context_builder = self.controller[
+            "_operation_recovery_exact_recovery_context"
+        ]
+        globals_ = context_builder.__globals__
+        calls = []
+        original = globals_[
+            "_operation_recovery_exact_candidate_repair_context"
+        ]
+        globals_["_operation_recovery_exact_candidate_repair_context"] = (
+            lambda **kwargs: calls.append(kwargs) or {"origin": "post-abort"}
+        )
+        try:
+            result = context_builder(
+                SimpleNamespace(
+                    partial_completion_plan="partial.json",
+                    recovery_plan=None,
+                    candidate_repair_plan=None,
+                ),
+                snapshot={"generation_before": "systalyze:public:1"},
+                candidate_release={"release_digest": "a" * 64},
+            )
+            self.assertEqual(result, {"origin": "post-abort"})
+            self.assertEqual(calls[0]["reference_plan_path"], "partial.json")
+            self.assertIs(calls[0]["allow_partial_completion"], True)
+        finally:
+            globals_[
+                "_operation_recovery_exact_candidate_repair_context"
+            ] = original
+
     def test_exact_drain_plan_command_hands_off_verified_recovery_sources(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__

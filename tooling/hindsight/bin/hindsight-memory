@@ -179,6 +179,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     OperationRecoveryError,
     _exact_drain_current_grant_reference,
+    _post_abort_worker_digest,
     activate_exact_drain_authorization_grant,
     claim_exact_drain_grant,
     close_exact_drain_grant_claim,
@@ -9171,15 +9172,17 @@ def _operation_recovery_exact_candidate_repair_context(
     snapshot: Mapping[str, Any],
     candidate_release: Mapping[str, Any],
     reference_plan_path: str,
+    allow_partial_completion: bool = False,
 ) -> Mapping[str, Any]:
-    """Reuse a recovery epoch only after a pre-execution worker failure.
+    """Build a bounded handoff from authenticated worker evidence.
 
     A worker can fail while importing its candidate before it claims a row or
     opens a provider request.  In that case the failed exact-drain plan is an
     immutable, read-only handoff: replacing its candidate does not require a
     post-abort database recovery or a new epoch.  Keep this proof separate
     from the ordinary post-abort path so a partially executed task can never
-    be treated as a candidate repair.
+    be treated as a candidate repair.  The explicit partial-completion path
+    instead proves the completed subset and hands only pending rows forward.
     """
     reference_plan = verify_exact_drain_plan(
         _operation_recovery_read_private_json(
@@ -9215,7 +9218,10 @@ def _operation_recovery_exact_candidate_repair_context(
         and reference_context.get("recovery_epoch") in {1, 2, 3}
     )
     if (
-        reference_plan["candidate_release"] == candidate_release
+        (
+            reference_plan["candidate_release"] == candidate_release
+            and not allow_partial_completion
+        )
         or not (
             ordinary_preexecution_repair
             or quiescent_schema_15_repair
@@ -9242,7 +9248,7 @@ def _operation_recovery_exact_candidate_repair_context(
             "progress_schema_version", 1
         ),
     )
-    if interrupted_schema_15_poller_repair:
+    if interrupted_schema_15_poller_repair and not allow_partial_completion:
         if (
             any(
                 progress.get(key) != journal[key]
@@ -9502,6 +9508,227 @@ def _operation_recovery_exact_candidate_repair_context(
             ),
         }
 
+    partial_completion_schema_15_repair = (
+        allow_partial_completion
+        and reference_plan["schema_version"] == 15
+        and isinstance(reference_context, Mapping)
+        and reference_context.get("origin") == "post-abort"
+        and reference_context.get("schema_version") == 3
+        and reference_context.get("recovery_epoch") == 3
+    )
+    if partial_completion_schema_15_repair:
+        # A runtime failure after one or more successful retains is neither a
+        # candidate-import failure nor a safe quiescent handoff. Reconcile
+        # only the still-pending subset, after proving that the completed
+        # subset belongs to this plan and that no provider request survived.
+        failure = progress.get("worker_failure")
+        if (
+            any(
+                progress.get(key) != journal[key]
+                for key in ("worker_pid", "worker_start_time", "worker_attempt")
+            )
+            or progress.get("worker_status") != "failed"
+            or progress.get("worker_stage") != "failed"
+            or progress.get("worker_failure_stage") != "worker.poller.running"
+            or not isinstance(failure, Mapping)
+            or failure.get("category") != "worker_runtime_failure"
+            or failure.get("retryable") is not False
+            or type(progress.get("worker_exit_code")) is not int
+            or progress["worker_exit_code"] == 0
+            or progress.get("active_provider_requests")
+            or progress.get("provider_counters")
+            or not isinstance(progress.get("prior_attempts"), list)
+            or progress.get("cooldowns")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery partial-completion execution evidence differs"
+            )
+
+        expected_tasks = {
+            item["operation_id"]: item
+            for item in reference_plan["selected_operations"]
+        }
+        tasks = progress.get("tasks")
+        observed_tasks: dict[str, Mapping[str, Any]] = {}
+        if not isinstance(tasks, list):
+            raise OperationRecoveryError(
+                "operation-recovery partial-completion task evidence differs"
+            )
+        for item in tasks:
+            if (
+                not isinstance(item, Mapping)
+                or item.get("operation_id") in observed_tasks
+                or item.get("operation_id") not in expected_tasks
+                or item.get("operation_type")
+                != expected_tasks[item.get("operation_id")]["operation_type"]
+                or item.get("row_digest")
+                != expected_tasks[item.get("operation_id")]["row_digest"]
+                or (
+                    item.get("status") == "completed"
+                    and (
+                        not isinstance(item.get("checkpoint"), Mapping)
+                        or item["checkpoint"].get("facts_committed") is not True
+                        or item["checkpoint"].get("processed")
+                        != item["checkpoint"].get("total")
+                    )
+                )
+                or item.get("status") not in {"completed", "pending"}
+                or (
+                    item.get("status") == "pending"
+                    and item.get("stage") not in {"queued", "released"}
+                )
+                or (
+                    item.get("status") == "completed"
+                    and item.get("stage") != "completed"
+                )
+                or (
+                    item.get("status") == "completed"
+                    and (
+                        item.get("failure") is not None
+                        or item.get("failure_stage") is not None
+                    )
+                )
+                or (
+                    item.get("status") == "pending"
+                    and item.get("stage") == "released"
+                    and (
+                        not isinstance(item.get("failure"), Mapping)
+                        or item["failure"].get("category")
+                        != "provider_transport"
+                        or item["failure"].get("retryable") is not True
+                        or not isinstance(item.get("failure_stage"), str)
+                    )
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery partial-completion task evidence differs"
+                )
+            observed_tasks[item["operation_id"]] = item
+        if set(observed_tasks) != set(expected_tasks):
+            raise OperationRecoveryError(
+                "operation-recovery partial-completion task evidence differs"
+            )
+        observed_status_counts = {
+            status: sum(
+                item["status"] == status for item in observed_tasks.values()
+            )
+            for status in ("completed", "pending")
+        }
+        observed_status_counts = {
+            status: count
+            for status, count in observed_status_counts.items()
+            if count
+        }
+        if progress.get("selected_status_counts") != observed_status_counts:
+            raise OperationRecoveryError(
+                "operation-recovery partial-completion task evidence differs"
+            )
+        completed_ids = {
+            operation_id
+            for operation_id, item in observed_tasks.items()
+            if item["status"] == "completed"
+        }
+        pending_ids = set(expected_tasks) - completed_ids
+        if not completed_ids or not pending_ids:
+            raise OperationRecoveryError(
+                "operation-recovery partial-completion row set is invalid"
+            )
+
+        reference_rows = {
+            item["operation_id"]: item
+            for item in reference_plan["live_snapshot"]["operations"]
+        }
+        current_rows = {
+            item["operation_id"]: item for item in snapshot["operations"]
+        }
+        worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
+        for operation_id in expected_tasks:
+            current = current_rows.get(operation_id)
+            reference = reference_rows.get(operation_id)
+            if current is None or reference is None or any(
+                current[key] != reference[key]
+                for key in ("operation_type", "created_at", "task_payload_digest")
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery partial-completion row set is invalid"
+                )
+            if operation_id in completed_ids:
+                valid = (
+                    current["current_status"] == "completed"
+                    and current["completed_at"] is not None
+                    and current["worker_id_present"] is True
+                    and current["worker_id_digest"] == worker_digest
+                    and current["claimed_at"] is not None
+                )
+            else:
+                valid = (
+                    current["current_status"] == "pending"
+                    and current["completed_at"] is None
+                    and current["worker_id_present"] is False
+                    and current["worker_id_digest"] is None
+                    and current["claimed_at"] is None
+                )
+            if not valid:
+                raise OperationRecoveryError(
+                    "operation-recovery partial-completion row set is invalid"
+                )
+        reference_scope = {
+            item["operation_id"]: (
+                item["operation_type"],
+                item["task_payload_digest"],
+            )
+            for item in reference_plan["cohort"]["operations"]
+        }
+        current_scope = {
+            item["operation_id"]: (
+                item["operation_type"],
+                item["task_payload_digest"],
+            )
+            for item in snapshot["operations"]
+        }
+        if (
+            set(current_rows) != set(reference_rows)
+            or current_scope != reference_scope
+            or snapshot["installation_authority"]
+            != reference_plan["installation_authority"]
+            or snapshot["generation_before"] != snapshot["generation_after"]
+            or snapshot["status_counts"].get("processing", 0)
+            or any(
+                current_rows[operation_id]["row_digest"]
+                != reference_rows[operation_id]["row_digest"]
+                for operation_id in set(reference_rows) - set(expected_tasks)
+            )
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery partial-completion row set is invalid"
+            )
+        return {
+            **reference_context,
+            "generation": snapshot["generation_before"],
+            "candidate_release_digest": candidate_release["release_digest"],
+            "selected_operation_ids_digest": digest(sorted(pending_ids)),
+            "selected_checkpoint_set_digest": digest(
+                [
+                    {
+                        "operation_id": operation_id,
+                        "result_metadata_digest": current_rows[operation_id][
+                            "result_metadata_digest"
+                        ],
+                    }
+                    for operation_id in sorted(pending_ids)
+                ]
+            ),
+            "preserved_row_set_digest": digest(
+                [
+                    {
+                        "operation_id": operation_id,
+                        "row_digest": current_rows[operation_id]["row_digest"],
+                    }
+                    for operation_id in sorted(set(current_rows) - pending_ids)
+                ]
+            ),
+        }
+
     failure = progress.get("worker_failure")
     if (
         any(
@@ -9636,6 +9863,23 @@ def _operation_recovery_exact_recovery_context(
     snapshot: Mapping[str, Any],
     candidate_release: Mapping[str, Any],
 ) -> Mapping[str, Any] | None:
+    partial_completion_plan_path = getattr(
+        args, "partial_completion_plan", None
+    )
+    if partial_completion_plan_path is not None:
+        if any(
+            getattr(args, name, None) is not None
+            for name in ("recovery_plan", "candidate_repair_plan")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain handoff sources are ambiguous"
+            )
+        return _operation_recovery_exact_candidate_repair_context(
+            snapshot=snapshot,
+            candidate_release=candidate_release,
+            reference_plan_path=partial_completion_plan_path,
+            allow_partial_completion=True,
+        )
     candidate_repair_plan_path = getattr(args, "candidate_repair_plan", None)
     if candidate_repair_plan_path is not None:
         if getattr(args, "recovery_plan", None) is not None:
@@ -10148,12 +10392,16 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     recovery_plan_path = getattr(args, "recovery_plan", None)
     candidate_repair_plan_path = getattr(args, "candidate_repair_plan", None)
+    partial_completion_plan_path = getattr(
+        args, "partial_completion_plan", None
+    )
     if sum(
         value is not None
         for value in (
             checkpoint_continuation_handoff_path,
             recovery_plan_path,
             candidate_repair_plan_path,
+            partial_completion_plan_path,
         )
     ) > 1:
         raise OperationRecoveryError(
@@ -10295,16 +10543,24 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
                 *grant_sources,
             )
         if recovery_plan_path is None:
-            if candidate_repair_plan_path is None:
+            if (
+                candidate_repair_plan_path is None
+                and partial_completion_plan_path is None
+            ):
                 return grant_sources
+            reference_plan_path = (
+                partial_completion_plan_path
+                if partial_completion_plan_path is not None
+                else candidate_repair_plan_path
+            )
             reference_plan = verify_exact_drain_plan(
                 _operation_recovery_read_private_json(
-                    candidate_repair_plan_path,
+                    reference_plan_path,
                     "candidate-repair reference exact drain plan",
                 ),
                 allow_expired=True,
             )
-            source_values = [str(candidate_repair_plan_path)]
+            source_values = [str(reference_plan_path)]
             source_values.extend(
                 value
                 for key, value in reference_plan.items()
@@ -16255,6 +16511,13 @@ def parser() -> argparse.ArgumentParser:
     recovery_drain_handoff = recovery_drain_plan.add_mutually_exclusive_group()
     recovery_drain_handoff.add_argument("--recovery-plan")
     recovery_drain_handoff.add_argument("--candidate-repair-plan")
+    recovery_drain_handoff.add_argument(
+        "--partial-completion-plan",
+        help=(
+            "authenticated schema-15 plan whose failed worker completed "
+            "at least one selected retain"
+        ),
+    )
     recovery_drain_handoff.add_argument(
         "--checkpoint-continuation-handoff"
     )

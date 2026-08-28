@@ -4502,6 +4502,106 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 repaired["preserved_row_set_digest"],
                 self.controller["digest"](["retain-2"]),
             )
+
+            failed_reference_row = row("retain-3", "b" * 64)
+            failed_row = row("retain-3", "c" * 64, status="failed")
+            failed_row.update(
+                {
+                    "completed_at": "2026-08-27T00:01:00Z",
+                    "worker_id_present": True,
+                    "worker_id_digest": globals_["_post_abort_worker_digest"](
+                        reference_plan["plan_digest"]
+                    ),
+                    "claimed_at": "2026-08-27T00:00:01Z",
+                    "error_category": "provider_transport",
+                    "next_retry_at": None,
+                }
+            )
+            reference_plan["selected_operations"].append(
+                {
+                    "operation_id": failed_reference_row["operation_id"],
+                    "operation_type": failed_reference_row["operation_type"],
+                    "row_digest": failed_reference_row["row_digest"],
+                }
+            )
+            reference_plan["cohort"]["operations"].append(
+                {
+                    "operation_id": failed_reference_row["operation_id"],
+                    "operation_type": failed_reference_row["operation_type"],
+                    "task_payload_digest": failed_reference_row[
+                        "task_payload_digest"
+                    ],
+                }
+            )
+            reference_plan["live_snapshot"]["operations"].append(
+                failed_reference_row
+            )
+            reference_plan["live_snapshot"]["status_counts"] = {"pending": 3}
+            reference_plan["selected_operation_count"] = 3
+            snapshot["operations"].append(failed_row)
+            snapshot["status_counts"] = {
+                "completed": 1,
+                "failed": 1,
+                "pending": 1,
+            }
+            progress["worker_failure"] = {
+                "category": "provider_transport",
+                "retryable": True,
+            }
+            progress["provider_counters"] = [{"provider_id": "openai-luna"}]
+            progress["cooldowns"] = [
+                {"provider_id": "work-codex", "reason": "usage_limit"}
+            ]
+            progress["selected_status_counts"] = {
+                "completed": 1,
+                "failed": 1,
+                "pending": 1,
+            }
+            progress["tasks"].append(
+                {
+                    "operation_id": failed_reference_row["operation_id"],
+                    "operation_type": failed_reference_row["operation_type"],
+                    "row_digest": failed_reference_row["row_digest"],
+                    "status": "failed",
+                    "stage": "retry-ceiling",
+                    "checkpoint": {
+                        "facts_committed": True,
+                        "processed": 0,
+                        "total": 1,
+                    },
+                    "failure": {
+                        "category": "retry_ceiling",
+                        "retryable": False,
+                    },
+                    "failure_stage": "retain.extract_and_embed",
+                }
+            )
+            repaired = helper(
+                snapshot=snapshot,
+                candidate_release=new_candidate,
+                reference_plan_path="reference.json",
+                allow_partial_completion=True,
+            )
+            self.assertEqual(
+                repaired["selected_operation_ids_digest"],
+                self.controller["digest"](["retain-2"]),
+            )
+            self.assertNotEqual(
+                repaired["preserved_row_set_digest"],
+                self.controller["digest"](["retain-2"]),
+            )
+            failed_row["error_category"] = "worker_runtime_failure"
+            with self.assertRaisesRegex(
+                Exception,
+                "partial-completion row set is invalid",
+            ):
+                helper(
+                    snapshot=snapshot,
+                    candidate_release=new_candidate,
+                    reference_plan_path="reference.json",
+                    allow_partial_completion=True,
+                )
+            failed_row["error_category"] = "provider_transport"
             snapshot["operations"][0]["worker_id_digest"] = "e" * 64
             with self.assertRaisesRegex(
                 Exception,

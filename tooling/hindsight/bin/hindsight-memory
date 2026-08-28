@@ -9519,9 +9519,27 @@ def _operation_recovery_exact_candidate_repair_context(
     if partial_completion_schema_15_repair:
         # A runtime failure after one or more successful retains is neither a
         # candidate-import failure nor a safe quiescent handoff. Reconcile
-        # only the still-pending subset, after proving that the completed
-        # subset belongs to this plan and that no provider request survived.
+        # only the still-pending subset, after proving that completed and
+        # terminally failed subsets belong to this plan and that no provider
+        # request survived.  A provider-transport interruption can exhaust
+        # individual task retries before the poller closes; those failed rows
+        # remain terminal evidence for the later reconciliation cycle and are
+        # never reset by this handoff.
         failure = progress.get("worker_failure")
+        ordinary_runtime_failure = (
+            isinstance(failure, Mapping)
+            and failure.get("category") == "worker_runtime_failure"
+            and failure.get("retryable") is False
+            and not progress.get("provider_counters")
+            and not progress.get("cooldowns")
+        )
+        provider_transport_failure = (
+            isinstance(failure, Mapping)
+            and failure.get("category") == "provider_transport"
+            and failure.get("retryable") is True
+            and isinstance(progress.get("provider_counters"), list)
+            and isinstance(progress.get("cooldowns"), list)
+        )
         if (
             any(
                 progress.get(key) != journal[key]
@@ -9530,15 +9548,13 @@ def _operation_recovery_exact_candidate_repair_context(
             or progress.get("worker_status") != "failed"
             or progress.get("worker_stage") != "failed"
             or progress.get("worker_failure_stage") != "worker.poller.running"
-            or not isinstance(failure, Mapping)
-            or failure.get("category") != "worker_runtime_failure"
-            or failure.get("retryable") is not False
+            or not (
+                ordinary_runtime_failure or provider_transport_failure
+            )
             or type(progress.get("worker_exit_code")) is not int
             or progress["worker_exit_code"] == 0
             or progress.get("active_provider_requests")
-            or progress.get("provider_counters")
             or not isinstance(progress.get("prior_attempts"), list)
-            or progress.get("cooldowns")
         ):
             raise OperationRecoveryError(
                 "operation-recovery partial-completion execution evidence differs"
@@ -9572,7 +9588,11 @@ def _operation_recovery_exact_candidate_repair_context(
                         != item["checkpoint"].get("total")
                     )
                 )
-                or item.get("status") not in {"completed", "pending"}
+                or item.get("status") not in {
+                    "completed",
+                    "failed",
+                    "pending",
+                }
                 or (
                     item.get("status") == "pending"
                     and item.get("stage") not in {"queued", "released"}
@@ -9599,6 +9619,17 @@ def _operation_recovery_exact_candidate_repair_context(
                         or not isinstance(item.get("failure_stage"), str)
                     )
                 )
+                or (
+                    item.get("status") == "failed"
+                    and (
+                        item.get("stage") != "retry-ceiling"
+                        or not isinstance(item.get("checkpoint"), Mapping)
+                        or not isinstance(item.get("failure"), Mapping)
+                        or item["failure"].get("category") != "retry_ceiling"
+                        or item["failure"].get("retryable") is not False
+                        or not isinstance(item.get("failure_stage"), str)
+                    )
+                )
             ):
                 raise OperationRecoveryError(
                     "operation-recovery partial-completion task evidence differs"
@@ -9612,7 +9643,7 @@ def _operation_recovery_exact_candidate_repair_context(
             status: sum(
                 item["status"] == status for item in observed_tasks.values()
             )
-            for status in ("completed", "pending")
+            for status in ("completed", "failed", "pending")
         }
         observed_status_counts = {
             status: count
@@ -9628,7 +9659,12 @@ def _operation_recovery_exact_candidate_repair_context(
             for operation_id, item in observed_tasks.items()
             if item["status"] == "completed"
         }
-        pending_ids = set(expected_tasks) - completed_ids
+        failed_ids = {
+            operation_id
+            for operation_id, item in observed_tasks.items()
+            if item["status"] == "failed"
+        }
+        pending_ids = set(expected_tasks) - completed_ids - failed_ids
         if not completed_ids or not pending_ids:
             raise OperationRecoveryError(
                 "operation-recovery partial-completion row set is invalid"
@@ -9659,6 +9695,17 @@ def _operation_recovery_exact_candidate_repair_context(
                     and current["worker_id_present"] is True
                     and current["worker_id_digest"] == worker_digest
                     and current["claimed_at"] is not None
+                )
+            elif operation_id in failed_ids:
+                valid = (
+                    current["current_status"] == "failed"
+                    and current["completed_at"] is not None
+                    and current["worker_id_present"] is True
+                    and current["worker_id_digest"] == worker_digest
+                    and current["claimed_at"] is not None
+                    and current.get("error_category")
+                    == "provider_transport"
+                    and current.get("next_retry_at") is None
                 )
             else:
                 valid = (

@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from typing import Any, ClassVar
 
+from tests.plugins import test_rolecasting_dispatch_evidence as rolecasting_evidence
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 PROVIDER = REPOSITORY / "plugins" / "tricritical" / "task-witness-provider.json"
 VALIDATOR = (
@@ -75,6 +77,9 @@ class Witness:
     canonical_bytes = staticmethod(canonical)
     digest = staticmethod(lambda value: sha(canonical(value)))
     dispatches: ClassVar[dict[str, dict[str, Any]]] = {}
+    dispatch_bundles: ClassVar[
+        dict[str, tuple[rolecasting_evidence.Bundle, dict[str, Any]]]
+    ] = {}
 
     @staticmethod
     def absolute(path: Path, label: str) -> Path:
@@ -229,6 +234,8 @@ def load_validator() -> Any:
 
 class TricriticalReviewEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
+        Witness.dispatches = {}
+        Witness.dispatch_bundles = {}
         self.validator = load_validator()
         self.producer = {
             "producer_id": "tricritical-review-loop-v2",
@@ -568,101 +575,247 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
         candidate: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         candidate = self.candidate if candidate is None else candidate
-        executions = {}
+        producer = {
+            "producer_id": "rolecasting-bootstrap-dispatch-v3",
+            "contract": "rolecasting-dispatch-evidence-v3",
+            "implementation_sha256": sha("rolecasting producer"),
+        }
+        issuer = {
+            "issuer_id": "rolecasting-bootstrap-adapter-v3",
+            "contract": "rolecasting-bootstrap-adapter-v3",
+            "implementation_sha256": sha("rolecasting adapter"),
+        }
+        trust = {
+            "producers": [producer],
+            "issuers": [
+                {
+                    "identity": issuer,
+                    "capabilities": ["execution-result", "model"],
+                }
+            ],
+        }
+        model_name = "gpt-5.6-sol"
+        reasoning_effort = "high"
+        capability = identity("model-catalog", "gpt-5.6-sol-high")
+        transition_guard = rolecasting_evidence.transition_contract.load_module()
+        dispatches: list[dict[str, Any]] = []
+        artifacts: dict[str, dict[str, Any]] = {}
         for index, role in enumerate(roles):
             execution_id = f"{path.rsplit('/', 1)[-1]}-{index}"
-            executions[execution_id] = {
+            target = {
+                "product_family": "codex",
+                "surface": "chatgpt-codex",
+                "executor": "codex",
+                "version": "2026.08.13",
+            }
+            topology = {
+                "relationship": "child",
+                "ownership": "leader-owned",
+                "transport": "native-tool",
+            }
+            scope = identity("review-scope-v1", role)
+            request = identity("review-request-v1", role)
+            authority = {
+                "access": "read-only",
+                "subdelegation": False,
+                "external_action": False,
+                "evidence": identity("dispatch-authority-v1", role),
+            }
+            isolation = {
+                "session": f"session-{path}-{index}",
+                "context": f"context-{path}-{index}",
+                "enforceable": True,
+            }
+            assurance = {
+                "target": "product-attested",
+                "model": "product-attested",
+                "topology": "product-attested",
+                "authority": "product-attested",
+                "execution_result": "product-attested",
+                "evidence": identity("product-attestation-v1", role),
+            }
+            assurance_minimum = {
+                field: "product-attested"
+                for field in (
+                    "target",
+                    "model",
+                    "topology",
+                    "authority",
+                    "execution_result",
+                )
+            }
+            transition_event = rolecasting_evidence.transition_contract.event(
+                "new-subagent",
+                predecessor=None,
+            )
+            transition_event["payload_sha256"] = request["content_sha256"]
+            transition_route = rolecasting_evidence.transition_contract.route(
+                rolecasting_evidence.transition_contract.selection(model=model_name)
+            )
+            transition_route["target"] = target
+            transition_route["capability_sha256"] = capability["content_sha256"]
+            transition = transition_guard.authorize_model_transition(
+                None,
+                transition_event,
+                rolecasting_evidence.transition_contract.scope(),
+                None,
+                transition_route,
+            )
+            transition_raw = raw_document(transition)
+            dispatch = {
                 "execution_id": execution_id,
                 "role": role,
-                "target": {
-                    "product_family": "codex",
-                    "surface": "chatgpt-codex",
-                    "executor": "codex",
-                    "version": "2026.08.13",
-                },
-                "topology": {
-                    "relationship": "child",
-                    "ownership": "leader-owned",
-                    "transport": "native-tool",
-                },
+                "target": target,
+                "topology": topology,
+                "subject": subject,
                 "candidate": candidate,
-                "scope": identity("review-scope-v1", role),
-                "request": identity("review-request-v1", role),
+                "scope": scope,
+                "request": request,
                 "return_contract": returned[role]["kind"],
                 "verification_contract": "review-verification-v1",
                 "stop_contract": "review-stop-v1",
-                "authority": {
-                    "access": "read-only",
-                    "subdelegation": False,
-                    "external_action": False,
-                    "evidence": identity("dispatch-authority-v1", role),
-                },
+                "model_transition_sha256": sha(transition_raw),
+                "model_sha256": "",
+                "authority": authority,
                 "user_authority": None,
-                "isolation": {
-                    "session": f"session-{path}-{index}",
-                    "context": f"context-{path}-{index}",
-                    "enforceable": True,
-                },
-                "assurance": {
-                    "target": "product-attested",
-                    "model": "product-attested",
-                    "topology": "product-attested",
-                    "authority": "product-attested",
-                    "execution_result": "product-attested",
-                    "evidence": identity("product-attestation-v1", role),
-                },
-                "assurance_minimum": {
-                    "target": "product-attested",
-                    "model": "product-attested",
-                    "topology": "product-attested",
-                    "authority": "product-attested",
-                    "execution_result": "product-attested",
-                },
-                "dispatch_sha256": f"{index + 1:x}" * 64,
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "high",
-                "model_sha256": f"{index + 5:x}" * 64,
-                "result_sha256": f"{index + 9:x}" * 64,
-                "usable": True,
-                "model_issuer": identity("issuer-v1", f"model-{path}-{role}"),
-                "result_issuer": identity("issuer-v1", f"result-{path}-{role}"),
-                "returned": returned[role],
-                "verification": identity("review-verification-v1", role),
-                "stop": identity("review-stop-v1", role),
+                "isolation": isolation,
+                "assurance": assurance,
+                "assurance_minimum": assurance_minimum,
             }
-        projection = signed(
+            model = signed(
+                {
+                    "schema_version": 1,
+                    "contract": "rolecasting-model-selection-receipt-v3",
+                    "issuer": issuer,
+                    "subject": subject,
+                    "execution_id": execution_id,
+                    "target": target,
+                    "model": model_name,
+                    "reasoning_effort": reasoning_effort,
+                    "capability": {"status": "available", "evidence": capability},
+                    "model_transition_sha256": sha(transition_raw),
+                }
+            )
+            model_raw = raw_document(model)
+            dispatch["model_sha256"] = sha(model_raw)
+            dispatches.append(dispatch)
+            artifacts[execution_id] = {
+                "role": role,
+                "transition": transition_raw,
+                "model": model_raw,
+                "dispatch": dispatch,
+                "request": request,
+                "target": target,
+                "topology": topology,
+                "authority": authority,
+                "isolation": isolation,
+                "assurance": assurance,
+                "assurance_minimum": assurance_minimum,
+            }
+
+        plan = signed(
             {
                 "schema_version": 1,
-                "contract": "rolecasting-dispatch-projection-v3",
-                "evidence_contract": "rolecasting-dispatch-evidence-v3",
-                "manifest_sha256": "3" * 64,
-                "plan_sha256": "4" * 64,
+                "contract": "rolecasting-dispatch-plan-v3",
                 "subject": subject,
-                "producer": {
-                    "producer_id": "rolecasting-bootstrap-dispatch-v3",
-                    "contract": "rolecasting-dispatch-evidence-v3",
-                    "implementation_sha256": "5" * 64,
-                },
-                "executions": executions,
+                "dispatches": dispatches,
             }
         )
+        plan_raw = raw_document(plan)
+        files = {"plan.json": plan_raw}
+        transition_digests = {}
+        model_digests = {}
+        result_digests = {}
+        for execution_id, artifact in artifacts.items():
+            dispatch = artifact["dispatch"]
+            result = signed(
+                {
+                    "schema_version": 1,
+                    "contract": "rolecasting-execution-result-receipt-v3",
+                    "issuer": issuer,
+                    "subject": subject,
+                    "execution_id": execution_id,
+                    "plan_sha256": sha(plan_raw),
+                    "dispatch_sha256": sha(canonical(dispatch)),
+                    "model_sha256": sha(artifact["model"]),
+                    "model_transition_sha256": sha(artifact["transition"]),
+                    "request": artifact["request"],
+                    "returned": returned[artifact["role"]],
+                    "verification": identity(
+                        "review-verification-v1", artifact["role"]
+                    ),
+                    "stop": identity("review-stop-v1", artifact["role"]),
+                    "target": artifact["target"],
+                    "topology": artifact["topology"],
+                    "assurance": artifact["assurance"],
+                    "assurance_minimum": artifact["assurance_minimum"],
+                    "user_authority": None,
+                    "session": artifact["isolation"]["session"],
+                    "context": artifact["isolation"]["context"],
+                    "authority": artifact["authority"],
+                    "before_candidate": candidate,
+                    "after_candidate": candidate,
+                    "usable": True,
+                }
+            )
+            result_raw = raw_document(result)
+            transition_name = f"transition-{execution_id}.json"
+            model_name_path = f"model-{execution_id}.json"
+            result_name = f"result-{execution_id}.json"
+            files[transition_name] = artifact["transition"]
+            files[model_name_path] = artifact["model"]
+            files[result_name] = result_raw
+            transition_digests[execution_id] = sha(artifact["transition"])
+            model_digests[execution_id] = sha(artifact["model"])
+            result_digests[execution_id] = sha(result_raw)
+
+        manifest = signed(
+            {
+                "schema_version": 1,
+                "contract": "rolecasting-dispatch-evidence-v3",
+                "producer": producer,
+                "subject": subject,
+                "plan_sha256": sha(plan_raw),
+                "transitions": transition_digests,
+                "models": model_digests,
+                "results": result_digests,
+            }
+        )
+        files["manifest.json"] = raw_document(manifest)
+        rolecasting_bundle = rolecasting_evidence.Bundle(files)
+        projection = rolecasting_evidence.load_validator()._validate_bundle(
+            rolecasting_bundle,
+            trust_snapshot=trust,
+        )
+        provider = json.loads(
+            (
+                REPOSITORY
+                / "plugins"
+                / "rolecasting"
+                / "task-witness-provider.json"
+            ).read_text()
+        )
+        validator = provider["validators"][0]
         bundle_sha256 = sha(path)
         envelope = {
             "contract": "task-witness-canonical-projection-v2",
             "bundle_sha256": bundle_sha256,
             "producer": {
                 **projection["producer"],
-                "validator_id": "rolecasting-dispatch-evidence-validator-v3",
-                "validator_contract": "rolecasting-dispatch-evidence-v3",
-                "validator_implementation_sha256": "6" * 64,
+                "validator_id": validator["validator_id"],
+                "validator_contract": validator["contract"],
+                "validator_implementation_sha256": validator[
+                    "implementation_sha256"
+                ],
             },
             "validator": {
-                "validator_id": "rolecasting-dispatch-evidence-validator-v3",
-                "contract": "rolecasting-dispatch-evidence-v3",
-                "implementation_sha256": "6" * 64,
+                "validator_id": validator["validator_id"],
+                "contract": validator["contract"],
+                "implementation_sha256": validator["implementation_sha256"],
             },
             "projection": projection,
         }
+        Witness.dispatch_bundles[path] = (rolecasting_bundle, trust)
         Witness.dispatches[path] = envelope
         return envelope
 
@@ -947,6 +1100,27 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
         projection = self.validator._validate_bundle(bundle, trust_snapshot=self.trust)
 
         self.assertEqual(projection, expected)
+
+    def test_rolecasting_fixture_uses_registered_v3_validator_projection(self) -> None:
+        bundle, _ = self.clean_bundle()
+        manifest = json.loads(bundle.files["manifest.json"])
+        path = manifest["cycles"][0]["review_dispatch"]["path"]
+        rolecasting_bundle, trust = Witness.dispatch_bundles[path]
+        projection = rolecasting_evidence.load_validator()._validate_bundle(
+            rolecasting_bundle,
+            trust_snapshot=trust,
+        )
+        self.assertEqual(Witness.dispatches[path]["projection"], projection)
+        for execution in projection["executions"].values():
+            self.assertLessEqual(
+                {
+                    "model_transition_sha256",
+                    "model_transition_authorization_sha256",
+                    "model_transition_event",
+                    "model_transition_task_sha256",
+                },
+                set(execution),
+            )
 
     def test_controller_observed_dispatch_is_preserved_without_assurance_laundering(
         self,

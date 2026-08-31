@@ -634,16 +634,16 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
                 "execution_result": "product-attested",
                 "evidence": identity("product-attestation-v1", role),
             }
-            assurance_minimum = {
-                field: "product-attested"
-                for field in (
+            assurance_minimum = dict.fromkeys(
+                (
                     "target",
                     "model",
                     "topology",
                     "authority",
                     "execution_result",
-                )
-            }
+                ),
+                "product-attested",
+            )
             transition_event = rolecasting_evidence.transition_contract.event(
                 "new-subagent",
                 predecessor=None,

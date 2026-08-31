@@ -123,7 +123,7 @@ MERGE_EVAL_FIXTURES = (
     "coderabbit-skipped-review.md",
     "draft-pr-resume.md",
     "explicit-review-loop-before-merge.md",
-    "external-review-budget.md",
+    "stalled-external-review.md",
     "gh-fix-ci-adapter-boundary.md",
     "latest-publication-receipt-drift.md",
     "local-policy-limits-autonomy.md",

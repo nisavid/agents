@@ -1,4 +1,4 @@
-# Scenario: External Review Budget
+# Scenario: Stalled External Review
 
 User request: "Drive this PR to merge. It already had two completed bot review cycles, and the latest review has one stale-looking unresolved thread."
 
@@ -15,7 +15,7 @@ Mock repository state:
 
 Mock local policy:
 
-- `AGENTS.md`: external review budget is limited by the current review workflow.
+- `AGENTS.md`: no time, cost, or external-review-count limit was specified.
 - `AGENTS.md`: no fresh review-and-revise cycle is required before ordinary
   merge closeout.
 - `AGENTS.md`: stale review threads may be resolved by the agent only with refreshed evidence.
@@ -24,6 +24,7 @@ Mock local policy:
 Mock review history:
 
 - Completed external review cycles: 2
+- Both cycles reviewed the same revision, produced no new findings, and left the same unresolved thread in place.
 - Latest bot result: no new findings
 - Thread state before refresh: one unresolved thread appears stale
 - Thread state after refresh: thread is outdated and points at superseded code

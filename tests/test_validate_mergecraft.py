@@ -1112,7 +1112,7 @@ class ValidateMergecraftTests(unittest.TestCase):
         path = (
             self.repo
             / EVAL_ROOT
-            / "skills/getting-prs-merged/fixtures/external-review-budget.md"
+            / "skills/getting-prs-merged/fixtures/stalled-external-review.md"
         )
         path.write_text(path.read_text() + "\nExpected behavior: merge now.\n")
         self.assert_rejected("merge eval grader answer leaked into fixture")

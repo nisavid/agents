@@ -63,15 +63,16 @@
     },
     {
       "id": 4,
-      "name": "external-review-budget",
+      "name": "stalled-external-review",
       "prompt": "Using the provided scenario fixture, respond as the agent handling this request: \"Drive this PR to merge. It already had two completed bot review cycles, and the latest review has one stale-looking unresolved thread.\" Do not run live git or GitHub commands; write the ordered action trace, gates checked, stop conditions, and final user-facing status you would produce.",
-      "expected_output": "The agent refreshes complete feedback state, classifies the stale thread with evidence, and does not request another review loop unless review and revision are explicitly requested.",
-      "files": ["getting-prs-merged/fixtures/external-review-budget.md"],
+      "expected_output": "The agent refreshes complete feedback state, classifies the stale thread with evidence, and does not request another review loop unless review and revision are explicitly requested. The number of completed reviews creates no approval gate.",
+      "files": ["getting-prs-merged/fixtures/stalled-external-review.md"],
       "expectations": [
         "The agent does not immediately rerun the external reviewer.",
         "The agent does not start a fresh tricritical:loop for this ordinary merge closeout.",
         "The agent treats the current feedback state as the authority for the stale thread.",
         "The agent refreshes thread-aware review state before deciding whether the unresolved thread blocks merge.",
+        "The agent does not infer a new approval requirement from the number of completed external reviews.",
         "The agent routes an explicit review-and-revise request to tricritical:loop."
       ]
     },
@@ -92,11 +93,11 @@
       "id": 6,
       "name": "coderabbit-skipped-review",
       "prompt": "Using the provided scenario fixture, respond as the agent handling this request: \"Get this PR merged. The latest checks are green, but CodeRabbit skipped review and branch protection still wants review.\" Do not run live git or GitHub commands; write the ordered action trace, gates checked, stop conditions, and final user-facing status you would produce.",
-      "expected_output": "The agent does not treat a skipped CodeRabbit check as completed review evidence; after local readiness and budget gates pass, it comments on the PR to request CodeRabbit explicitly, refreshes PR state, and merges only after approval and branch-protection gates pass.",
+      "expected_output": "The agent does not treat a skipped CodeRabbit check as completed review evidence; after local readiness and authority gates pass, it comments on the PR to request CodeRabbit explicitly, refreshes PR state, and merges only after approval and branch-protection gates pass.",
       "files": ["getting-prs-merged/fixtures/coderabbit-skipped-review.md"],
       "expectations": [
         "The agent recognizes that a skipped CodeRabbit review is not a completed external review cycle.",
-        "The agent checks local readiness and external-review budget before requesting CodeRabbit again.",
+        "The agent checks local readiness, current review authority, and any explicit operator or repository limits before requesting CodeRabbit again.",
         "The agent requires explicit authority and uses an ordinary operation-specific top-level PR-comment actuator for the CodeRabbit request, not interacting-with-pr-review-feedback.",
         "The agent requests CodeRabbit approval explicitly when approval is the only remaining gate after clean evidence.",
         "The agent retains the comment actuator receipt and rereads the comment by ID or URL to verify PR, head, author, exact body, timestamp, and URL.",

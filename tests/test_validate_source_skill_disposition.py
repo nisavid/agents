@@ -84,6 +84,14 @@ class SourceSkillDispositionWorkflowTests(unittest.TestCase):
             <= commands
         )
 
+    def test_workflow_keeps_plugin_inventory_free_of_python_bytecode(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+
+        self.assertEqual(
+            workflow["jobs"]["validate"]["env"]["PYTHONDONTWRITEBYTECODE"],
+            "1",
+        )
+
 
 class SourceSkillDispositionValidatorTests(unittest.TestCase):
     def setUp(self) -> None:

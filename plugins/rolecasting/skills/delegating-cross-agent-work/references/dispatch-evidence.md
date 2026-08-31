@@ -116,15 +116,18 @@ payload, plan, and actuation identities, current role classification, optional
 sticky operator choice, authenticated fresh route and account evidence,
 selected pair, authorization, and next state. The route preflight identifies
 the exact status implementation, version, operations, and side-effect-safety
-evidence. Codex app-server 0.149.0 fails closed even if a producer incorrectly
-labels it side-effect-safe. The registered validator recomputes the pure
-decision, authenticates the route-evidence issuer through Task Witness, and
-rejects denial, stale or ineligible routes, unsafe or unverified status,
-unavailable capacity, changed continuation target or account, a model below the
-carried floor, a non-exact Daybreak Max selection, duplicate authorization,
-cross-bound identity, or receipt tampering. This post-hoc check is defense in
-depth; the actuator must validate and atomically consume the same authorization
-before accepting payload data.
+evidence. Every canonical Codex app-server version with a `0.149.0` semantic
+version core fails closed even if a producer incorrectly labels it
+side-effect-safe; noncanonical or unparseable app-server versions fail closed
+too. The registered validator recomputes the pure decision, requires its exact
+authenticated route-evidence verifier to validate the concrete record,
+separately authenticates the issuer and `route-evidence` capability through
+Task Witness, and rejects denial, stale or ineligible routes, unsafe or
+unverified status, unavailable capacity, changed continuation target or
+account, a model below the carried floor, a non-exact Daybreak Max selection,
+duplicate authorization, cross-bound identity, or receipt tampering. This
+post-hoc check is defense in depth; the actuator must validate and atomically
+consume the same authorization before accepting payload data.
 
 Each `rolecasting-model-selection-receipt-v3` binds the transition, target, selected model,
 reasoning effort, and availability evidence from an issuer authorized for

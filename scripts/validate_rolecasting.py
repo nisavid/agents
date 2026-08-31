@@ -53,6 +53,9 @@ NATIVE_CODEX_RUNTIME = "skills/delegating-cross-agent-work/scripts/native_codex.
 MODEL_TRANSITION_RUNTIME = (
     "skills/choosing-agent-models/scripts/model_transition.py"
 )
+ROUTE_EVIDENCE_RUNTIME = (
+    "skills/choosing-agent-models/scripts/route_evidence.py"
+)
 TASK_WITNESS_PROVIDER = "task-witness-provider.json"
 DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v3"
 PROVIDER_CONTRACT = "task-witness-provider-declaration-v1"
@@ -689,6 +692,8 @@ def validate_task_witness_provider(root: Path) -> set[str]:
     runtime_sha256 = hashlib.sha256(runtime_raw).hexdigest()
     transition_raw = read_bytes(root, MODEL_TRANSITION_RUNTIME)
     transition_sha256 = hashlib.sha256(transition_raw).hexdigest()
+    route_evidence_raw = read_bytes(root, ROUTE_EVIDENCE_RUNTIME)
+    route_evidence_sha256 = hashlib.sha256(route_evidence_raw).hexdigest()
     adapter_raw = read_bytes(root, DISPATCH_ADAPTER_RUNTIME)
     adapter_sha256 = hashlib.sha256(adapter_raw).hexdigest()
     modules = [
@@ -703,6 +708,12 @@ def validate_task_witness_provider(root: Path) -> set[str]:
             "relative_path": MODEL_TRANSITION_RUNTIME,
             "length": len(transition_raw),
             "sha256": transition_sha256,
+        },
+        {
+            "name": "route-evidence",
+            "relative_path": ROUTE_EVIDENCE_RUNTIME,
+            "length": len(route_evidence_raw),
+            "sha256": route_evidence_sha256,
         },
         {
             "name": "adapter",
@@ -787,6 +798,17 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         and "def _validate_bundle(" in source,
         "dispatch-evidence registered API drift",
     )
+    route_verifier = read(root, ROUTE_EVIDENCE_RUNTIME)
+    for forbidden in ("subprocess", "socket", "urllib", "requests", "importlib"):
+        require(
+            forbidden not in route_verifier,
+            f"route-evidence verifier is not pure: {forbidden}",
+        )
+    require(
+        "def validate_authenticated_route_evidence(" in route_verifier
+        and "no production route-evidence verifier is registered" in route_verifier,
+        "route-evidence verifier truth boundary drift",
+    )
     adapter = read(root, DISPATCH_ADAPTER_RUNTIME)
     adapter_words = " ".join(adapter.split())
     for term in (
@@ -821,8 +843,9 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "Canonical new-publication evidence",
         "`usable: false` is valid evidence",
         "exact `usable` status",
-        "Codex app-server 0.149.0",
+        "Every canonical Codex app-server version with a `0.149.0` semantic version core",
         "authenticated route issuer",
+        "authenticated route-evidence verifier",
         "atomically consume",
     ):
         require(
@@ -888,7 +911,9 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         '"reclassification"',
         '"daybreak"',
         '"operator"',
-        '"codex-app-server", "0.149.0"',
+        '_KNOWN_UNSAFE_STATUS_SURFACE_CORES = {("codex-app-server", (0, 149, 0))}',
+        "_CANONICAL_SEMANTIC_VERSION",
+        "def _status_surface_is_unsafe_or_unversioned(",
         '"route-status-unverified"',
         '"route-status-denied"',
         '"gpt-daybreak-blue-latest"',
@@ -908,6 +933,7 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         DISPATCH_ADAPTER_RUNTIME,
         NATIVE_CODEX_RUNTIME,
         MODEL_TRANSITION_RUNTIME,
+        ROUTE_EVIDENCE_RUNTIME,
     }
 
 

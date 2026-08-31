@@ -448,7 +448,7 @@ class ModelTransitionGuardTests(unittest.TestCase):
                     "route-status-refresh-exceeded-authority",
                 )
 
-    def test_known_stateful_status_surface_fails_closed(self) -> None:
+    def test_known_stateful_status_surface_versions_fail_closed(self) -> None:
         guard = load_module()
         daybreak = selection(
             "daybreak",
@@ -456,60 +456,68 @@ class ModelTransitionGuardTests(unittest.TestCase):
             "security",
             reasoning_effort="max",
         )
-        candidate = preflight_route(
-            daybreak,
-            inventory_complete=False,
-            inventory_status="stale",
-            capability_status="unknown",
-            execution_authorized=False,
-            capacity="unknown",
-        )
-        candidate["preflight"].update(
-            {
-                "caller_state_mutation_requested": False,
-                "state_change_status": "unchanged",
-                "status_surface": {
-                    "implementation": "codex-app-server",
-                    "version": "0.149.0",
-                    "operations": [
-                        "initialize",
-                        "account/read:refreshToken=false",
-                        "model/list",
-                        "account/rateLimits/read",
-                    ],
-                    "safety": "side-effect-safe",
-                    "evidence_sha256": sha(
-                        "rust-v0.149.0 managed auth refresh source trace"
-                    ),
-                },
-            }
-        )
-        seal_route(candidate)
+        for version in (
+            "0.149.0",
+            "v0.149.0",
+            "0.149.0+release",
+            "0.149.0 ",
+            "0.149",
+        ):
+            with self.subTest(version=version):
+                candidate = preflight_route(
+                    daybreak,
+                    inventory_complete=False,
+                    inventory_status="stale",
+                    capability_status="unknown",
+                    execution_authorized=False,
+                    capacity="unknown",
+                )
+                candidate["preflight"].update(
+                    {
+                        "caller_state_mutation_requested": False,
+                        "state_change_status": "unchanged",
+                        "status_surface": {
+                            "implementation": "codex-app-server",
+                            "version": version,
+                            "operations": [
+                                "initialize",
+                                "account/read:refreshToken=false",
+                                "model/list",
+                                "account/rateLimits/read",
+                            ],
+                            "safety": "side-effect-safe",
+                            "evidence_sha256": sha(
+                                "rust-v0.149.0 managed auth refresh source trace"
+                            ),
+                        },
+                    }
+                )
+                seal_route(candidate)
 
-        decision = guard.authorize_model_transition(
-            None,
-            event("new-subagent", predecessor=None),
-            scope("security"),
-            None,
-            candidate,
-        )
+                decision = guard.authorize_model_transition(
+                    None,
+                    event("new-subagent", predecessor=None),
+                    scope("security"),
+                    None,
+                    candidate,
+                )
 
-        self.assertEqual(decision["authorization"]["status"], "denied")
-        self.assertEqual(
-            decision["authorization"]["reason"],
-            "route-status-unverified",
-        )
-        self.assertFalse(
-            decision["request"]["route_evidence"]["preflight"][
-                "inventory_complete"
-            ]
-        )
-        self.assertEqual(
-            decision["request"]["route_evidence"]["preflight"][
-                "status_surface"
-            ]["safety"],
-            "side-effect-safe",
-        )
+                self.assertEqual(decision["authorization"]["status"], "denied")
+                self.assertEqual(
+                    decision["authorization"]["reason"],
+                    "route-status-unverified",
+                )
+                self.assertFalse(
+                    decision["request"]["route_evidence"]["preflight"][
+                        "inventory_complete"
+                    ]
+                )
+                self.assertEqual(
+                    decision["request"]["route_evidence"]["preflight"][
+                        "status_surface"
+                    ]["safety"],
+                    "side-effect-safe",
+                )
 
     def test_unverified_status_surface_is_not_model_absence(self) -> None:
         guard = load_module()

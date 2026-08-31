@@ -20,15 +20,19 @@ sticky operator choice, Daybreak requirement, the complete permitted-route
 inventory and authenticated side-effect-safe status preflight, fresh selector
 and capability evidence, separate execution authority, account binding,
 capacity, immutable plan and actuation identity, and the exact selection.
-Native adapters require an injected authenticated route-evidence verifier, and
-the portable validator binds a route issuer through Task Witness. Neither path
-can issue trustworthy route authority on its own. Consumers reject missing,
-denied, stale, replayed, downgraded, or cross-bound decisions at their payload
-boundaries. Codex app-server 0.149.0 is explicitly ineligible for the standing
-status-only refresh because its rate-limit path may refresh and persist managed
-authentication. This source release registers no production route-evidence
-issuer or verifier and no mandatory actuator hook, so it does not establish a
-runnable alternate-account Daybreak route.
+Native adapters and the portable validator require an injected authenticated
+route-evidence verifier; Task Witness separately binds the portable issuer and
+exact verifier module. Neither path can issue trustworthy route authority on
+its own. Consumers reject missing, denied, stale, downgraded, or cross-bound
+decisions at their payload boundaries. Replay rejection additionally requires
+the owning actuator to atomically consume each authorization. Every canonical
+Codex app-server semantic version with a `0.149.0` core is explicitly
+ineligible for the standing status-only refresh because its rate-limit path may
+refresh and persist managed authentication; noncanonical or unparseable
+app-server versions also fail closed. This source release registers no
+production route-evidence issuer or accepting verifier and no mandatory
+actuator hook, so it does not establish a runnable alternate-account Daybreak
+route.
 
 Initial operational support uses separate native-child adapter profiles for
 ChatGPT Codex and Codex CLI/TUI. Both freeze the complete plan and assurance

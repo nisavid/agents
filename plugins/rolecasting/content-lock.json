@@ -3,7 +3,7 @@
   "algorithm": "sha256",
   "files": {
     ".claude-plugin/plugin.json": "1ca18268b8c7ab9b66fc87747e55070cb3fcc5f83ddcb0e594013e9824d06cf9",
-    "README.md": "d1177c42a17892e94824826fc7452fa21f22820f914e0e45e3b9cb9e4c7d1593",
+    "README.md": "7f1a91bdd76b29133c292a04b7aeb1e206861e1be0d1a9db8fd4057005eb9ea1",
     "evals/delivery.json": "3926df63cef6bd46edda5ddcfe0992b04a0b7be6156e6bae48cc7cad4e01a9c7",
     "plugin.json": "d40929425af9fd3c02ced30ae0b1fb2b1446602e3b4d82ef2ce8d5a12994fea6",
     "skills/choosing-agent-models/SKILL.md": "955cdad1f4ed8ebc55d71cd1d140b8e53724e79fa744aeb84b537f012e5aa391",
@@ -21,7 +21,8 @@
     "skills/choosing-agent-models/evals/fixtures/unrelated-task-model-route.md": "7fba87298576ed589d54c7b10cf11925a913b4182fdda143a9572a11db03da12",
     "skills/choosing-agent-models/evals/fixtures/unsupported-luna-surface.md": "641668785056928e9ca33b91bbb14fa3dcc7841c946432f9b29858e7f3fc24fe",
     "skills/choosing-agent-models/references/capability-probes-and-fallbacks.md": "281f27d026b0fe9accdfa9b79e845f4b7af332b038c0513d0601c421a49c645b",
-    "skills/choosing-agent-models/scripts/model_transition.py": "b801c3506ffbe0e371aba849b606061aa403aff522429fea840fbce2d11bc369",
+    "skills/choosing-agent-models/scripts/model_transition.py": "0b56fdd87191b51553e7c568e75648cd84e5b01f2feea34af43628f2b4fa2ae0",
+    "skills/choosing-agent-models/scripts/route_evidence.py": "e6b053e2451350095e3301e4eeffc6432049d8c0a5fa3bc1a83de5aa72023e91",
     "skills/delegating-cross-agent-work/SKILL.md": "3911c92aef30f1cbb5a35ee92833585168e29611c21a6118f69f23a6269a9066",
     "skills/delegating-cross-agent-work/agents/openai.yaml": "4440bba50209bde34f4c866233262f396f69e5e11978b200cd480787998a86dd",
     "skills/delegating-cross-agent-work/evals/evals.json": "51ed99f338f418fadbe33996976a1662be11b774b02e1df882531ed5f5532f4c",
@@ -45,14 +46,14 @@
     "skills/delegating-cross-agent-work/evals/fixtures/sticky-operator-selection.md": "3aeed349c3ab2fc3f2f5edbbe2a1fad04c3ee24e97389f5159a9b6168548f66a",
     "skills/delegating-cross-agent-work/evals/fixtures/user-owned-peer-consent.md": "a2de7f24651f2f88be1114fe687326caeeacf3a107009b489fbd63c24f609eca",
     "skills/delegating-cross-agent-work/evals/fixtures/user-owned-task-authority.md": "9dfd8cbf0319c0a77079100f578c810d458546e4496fdf96be04738aaac67e04",
-    "skills/delegating-cross-agent-work/references/dispatch-evidence.md": "37844e5f381266624153074138789d7be4f1ebf2084e4853ebcfb4c336ee7135",
+    "skills/delegating-cross-agent-work/references/dispatch-evidence.md": "e449cfd18ec5531944f4c1c20a2ec46155985588a7f861770c3dffb05a5c389d",
     "skills/delegating-cross-agent-work/references/foreign-harness-peers.md": "3bd2c842ab199e9c0c971842fa9e95a70f523652cb4d01075adbdf15ccef2e96",
     "skills/delegating-cross-agent-work/references/invocation-topology-receipt.md": "0c985442c3f02082e568eac750fdc4966e4ca5bb84896b77a8c14680c065af40",
     "skills/delegating-cross-agent-work/references/native-codex-subagents.md": "7e6919e911107301d26223100e8fe6a0b8d50662c8e0f670f640ee23c43e54a0",
     "skills/delegating-cross-agent-work/scripts/dispatch_adapter.py": "f214aaebbe178a7c0682a33a2bf6d84dbb35a8fafe1206efbc05b38cfd646474",
-    "skills/delegating-cross-agent-work/scripts/dispatch_evidence.py": "f0d5de019f83680772fab47244fc5ef76162526cc1d20c7fea16ddbc9a7d30af",
+    "skills/delegating-cross-agent-work/scripts/dispatch_evidence.py": "506f12a159f1cc517889fedf776c5c2824e4514f9c24621d45de040d6fbe6a86",
     "skills/delegating-cross-agent-work/scripts/native_codex.py": "7aefaa5c552c7dac5d39d948af67f1f10707095ba222d15bc4001c568d4c300d",
-    "task-witness-provider.json": "ae190f8b515f1521bccfbfbd0dd173ff776b9b3e582b4b7e8dab8787060fab6c",
+    "task-witness-provider.json": "db416fee64d35677eb4d9a19014e3a3e5f2fb9b9a6e65356def4f08f5e29ad6d",
     "topology.json": "259673c147ffee1ebdf9630f2947c6ae7994f3ec57d58348e053f4d37a95921c"
   }
 }

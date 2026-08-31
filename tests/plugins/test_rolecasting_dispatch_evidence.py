@@ -28,6 +28,9 @@ VALIDATOR = (
     / "scripts"
     / "dispatch_evidence.py"
 )
+TEST_ROUTE_VERIFIER = (
+    REPOSITORY / "tests" / "fixtures" / "rolecasting_route_evidence_verifier.py"
+)
 ADAPTER = VALIDATOR.with_name("dispatch_adapter.py")
 
 TARGET_PAIRS = (
@@ -848,6 +851,29 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(adapter.AdapterError, "selection mismatch"):
             adapter.render_dispatch_bundle(self.resign(request))
 
+    def test_portable_route_authorization_must_be_cryptographically_verified(
+        self,
+    ) -> None:
+        bundle, _ = self.make_bundle()
+        transition = self.decoded(bundle, "transition-worker-one.json")
+        request = transition["request"]
+        route = request["route_evidence"]
+        route["account_binding_sha256"] = sha("forged account binding")
+        transition_contract.seal_route(route)
+        route["route_authorization_sha256"] = sha("public forgery")
+        replacement = transition_contract.load_module().authorize_model_transition(
+            request["prior_state"],
+            request["event"],
+            request["current_scope"],
+            request["operator_selection"],
+            route,
+        )
+        self.assertEqual(replacement["authorization"]["status"], "authorized")
+        bundle.files["transition-worker-one.json"] = canonical_document(replacement)
+        self.relink(bundle)
+
+        self.assert_bundle_rejected(bundle, "route evidence is not authenticated")
+
     def test_transition_task_must_match_the_signed_subject(self) -> None:
         bundle, _ = self.make_bundle()
         transition = self.decoded(bundle, "transition-worker-one.json")
@@ -1143,14 +1169,19 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         transition_validator = task_witness.root / "model_transition.py"
         transition_validator.write_bytes(transition_contract.MODULE_PATH.read_bytes())
         transition_validator.chmod(0o600)
+        route_verifier = task_witness.root / "route_evidence.py"
+        route_verifier.write_bytes(TEST_ROUTE_VERIFIER.read_bytes())
+        route_verifier.chmod(0o600)
         validator_sha = sha(task_witness.validator.read_bytes())
         transition_validator_sha = sha(transition_validator.read_bytes())
+        route_verifier_sha = sha(route_verifier.read_bytes())
         validator_implementation = task_witness_launcher.validator_identity(
             BUNDLE_CONTRACT,
             VALIDATOR_ID,
             [
                 (VALIDATOR_ID, validator_sha),
                 ("model-transition", transition_validator_sha),
+                ("route-evidence", route_verifier_sha),
             ],
         )
         publication_blocked = {
@@ -1202,6 +1233,11 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                                 "name": "model-transition",
                                 "path": str(transition_validator),
                                 "sha256": transition_validator_sha,
+                            },
+                            {
+                                "name": "route-evidence",
+                                "path": str(route_verifier),
+                                "sha256": route_verifier_sha,
                             },
                         ],
                         **validator_lifecycle,

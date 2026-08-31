@@ -63,6 +63,32 @@ def _transition_guard() -> Any:
     return guard
 
 
+def _authenticated_route_evidence(value: Any) -> dict[str, Any]:
+    witness = _witness()
+    modules = globals().get("_VERIFIED_MODULES")
+    if not isinstance(modules, dict) or "route-evidence" not in modules:
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route evidence is unavailable"
+        )
+    verifier = modules["route-evidence"]
+    validate = getattr(verifier, "validate_authenticated_route_evidence", None)
+    if not callable(validate):
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route-evidence API drift"
+        )
+    try:
+        authenticated = validate(value)
+    except Exception as error:
+        raise witness.EvidenceError(
+            "Rolecasting route evidence is not authenticated"
+        ) from error
+    if authenticated != value:
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route evidence is cross-bound"
+        )
+    return value
+
+
 def _raw_sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -295,7 +321,9 @@ def _transition(
     transition_sha256 = _raw_sha256(raw)
     if transition_sha256 != dispatch["model_transition_sha256"]:
         raise witness.EvidenceError("Rolecasting model-transition digest mismatch")
-    route = transition["request"]["route_evidence"]
+    route = _authenticated_route_evidence(
+        transition["request"]["route_evidence"]
+    )
     route_digest = getattr(guard, "route_evidence_sha256", None)
     if (
         not callable(route_digest)

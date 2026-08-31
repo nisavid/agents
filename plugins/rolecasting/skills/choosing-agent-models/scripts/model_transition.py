@@ -48,7 +48,14 @@ _CAPABILITY_STATUS = {"available", "absent", "probe-failed", "unknown"}
 _INVENTORY_STATUS = {"fresh", "missing", "stale", "denied"}
 _STATUS_SURFACE_SAFETY = {"side-effect-safe", "unverified", "unsafe"}
 _STATE_CHANGE_STATUS = {"unchanged", "unknown", "changed"}
-_KNOWN_UNSAFE_STATUS_SURFACES = {("codex-app-server", "0.149.0")}
+_CANONICAL_SEMANTIC_VERSION = re.compile(
+    r"(?P<major>0|[1-9]\d*)\."
+    r"(?P<minor>0|[1-9]\d*)\."
+    r"(?P<patch>0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z"
+)
+_KNOWN_UNSAFE_STATUS_SURFACE_CORES = {("codex-app-server", (0, 149, 0))}
 _FAILURE_DISPOSITIONS = {"defer", "cross-harness", "tracker", "blocked"}
 _UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
@@ -343,6 +350,17 @@ def _status_surface(value: Any) -> dict[str, Any]:
     return value
 
 
+def _status_surface_is_unsafe_or_unversioned(value: dict[str, Any]) -> bool:
+    implementation = value["implementation"]
+    if implementation != "codex-app-server":
+        return False
+    match = _CANONICAL_SEMANTIC_VERSION.fullmatch(value["version"])
+    if match is None:
+        return True
+    core = tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
+    return (implementation, core) in _KNOWN_UNSAFE_STATUS_SURFACE_CORES
+
+
 def _preflight(value: Any) -> dict[str, Any]:
     value = _exact(
         value,
@@ -626,9 +644,7 @@ def _deny_reason(
 
     preflight = route["preflight"]
     surface = preflight["status_surface"]
-    if (surface["implementation"], surface["version"]) in (
-        _KNOWN_UNSAFE_STATUS_SURFACES
-    ):
+    if _status_surface_is_unsafe_or_unversioned(surface):
         return "route-status-unverified", effective_operator
     if surface["safety"] in {"unsafe", "unverified"}:
         return "route-status-unverified", effective_operator

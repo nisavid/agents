@@ -10,14 +10,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).parents[1]
 SCRIPT_DIR = REPO_ROOT / "scripts"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import phase7_compatibility_projection as projection  # noqa: E402
-
 
 SOURCE_PATHS = (
     Path("plugins/rolecasting/topology.json"),
@@ -112,7 +110,7 @@ class Phase7CompatibilityProjectionTests(unittest.TestCase):
         )
         self.assertEqual(
             [module["name"] for module in rolecasting_provider["validators"][0]["modules"]],
-            ["validator", "model-transition", "adapter"],
+            ["validator", "model-transition", "route-evidence", "adapter"],
         )
         tricritical_provider = document["tricritical"]["task_witness_provider"]
         self.assertEqual(tricritical_provider["producers"], [])

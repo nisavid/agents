@@ -21,6 +21,9 @@ DISPATCH_ADAPTER_RUNTIME = (
     "skills/delegating-cross-agent-work/scripts/dispatch_adapter.py"
 )
 MODEL_TRANSITION_RUNTIME = "skills/choosing-agent-models/scripts/model_transition.py"
+ROUTE_EVIDENCE_RUNTIME = (
+    "skills/choosing-agent-models/scripts/route_evidence.py"
+)
 CANONICAL_MANIFEST_KEYS = {
     "$schema",
     "name",
@@ -140,6 +143,9 @@ class ValidateRolecastingTests(unittest.TestCase):
         transition = self.plugin / MODEL_TRANSITION_RUNTIME
         transition_raw = transition.read_bytes()
         transition_sha = hashlib.sha256(transition_raw).hexdigest()
+        route_evidence = self.plugin / ROUTE_EVIDENCE_RUNTIME
+        route_evidence_raw = route_evidence.read_bytes()
+        route_evidence_sha = hashlib.sha256(route_evidence_raw).hexdigest()
         validator = provider["validators"][0]
         self.assertEqual(validator["entrypoint"], "validator")
         self.assertEqual(
@@ -167,6 +173,12 @@ class ValidateRolecastingTests(unittest.TestCase):
                     "sha256": transition_sha,
                 },
                 {
+                    "name": "route-evidence",
+                    "relative_path": ROUTE_EVIDENCE_RUNTIME,
+                    "length": len(route_evidence_raw),
+                    "sha256": route_evidence_sha,
+                },
+                {
                     "name": "adapter",
                     "relative_path": DISPATCH_ADAPTER_RUNTIME,
                     "length": len(adapter_raw),
@@ -181,6 +193,7 @@ class ValidateRolecastingTests(unittest.TestCase):
             "modules": [
                 {"name": "validator", "content_sha256": runtime_sha},
                 {"name": "model-transition", "content_sha256": transition_sha},
+                {"name": "route-evidence", "content_sha256": route_evidence_sha},
                 {"name": "adapter", "content_sha256": adapter_sha},
             ],
         }
@@ -197,6 +210,14 @@ class ValidateRolecastingTests(unittest.TestCase):
 
     def test_rejects_adapter_mutation_without_provider_identity_refresh(self) -> None:
         path = self.plugin / DISPATCH_ADAPTER_RUNTIME
+        path.write_bytes(path.read_bytes() + b"\n# drift\n")
+
+        self.assert_rejected("Task Witness provider declaration drift")
+
+    def test_rejects_route_verifier_mutation_without_provider_identity_refresh(
+        self,
+    ) -> None:
+        path = self.plugin / ROUTE_EVIDENCE_RUNTIME
         path.write_bytes(path.read_bytes() + b"\n# drift\n")
 
         self.assert_rejected("Task Witness provider declaration drift")

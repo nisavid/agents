@@ -9,7 +9,7 @@
     "skills/addressing-pr-review-feedback/agents/openai.yaml": "2496f90c970648152cda7b94f40047baab0426c19b47954b87aa6baac563c39c",
     "skills/addressing-pr-review-feedback/references/feedback-flow.md": "bbbfba1c3081132415cc39ffe06516d30712c4220223dcc34e73255057731a14",
     "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py": "a344a2e748a7fdd04cdc73106308305b3d13ef5741a3fc899d863d2a5fae1613",
-    "skills/getting-prs-merged/SKILL.md": "69bbae5a13716762843ffece79a38df644180a8e15adbfbcd00a8726d6856fd1",
+    "skills/getting-prs-merged/SKILL.md": "aaff62bb547b99b3b921f1497f9ef4206b1c6066e717cee4fd5dc36c9f8bf1be",
     "skills/getting-prs-merged/agents/openai.yaml": "50ee890aeefc987b7a7f7e823d5e7a58bbd019ef89767f9bd839482c1b9766c9",
     "skills/getting-prs-merged/references/gh-fix-ci-adapter.md": "18d47225b110317293710d4b6ef79415f1277568f0abc10a3b53133bb46edb8c",
     "skills/getting-prs-merged/references/merge-actuator.md": "54413ec09c1dba17b159b5681ec146431e4f5dfce6cc07aac07b5212ff84c331",

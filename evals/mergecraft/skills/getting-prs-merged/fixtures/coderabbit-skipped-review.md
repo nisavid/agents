@@ -16,7 +16,7 @@ Mock repository state:
 Mock local policy:
 
 - `AGENTS.md`: CodeRabbit review is part of the normal PR closeout loop.
-- `AGENTS.md`: one top-level CodeRabbit request comment is explicitly agent-owned after readiness and review-budget gates pass.
+- `AGENTS.md`: one top-level CodeRabbit request comment is explicitly agent-owned after readiness gates pass. No time, cost, or review-count limit was specified.
 - `AGENTS.md`: merge actuation is agent-owned after all review, check, and branch-protection gates pass.
 
 Mock review history:

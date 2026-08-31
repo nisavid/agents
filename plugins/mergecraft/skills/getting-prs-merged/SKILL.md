@@ -77,8 +77,9 @@ mutation and reports findings or missing evidence before PR status.
 ## CodeRabbit request
 
 For a policy-required skipped CodeRabbit review, treat the skip as no completed
-cycle, check readiness/budget, and get explicit authority for one top-level
-comment. Bind PR/base/head and head repository/owner, caller-supplied expected
+cycle, check readiness and any explicit operator or repository limit, and
+require explicit authority for one top-level comment. Bind PR/base/head and
+head repository/owner, caller-supplied expected
 authenticated login, bytes, and SHA-256. Use the helper once; independently
 verify the active login, then reread ID/URL, PR, head, author, body, and
 timestamp. Possible-mutation timeout is ambiguous: do not retry. It cannot

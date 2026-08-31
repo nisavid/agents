@@ -172,14 +172,23 @@ class NativeCodexBindingTests(unittest.TestCase):
         native = load_module()
 
         denied = intent()
-        denied["model_transition"] = {
-            **denied["model_transition"],
-            "authorization": {
-                "status": "denied",
-                "reason": "route-capacity-unavailable",
-                "disposition": "blocked",
-            },
-        }
+        denied_event = transition_contract.event("new-subagent", predecessor=None)
+        denied_event["payload_sha256"] = denied["request_sha256"]
+        denied_route = transition_contract.route(transition_contract.selection())
+        denied_route["capacity"] = "exhausted"
+        denied["model_transition"] = (
+            transition_contract.load_module().authorize_model_transition(
+                None,
+                denied_event,
+                transition_contract.scope(),
+                None,
+                denied_route,
+            )
+        )
+        self.assertEqual(
+            denied["model_transition"]["authorization"]["reason"],
+            "route-capacity-unavailable",
+        )
         with self.assertRaisesRegex(
             native.NativeDispatchError,
             "model transition is not authorized",

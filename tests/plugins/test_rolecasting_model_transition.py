@@ -213,6 +213,30 @@ class ModelTransitionGuardTests(unittest.TestCase):
                     "selection-below-judgment-floor",
                 )
 
+    def test_builtin_role_cannot_claim_classification_above_its_ceiling(
+        self,
+    ) -> None:
+        guard = load_module()
+
+        for role, model, qualified, current_scope in (
+            ("luna", "gpt-5.6-luna", "recoverable", scope("recoverable")),
+            ("terra", "gpt-5.6-terra", "consequential", scope()),
+            ("sol", "gpt-5.6-sol", "security", scope()),
+        ):
+            with self.subTest(role=role):
+                decision = guard.authorize_model_transition(
+                    None,
+                    event("new-subagent", predecessor=None),
+                    current_scope,
+                    None,
+                    route(selection(role, model, qualified)),
+                )
+                self.assertEqual(decision["authorization"]["status"], "denied")
+                self.assertEqual(
+                    decision["authorization"]["reason"],
+                    "selection-exceeds-role-ceiling",
+                )
+
     def test_every_continuation_event_requires_fresh_same_task_authorization(
         self,
     ) -> None:
@@ -271,6 +295,162 @@ class ModelTransitionGuardTests(unittest.TestCase):
                 self.assertEqual(decision["authorization"]["reason"], reason)
                 self.assertIsNone(decision["selection"])
                 self.assertIsNone(decision["next_state"])
+
+    def test_control_flow_denial_reasons_are_reachable(self) -> None:
+        guard = load_module()
+        initial = initial_decision(guard)
+
+        initial_with_predecessor = guard.authorize_model_transition(
+            initial["next_state"],
+            event(
+                "new-subagent",
+                predecessor=initial["authorization_sha256"],
+            ),
+            scope(),
+            None,
+            route(selection()),
+        )
+        self.assertEqual(
+            initial_with_predecessor["authorization"]["reason"],
+            "initial-event-has-predecessor",
+        )
+
+        selected_operator = operator()
+        unexpected_operator = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None),
+            scope(),
+            selected_operator,
+            operator_route(selected_operator),
+        )
+        self.assertEqual(
+            unexpected_operator["authorization"]["reason"],
+            "unexpected-operator-selection",
+        )
+
+        invalid_select = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None, operator_action="select"),
+            scope(),
+            None,
+            route(selection()),
+        )
+        self.assertEqual(
+            invalid_select["authorization"]["reason"],
+            "operator-selection-action-invalid",
+        )
+
+        invalid_replace = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None, operator_action="replace"),
+            scope(),
+            selected_operator,
+            operator_route(selected_operator),
+        )
+        self.assertEqual(
+            invalid_replace["authorization"]["reason"],
+            "operator-replacement-action-invalid",
+        )
+
+        no_evidence = guard.authorize_model_transition(
+            initial["next_state"],
+            event(
+                "reclassification",
+                predecessor=initial["authorization_sha256"],
+            ),
+            scope("recoverable"),
+            None,
+            route(selection("terra", "gpt-5.6-terra", "recoverable")),
+        )
+        self.assertEqual(
+            no_evidence["authorization"]["reason"],
+            "reclassification-evidence-required",
+        )
+
+        unchanged_scope = scope()
+        unchanged_scope["reclassification_sha256"] = sha("no-op reclassification")
+        noop = guard.authorize_model_transition(
+            initial["next_state"],
+            event(
+                "reclassification",
+                predecessor=initial["authorization_sha256"],
+            ),
+            unchanged_scope,
+            None,
+            route(selection()),
+        )
+        self.assertEqual(
+            noop["authorization"]["reason"],
+            "reclassification-is-noop",
+        )
+
+        unexpected_scope_evidence = scope()
+        unexpected_scope_evidence["reclassification_sha256"] = sha(
+            "unexpected reclassification"
+        )
+        unexpected_evidence = guard.authorize_model_transition(
+            initial["next_state"],
+            event("resume", predecessor=initial["authorization_sha256"]),
+            unexpected_scope_evidence,
+            None,
+            route(selection()),
+        )
+        self.assertEqual(
+            unexpected_evidence["authorization"]["reason"],
+            "unexpected-reclassification-evidence",
+        )
+
+        unproven_operator = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None),
+            scope(),
+            None,
+            operator_route(selected_operator),
+        )
+        self.assertEqual(
+            unproven_operator["authorization"]["reason"],
+            "operator-selection-is-unproven",
+        )
+
+        nonfallback_change = guard.authorize_model_transition(
+            initial["next_state"],
+            event("follow-up", predecessor=initial["authorization_sha256"]),
+            scope(),
+            None,
+            route(selection(model="gpt-5.6-sol-alternate")),
+        )
+        self.assertEqual(
+            nonfallback_change["authorization"]["reason"],
+            "selection-change-requires-fallback",
+        )
+
+        sticky_scope = scope()
+        sticky_scope["daybreak_required"] = True
+        daybreak_initial = initial_decision(
+            guard,
+            current_scope=sticky_scope,
+            selected=selection(
+                "daybreak", "gpt-daybreak-blue-latest", "security"
+            ),
+        )
+        released_scope = scope()
+        released_scope["reclassification_sha256"] = sha(
+            "attempted Daybreak requirement release"
+        )
+        sticky_daybreak = guard.authorize_model_transition(
+            daybreak_initial["next_state"],
+            event(
+                "reclassification",
+                predecessor=daybreak_initial["authorization_sha256"],
+            ),
+            released_scope,
+            None,
+            route(selection()),
+        )
+        self.assertEqual(
+            sticky_daybreak["authorization"]["reason"],
+            "daybreak-requirement-is-sticky",
+        )
 
     def test_explicit_operator_selection_is_sticky_until_explicit_replacement(
         self,

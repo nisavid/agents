@@ -652,12 +652,12 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
             "bundle_sha256": bundle_sha256,
             "producer": {
                 **projection["producer"],
-                "validator_id": "rolecasting-dispatch-evidence-validator-v2",
+                "validator_id": "rolecasting-dispatch-evidence-validator-v3",
                 "validator_contract": "rolecasting-dispatch-evidence-v3",
                 "validator_implementation_sha256": "6" * 64,
             },
             "validator": {
-                "validator_id": "rolecasting-dispatch-evidence-validator-v2",
+                "validator_id": "rolecasting-dispatch-evidence-validator-v3",
                 "contract": "rolecasting-dispatch-evidence-v3",
                 "implementation_sha256": "6" * 64,
             },

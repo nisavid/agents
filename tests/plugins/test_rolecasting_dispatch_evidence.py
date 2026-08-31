@@ -317,9 +317,9 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         assurance_minimum = assurance_minimum or {
             field: assurance[field] for field in ASSURANCE_FIELDS
         }
-        model_name = "gpt-5-6-sol"
+        model_name = "gpt-5.6-sol"
         reasoning_effort = "high"
-        capability_evidence = identity("model-catalog", "gpt-5-6-sol-high")
+        capability_evidence = identity("model-catalog", "gpt-5.6-sol-high")
         transition_event = transition_contract.event(
             "new-subagent", predecessor=None
         )

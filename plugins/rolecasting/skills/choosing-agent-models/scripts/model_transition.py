@@ -35,6 +35,12 @@ _CLASSIFICATIONS = ("clerical", "recoverable", "consequential", "security")
 _CLASSIFICATION_RANK = {
     name: rank for rank, name in enumerate(_CLASSIFICATIONS)
 }
+_ROLE_CLASSIFICATION_CEILING = {
+    "luna": "clerical",
+    "terra": "recoverable",
+    "sol": "consequential",
+    "daybreak": "security",
+}
 _ROLES = {"luna", "terra", "sol", "daybreak", "inherited-fixed", "other"}
 _PROVENANCE = {"policy", "fallback", "operator", "inherited-fixed"}
 _CAPACITY = {"available", "exhausted", "unknown"}
@@ -459,6 +465,13 @@ def _deny_reason(
         return "selection-below-judgment-floor", effective_operator
     if scope["daybreak_required"] and selected["role"] != "daybreak":
         return "daybreak-route-required", effective_operator
+    ceiling = _ROLE_CLASSIFICATION_CEILING.get(selected["role"])
+    if (
+        ceiling is not None
+        and _CLASSIFICATION_RANK[selected["qualified_classification"]]
+        > _CLASSIFICATION_RANK[ceiling]
+    ):
+        return "selection-exceeds-role-ceiling", effective_operator
     if effective_operator is not None:
         if selected["provenance"] != "operator" or not _same_operator(
             selected, effective_operator

@@ -21,7 +21,7 @@
     "skills/choosing-agent-models/evals/fixtures/unrelated-task-model-route.md": "7fba87298576ed589d54c7b10cf11925a913b4182fdda143a9572a11db03da12",
     "skills/choosing-agent-models/evals/fixtures/unsupported-luna-surface.md": "641668785056928e9ca33b91bbb14fa3dcc7841c946432f9b29858e7f3fc24fe",
     "skills/choosing-agent-models/references/capability-probes-and-fallbacks.md": "281f27d026b0fe9accdfa9b79e845f4b7af332b038c0513d0601c421a49c645b",
-    "skills/choosing-agent-models/scripts/model_transition.py": "0b56fdd87191b51553e7c568e75648cd84e5b01f2feea34af43628f2b4fa2ae0",
+    "skills/choosing-agent-models/scripts/model_transition.py": "096d4bb82040423ba35c89c97542fc69f39f04296a989d782fc8ec472ef7e585",
     "skills/choosing-agent-models/scripts/route_evidence.py": "e6b053e2451350095e3301e4eeffc6432049d8c0a5fa3bc1a83de5aa72023e91",
     "skills/delegating-cross-agent-work/SKILL.md": "3911c92aef30f1cbb5a35ee92833585168e29611c21a6118f69f23a6269a9066",
     "skills/delegating-cross-agent-work/agents/openai.yaml": "4440bba50209bde34f4c866233262f396f69e5e11978b200cd480787998a86dd",
@@ -53,7 +53,7 @@
     "skills/delegating-cross-agent-work/scripts/dispatch_adapter.py": "f214aaebbe178a7c0682a33a2bf6d84dbb35a8fafe1206efbc05b38cfd646474",
     "skills/delegating-cross-agent-work/scripts/dispatch_evidence.py": "506f12a159f1cc517889fedf776c5c2824e4514f9c24621d45de040d6fbe6a86",
     "skills/delegating-cross-agent-work/scripts/native_codex.py": "7aefaa5c552c7dac5d39d948af67f1f10707095ba222d15bc4001c568d4c300d",
-    "task-witness-provider.json": "db416fee64d35677eb4d9a19014e3a3e5f2fb9b9a6e65356def4f08f5e29ad6d",
+    "task-witness-provider.json": "0ffb71708c80bbec4ce16f68f689e36b99a54e77b31d07b5edd0eb5eaf6e6307",
     "topology.json": "259673c147ffee1ebdf9630f2947c6ae7994f3ec57d58348e053f4d37a95921c"
   }
 }

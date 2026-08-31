@@ -456,14 +456,17 @@ class ModelTransitionGuardTests(unittest.TestCase):
             "security",
             reasoning_effort="max",
         )
-        for version in (
-            "0.149.0",
-            "v0.149.0",
-            "0.149.0+release",
-            "0.149.0 ",
-            "0.149",
+        for case, version in (
+            ("known unsafe core", "0.149.0"),
+            ("leading version prefix", "v0.149.0"),
+            ("known unsafe core with build metadata", "0.149.0+release"),
+            ("trailing whitespace", "0.149.0 "),
+            ("missing patch", "0.149"),
+            ("numeric prerelease leading zero", "0.150.0-01"),
+            ("non-ASCII numeral", "1.2٣.4"),
+            ("oversized numeric component", f"{'1' * 5001}.2.3"),
         ):
-            with self.subTest(version=version):
+            with self.subTest(case=case):
                 candidate = preflight_route(
                     daybreak,
                     inventory_complete=False,

@@ -21,13 +21,15 @@ The normal topology for either profile is:
 Do not use this binding to create or steer a user-owned task. That ownership
 requires explicit user consent and a separately classified route.
 App-server is an optional later transport for dispatch, not a Codex surface and
-not an initial-release dependency. Its narrowly supported metadata-only use for
-permitted-account status inventory is a preflight inspection surface, not a
-dispatch or task-work transport.
+not an initial-release dependency. A qualified metadata-only interface may be
+a preflight inspection surface, never a dispatch or task-work transport. Codex
+app-server 0.149.0 is not qualified for that standing status authority because
+its rate-limit request path may refresh and persist managed authentication.
 
 ## Freeze before launch
 
-First apply the verified `model-transition` module to the prior state, exact
+First apply the verified `model-transition` module and authenticated
+`route-evidence` verifier to the prior state, exact
 lifecycle event, current role classification, optional operator selection, and
 fresh route evidence with its complete permitted-route preflight. Do this for
 new subagents, follow-ups, resumes, retries, capacity recovery, and
@@ -44,9 +46,10 @@ enforced effective authority.
 Call `freeze_native_dispatch` before invoking the native subagent tool. The
 freeze validates and binds the complete
 `rolecasting-model-transition-decision-v1`, plan and request digests, dispatch
-ID, exact Codex surface, version, executor, context, read-only authority
+ID, task identity, exact Codex surface, version, executor, context, read-only authority
 intent, and assurance minima. The transition payload digest must equal the
-request digest, and its target must equal the native profile.
+request digest, its immutable plan and actuation identities must equal the
+native plan and dispatch IDs, and its target must equal the native profile.
 It derives the fixed child, leader-owned, native-tool topology. It rejects the
 dispatch before launch when any consumer minimum exceeds the selected native
 profile.
@@ -77,11 +80,18 @@ dispatch. Pass the bounded worker request and least authority allowed by the
 live tool schema. Preserve the frozen context; a changed worktree, scope,
 request, target, ownership, or authority requires a new freeze.
 
-The caller supplies the guard to `native_codex.py` as the verified
-`model-transition` module. Missing or changed guard bytes fail closed before
-spawn. The repository module remains a sequencing seam, not the harness
-actuator; the owning harness must make the freeze mandatory at its payload
-boundary.
+The caller supplies the guard and route verifier to `native_codex.py` as the
+verified `model-transition` and `route-evidence` modules. Missing, changed, or
+unauthenticated evidence fails closed before spawn. The repository module
+remains a sequencing seam, not the harness actuator; the owning harness must
+make the freeze mandatory at its payload boundary and atomically consume each
+plan- and actuation-bound authorization so a second invocation cannot replay
+it.
+
+No such production issuer, verifier, or mandatory actuator integration is
+registered by this release. These native profiles therefore describe the
+required boundary but do not establish a runnable alternate-account Daybreak
+route.
 
 Take the agent or worker ID, session or task ID, context binding, and
 launch acknowledgement only from the native tool protocol. Continue with the

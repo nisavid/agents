@@ -585,13 +585,18 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
             "contract": "rolecasting-bootstrap-adapter-v3",
             "implementation_sha256": sha("rolecasting adapter"),
         }
+        route_issuer = rolecasting_evidence.transition_contract.route_issuer()
         trust = {
             "producers": [producer],
             "issuers": [
                 {
                     "identity": issuer,
                     "capabilities": ["execution-result", "model"],
-                }
+                },
+                {
+                    "identity": route_issuer,
+                    "capabilities": ["route-evidence"],
+                },
             ],
         }
         model_name = "gpt-5.6-sol"
@@ -600,6 +605,7 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
         transition_guard = rolecasting_evidence.transition_contract.load_module()
         dispatches: list[dict[str, Any]] = []
         artifacts: dict[str, dict[str, Any]] = {}
+        plan_binding_sha256 = sha(f"{path}: immutable pre-actuation plan")
         for index, role in enumerate(roles):
             execution_id = f"{path.rsplit('/', 1)[-1]}-{index}"
             target = {
@@ -648,12 +654,17 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
                 "new-subagent",
                 predecessor=None,
             )
+            transition_event["task_sha256"] = subject["content_sha256"]
             transition_event["payload_sha256"] = request["content_sha256"]
+            transition_event["plan_binding_sha256"] = plan_binding_sha256
+            transition_event["actuation_id"] = execution_id
             transition_route = rolecasting_evidence.transition_contract.route(
-                rolecasting_evidence.transition_contract.selection(model=model_name)
+                rolecasting_evidence.transition_contract.selection(model=model_name),
+                transition_event,
             )
             transition_route["target"] = target
             transition_route["capability_sha256"] = capability["content_sha256"]
+            rolecasting_evidence.transition_contract.seal_route(transition_route)
             transition = transition_guard.authorize_model_transition(
                 None,
                 transition_event,
@@ -664,6 +675,7 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
             transition_raw = raw_document(transition)
             dispatch = {
                 "execution_id": execution_id,
+                "plan_binding_sha256": plan_binding_sha256,
                 "role": role,
                 "target": target,
                 "topology": topology,
@@ -718,6 +730,7 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
                 "schema_version": 1,
                 "contract": "rolecasting-dispatch-plan-v3",
                 "subject": subject,
+                "plan_binding_sha256": plan_binding_sha256,
                 "dispatches": dispatches,
             }
         )
@@ -1042,16 +1055,16 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
                     "dispatch-assurance-v2", f"{level}-{execution_id}"
                 ),
             }
-            execution["assurance_minimum"] = {
-                field: level
-                for field in (
+            execution["assurance_minimum"] = dict.fromkeys(
+                (
                     "target",
                     "model",
                     "topology",
                     "authority",
                     "execution_result",
-                )
-            }
+                ),
+                level,
+            )
         review_projection = signed(
             {
                 key: value

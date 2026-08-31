@@ -24,12 +24,13 @@ unknown capacity, and an unavailable required model fail closed.
 
 ## Inventory Before Selection
 
-Inventory every permitted route before first dispatch and every transition;
-never infer from the ambient account. Automatically refresh missing or
-stale status under the narrow metadata-only authority in
-[capability-probes-and-fallbacks.md](references/capability-probes-and-fallbacks.md),
-then bind timestamped redacted evidence. Status is not execution authority;
-denied or unverified status is not model absence.
+Inventory permitted routes before every transition; never infer an account.
+Refresh missing or stale status only through an authenticated,
+exact-version, side-effect-safe surface in
+[capability-probes-and-fallbacks.md](references/capability-probes-and-fallbacks.md).
+Bind redacted timestamped evidence, or block. Status grants no execution
+authority. Codex app-server 0.149.0 and unregistered issuer/verifier paths
+remain blocked, not model absence.
 
 ## Preferred Codex Role Family
 

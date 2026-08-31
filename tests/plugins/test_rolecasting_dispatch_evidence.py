@@ -8,9 +8,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from tests.plugins import test_rolecasting_model_transition as transition_contract
 from tests.plugins.task_witness_client import test_launcher as task_witness_launcher
 from tests.plugins.task_witness_deployment._support import load_deployment_module
-from tests.plugins import test_rolecasting_model_transition as transition_contract
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v3"
@@ -214,7 +214,8 @@ def load_validator() -> Any:
     module = importlib.util.module_from_spec(specification)
     module.__dict__["_TASK_WITNESS"] = Witness
     module.__dict__["_VERIFIED_MODULES"] = {
-        "model-transition": transition_contract.load_module()
+        "model-transition": transition_contract.load_module(),
+        "route-evidence": transition_contract.route_verifier(),
     }
     specification.loader.exec_module(module)
     return module
@@ -228,7 +229,8 @@ def load_adapter() -> Any:
         raise AssertionError("Rolecasting bootstrap adapter could not be loaded")
     module = importlib.util.module_from_spec(specification)
     module.__dict__["_VERIFIED_MODULES"] = {
-        "model-transition": transition_contract.load_module()
+        "model-transition": transition_contract.load_module(),
+        "route-evidence": transition_contract.route_verifier(),
     }
     specification.loader.exec_module(module)
     return module
@@ -252,7 +254,11 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                 {
                     "identity": self.issuer,
                     "capabilities": ["execution-result", "model"],
-                }
+                },
+                {
+                    "identity": transition_contract.route_issuer(),
+                    "capabilities": ["route-evidence"],
+                },
             ],
         }
         self.subject = identity("opaque-work-subject", "subject-one")
@@ -293,13 +299,13 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
     @staticmethod
     def assurance(level: str = "product-attested") -> dict[str, Any]:
         return {
-            **{field: level for field in ASSURANCE_FIELDS},
+            **dict.fromkeys(ASSURANCE_FIELDS, level),
             "evidence": identity("dispatch-assurance", f"{level}-observation"),
         }
 
     @staticmethod
     def assurance_minimum(level: str = "product-attested") -> dict[str, str]:
-        return {field: level for field in ASSURANCE_FIELDS}
+        return dict.fromkeys(ASSURANCE_FIELDS, level)
 
     def make_bundle(
         self,
@@ -323,14 +329,21 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         transition_event = transition_contract.event(
             "new-subagent", predecessor=None
         )
+        transition_event["task_sha256"] = self.subject["content_sha256"]
         transition_event["payload_sha256"] = self.request["content_sha256"]
+        transition_event["plan_binding_sha256"] = sha(
+            "worker-one immutable dispatch plan"
+        )
+        transition_event["actuation_id"] = "worker-one"
         transition_route = transition_contract.route(
-            transition_contract.selection(model=model_name)
+            transition_contract.selection(model=model_name),
+            transition_event,
         )
         transition_route["target"] = target
         transition_route["capability_sha256"] = capability_evidence[
             "content_sha256"
         ]
+        transition_contract.seal_route(transition_route)
         transition = transition_contract.load_module().authorize_model_transition(
             None,
             transition_event,
@@ -341,6 +354,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         transition_raw = canonical_document(transition)
         dispatch = {
             "execution_id": "worker-one",
+            "plan_binding_sha256": transition_event["plan_binding_sha256"],
             "role": "independent-checker",
             "target": target,
             "topology": topology,
@@ -387,6 +401,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                 "schema_version": 1,
                 "contract": "rolecasting-dispatch-plan-v3",
                 "subject": self.subject,
+                "plan_binding_sha256": transition_event["plan_binding_sha256"],
                 "dispatches": [dispatch],
             }
         )
@@ -447,11 +462,15 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                 "evidence_contract": BUNDLE_CONTRACT,
                 "manifest_sha256": sha(manifest_raw),
                 "plan_sha256": sha(plan_raw),
+                "plan_binding_sha256": transition_event["plan_binding_sha256"],
                 "subject": self.subject,
                 "producer": self.producer,
                 "executions": {
                     "worker-one": {
                         "execution_id": "worker-one",
+                        "plan_binding_sha256": transition_event[
+                            "plan_binding_sha256"
+                        ],
                         "role": "independent-checker",
                         "target": target,
                         "topology": topology,
@@ -469,6 +488,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                         "model_transition_task_sha256": transition_event[
                             "task_sha256"
                         ],
+                        "route_evidence_issuer": transition_contract.route_issuer(),
                         "authority": self.authority,
                         "user_authority": user_authority,
                         "isolation": dispatch["isolation"],
@@ -511,6 +531,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         dispatch = plan["dispatches"][0]
         dispatch_keys = (
             "execution_id",
+            "plan_binding_sha256",
             "role",
             "target",
             "topology",
@@ -827,6 +848,27 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(adapter.AdapterError, "selection mismatch"):
             adapter.render_dispatch_bundle(self.resign(request))
 
+    def test_transition_task_must_match_the_signed_subject(self) -> None:
+        bundle, _ = self.make_bundle()
+        transition = self.decoded(bundle, "transition-worker-one.json")
+        request = transition["request"]
+        request["event"]["task_sha256"] = sha("another task")
+        request["route_evidence"]["task_sha256"] = request["event"][
+            "task_sha256"
+        ]
+        transition_contract.seal_route(request["route_evidence"])
+        replacement = transition_contract.load_module().authorize_model_transition(
+            request["prior_state"],
+            request["event"],
+            request["current_scope"],
+            request["operator_selection"],
+            request["route_evidence"],
+        )
+        bundle.files["transition-worker-one.json"] = canonical_document(replacement)
+        self.relink(bundle)
+
+        self.assert_bundle_rejected(bundle, "task identity")
+
     def test_target_family_surface_pair_is_closed(self) -> None:
         cases = (
             ("codex", "codex-app-server"),
@@ -1041,6 +1083,10 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         self.trust["issuers"][0]["capabilities"] = ["model"]
         self.assert_bundle_rejected(bundle, "execution-result")
 
+        bundle, _ = self.make_bundle()
+        self.trust["issuers"][1]["capabilities"] = []
+        self.assert_bundle_rejected(bundle, "route-evidence")
+
     def test_closed_bundle_and_canonical_document_bytes_are_required(self) -> None:
         bundle, _ = self.make_bundle()
         bundle.files["unexpected.json"] = canonical_document({"unexpected": True})
@@ -1133,7 +1179,12 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                         **self.issuer,
                         "capabilities": ["execution-result", "model"],
                         **publication_blocked,
-                    }
+                    },
+                    {
+                        **transition_contract.route_issuer(),
+                        "capabilities": ["route-evidence"],
+                        **publication_blocked,
+                    },
                 ],
                 "validators": [
                     {

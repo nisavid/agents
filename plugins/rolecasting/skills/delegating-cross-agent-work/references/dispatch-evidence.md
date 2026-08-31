@@ -77,13 +77,14 @@ Boolean; completion alone never implies a usable result. See
 
 The bootstrap adapter exposes a pure deterministic renderer for one closed
 `rolecasting-bootstrap-dispatch-request-v3`. It first validates the supplied
-`rolecasting-model-transition-decision-v1`, then freezes supplied facts and
-binds its exact source bytes. It does not launch a worker, choose a model, or
-authenticate facts outside its process. No owning harness integration currently
-authenticates those observations as portable evidence or binds its bytes into
-a registered issuer closure. Canonical new-publication evidence remains
-unreachable until such an integration exists. Merely adding provider roles
-cannot satisfy that boundary.
+`rolecasting-model-transition-decision-v1` through verified transition and
+route-evidence modules, then freezes supplied facts and binds its exact source
+bytes. It does not launch a worker, choose a model, or authenticate facts
+outside its process. No owning harness integration currently authenticates
+those observations as portable evidence, and no production route-evidence
+verifier or integration bytes are bound into a registered issuer closure.
+Canonical new-publication evidence remains unreachable until such an
+integration exists. Merely adding provider roles cannot satisfy that boundary.
 
 ## Closed bundle
 
@@ -98,8 +99,9 @@ Every stored document is a closed schema-version-1 canonical JSON object with
 one trailing LF. Its `content_sha256` addresses the canonical object with that
 field omitted. The manifest binds the raw plan and per-execution file digests.
 
-The plan binds an opaque subject and a nonempty ordered dispatch set. Each
-dispatch binds its unique ID and generic role; exact target product family,
+The plan binds an opaque subject, an immutable pre-actuation plan identity, and
+a nonempty ordered dispatch set. Each dispatch binds that plan identity, its
+unique actuation ID and generic role; exact target product family,
 surface, executor, and version; relationship, ownership, and transport;
 subject, candidate, scope, and request; return, verification, and stop
 contracts; authorized model-transition and model-selection receipts; read-only authority; conditional user
@@ -109,14 +111,20 @@ Subdelegation and external action are denied. User authority is present exactly
 for user-owned work. Externality comes only from the relationship and is never
 inferred from the transport, surface, or isolation record.
 
-Each transition document binds prior accepted state, exact event and payload,
-current role classification, optional sticky operator choice, fresh route and
-account evidence, selected pair, authorization, and next state. The registered
-validator recomputes the pure decision and rejects denial, stale or ineligible
-routes, unavailable capacity, changed continuation target or account, a model
-below the carried floor, Daybreak fallthrough, or receipt tampering. This
-post-hoc check is defense in depth; the actuator must validate the same
-decision before accepting payload data.
+Each transition document binds prior accepted state, exact task, event,
+payload, plan, and actuation identities, current role classification, optional
+sticky operator choice, authenticated fresh route and account evidence,
+selected pair, authorization, and next state. The route preflight identifies
+the exact status implementation, version, operations, and side-effect-safety
+evidence. Codex app-server 0.149.0 fails closed even if a producer incorrectly
+labels it side-effect-safe. The registered validator recomputes the pure
+decision, authenticates the route-evidence issuer through Task Witness, and
+rejects denial, stale or ineligible routes, unsafe or unverified status,
+unavailable capacity, changed continuation target or account, a model below the
+carried floor, a non-exact Daybreak Max selection, duplicate authorization,
+cross-bound identity, or receipt tampering. This post-hoc check is defense in
+depth; the actuator must validate and atomically consume the same authorization
+before accepting payload data.
 
 Each `rolecasting-model-selection-receipt-v3` binds the transition, target, selected model,
 reasoning effort, and availability evidence from an issuer authorized for
@@ -136,8 +144,9 @@ only non-Boolean values reject.
 
 Successful validation emits the self-addressed
 `rolecasting-dispatch-projection-v3`. It contains the evidence and raw manifest
-and plan identities, opaque subject, producer, and an execution map with exact
-transition authorization, event, task, dispatch, model, and result digests;
+and plan identities, immutable plan binding, opaque subject, producer, and an
+execution map with exact transition authorization, authenticated route issuer,
+event, task, dispatch, model, and result digests;
 target, topology, observed assurance,
 assurance minimum, authority, user authority, and isolation; model choice and issuer identities; typed
 returned evidence; and exact `usable` status. Consumers use this projection and

@@ -43,14 +43,13 @@ and consumer assurance minima before model choice or edit authority.
 
 ## Gate Every Payload
 
-Use `choosing-agent-models` before every payload-bearing new dispatch,
-follow-up, resume, retry, capacity recovery, or reclassification—even when a
-model was previously resolved. Require complete route inventory and status
-preflight plus fresh eligibility, selector, capability, account, target,
-execution-authority, and capacity evidence. Bind the guard's authorized
-decision immediately before the actuator accepts the payload; denial sends
-none. Never treat denied status as model absence or capacity loss as a
-downgrade route.
+Use `choosing-agent-models` before every payload-bearing lifecycle event. Require authenticated
+route evidence binding complete inventory, safe status preflight, eligibility,
+selector, capability, account, target, execution authority, capacity, task,
+payload, plan, and actuation. Validate and atomically consume it before payload
+acceptance; denial sends none. Missing production issuer, verifier, or actuator
+integration blocks dispatch. Never recast denied or unverified status as model
+absence, or capacity loss as permission to downgrade.
 
 ## Bounded Handoff
 

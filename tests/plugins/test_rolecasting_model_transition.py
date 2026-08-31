@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import importlib.util
 import json
 import unittest
 from pathlib import Path
 from typing import Any
-
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 MODULE_PATH = (
@@ -61,19 +61,80 @@ def selection(
     qualified_classification: str = "consequential",
     provenance: str = "policy",
     operator_selection_sha256: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
+    if reasoning_effort is None:
+        reasoning_effort = "max" if role == "daybreak" else "high"
     return {
         "role": role,
         "model": model,
-        "reasoning_effort": "high",
+        "reasoning_effort": reasoning_effort,
         "qualified_classification": qualified_classification,
         "provenance": provenance,
         "operator_selection_sha256": operator_selection_sha256,
     }
 
 
-def route(selected: dict[str, Any]) -> dict[str, Any]:
+def route_issuer() -> dict[str, str]:
     return {
+        "issuer_id": "test-route-evidence",
+        "contract": "rolecasting-route-evidence-issuer-v1",
+        "implementation_sha256": sha("test route-evidence verifier"),
+    }
+
+
+def seal_route(value: dict[str, Any]) -> dict[str, Any]:
+    unsigned = {
+        key: item
+        for key, item in value.items()
+        if key not in {"content_sha256", "route_authorization_sha256"}
+    }
+    value["content_sha256"] = hashlib.sha256(canonical(unsigned)).hexdigest()
+    value["route_authorization_sha256"] = hmac.new(
+        b"test-only-route-evidence-key",
+        value["content_sha256"].encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return value
+
+
+class RouteEvidenceVerifier:
+    @staticmethod
+    def validate_authenticated_route_evidence(value: Any) -> Any:
+        if value["evidence_issuer"] != route_issuer():
+            raise ValueError("route-evidence issuer is not trusted")
+        if (
+            load_module().route_evidence_sha256(value)
+            != value["content_sha256"]
+        ):
+            raise ValueError("route-evidence content digest mismatch")
+        expected_authorization = hmac.new(
+            b"test-only-route-evidence-key",
+            value["content_sha256"].encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if value["route_authorization_sha256"] != expected_authorization:
+            raise ValueError("route-evidence authentication failed")
+        return copy.deepcopy(value)
+
+
+def route_verifier() -> RouteEvidenceVerifier:
+    return RouteEvidenceVerifier()
+
+
+def route(
+    selected: dict[str, Any],
+    bound_event: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    bound_event = bound_event or event("new-subagent", predecessor=None)
+    value = {
+        "schema_version": 1,
+        "contract": "rolecasting-route-evidence-v1",
+        "evidence_issuer": route_issuer(),
+        "task_sha256": bound_event["task_sha256"],
+        "payload_sha256": bound_event["payload_sha256"],
+        "plan_binding_sha256": bound_event["plan_binding_sha256"],
+        "actuation_id": bound_event["actuation_id"],
         "fresh": True,
         "eligible": True,
         "capacity": "available",
@@ -85,7 +146,8 @@ def route(selected: dict[str, Any]) -> dict[str, Any]:
             "executor": "codex",
         },
         "account_binding_sha256": sha("private account binding"),
-        "route_authorization_sha256": sha("authorized route"),
+        "content_sha256": "0" * 64,
+        "route_authorization_sha256": "0" * 64,
         "selector_sha256": sha("fresh target selector"),
         "capability_sha256": sha("fresh exact capability"),
         "capability_status": "available",
@@ -98,18 +160,28 @@ def route(selected: dict[str, Any]) -> dict[str, Any]:
             "status_authorization_sha256": sha(
                 "authorized metadata-only status refresh"
             ),
+            "status_surface": {
+                "implementation": "test-status-provider",
+                "version": "1",
+                "operations": ["route-metadata/read"],
+                "safety": "side-effect-safe",
+                "evidence_sha256": sha("proved side-effect-safe test surface"),
+            },
             "status_observed_at": "2026-08-31T18:50:00Z",
             "status_evidence_sha256": sha("timestamped redacted route status"),
             "task_data_shared": False,
-            "state_changed": False,
+            "caller_state_mutation_requested": False,
+            "state_change_status": "unchanged",
         },
         "selection": selected,
     }
+    return seal_route(value)
 
 
 def preflight_route(
     selected: dict[str, Any],
     *,
+    bound_event: dict[str, Any] | None = None,
     inventory_complete: bool = True,
     inventory_status: str = "fresh",
     selected_route_in_inventory: bool = True,
@@ -117,7 +189,7 @@ def preflight_route(
     execution_authorized: bool = True,
     capacity: str = "available",
 ) -> dict[str, Any]:
-    value = route(selected)
+    value = route(selected, bound_event)
     value["preflight"] = {
         "inventory_complete": inventory_complete,
         "inventory_sha256": sha(
@@ -128,10 +200,18 @@ def preflight_route(
         "status_authorization_sha256": sha(
             "authorized metadata-only status refresh"
         ),
+        "status_surface": {
+            "implementation": "test-status-provider",
+            "version": "1",
+            "operations": ["route-metadata/read"],
+            "safety": "side-effect-safe",
+            "evidence_sha256": sha("proved side-effect-safe test surface"),
+        },
         "status_observed_at": "2026-08-31T18:50:00Z",
         "status_evidence_sha256": sha("timestamped redacted route status"),
         "task_data_shared": False,
-        "state_changed": False,
+        "caller_state_mutation_requested": False,
+        "state_change_status": "unchanged",
     }
     value["capability_status"] = capability_status
     value["execution_authorized"] = execution_authorized
@@ -149,7 +229,9 @@ def event(
     return {
         "kind": kind,
         "task_sha256": sha("same task"),
-        "payload_sha256": sha(f"{kind} payload"),
+        "payload_sha256": sha("same payload"),
+        "plan_binding_sha256": sha("same frozen plan"),
+        "actuation_id": "worker-one",
         "predecessor_authorization_sha256": predecessor,
         "operator_action": operator_action,
     }
@@ -160,10 +242,11 @@ def operator(
     model: str = "gpt-5.6-sol",
     qualified_classification: str = "consequential",
 ) -> dict[str, Any]:
+    reasoning_effort = "max" if role == "daybreak" else "high"
     value = {
         "role": role,
         "model": model,
-        "reasoning_effort": "high",
+        "reasoning_effort": reasoning_effort,
         "qualified_classification": qualified_classification,
     }
     return {
@@ -241,6 +324,7 @@ class ModelTransitionGuardTests(unittest.TestCase):
         alternate["route_authorization_sha256"] = sha(
             "alternate account execution authorization"
         )
+        seal_route(alternate)
 
         authorized = guard.authorize_model_transition(
             None,
@@ -276,9 +360,15 @@ class ModelTransitionGuardTests(unittest.TestCase):
             ),
             (
                 "status-denied",
-                {"inventory_status": "denied"},
+                {"inventory_complete": False, "inventory_status": "denied"},
                 {},
-                "route-status-refresh-denied",
+                "route-status-denied",
+            ),
+            (
+                "status-state-unverified",
+                {"inventory_complete": False, "state_change_status": "unknown"},
+                {},
+                "route-status-unverified",
             ),
             (
                 "route-not-in-inventory",
@@ -330,6 +420,7 @@ class ModelTransitionGuardTests(unittest.TestCase):
                 candidate["fresh"] = (
                     candidate["preflight"]["inventory_status"] == "fresh"
                 )
+                seal_route(candidate)
                 decision = guard.authorize_model_transition(
                     None,
                     event("new-subagent", predecessor=None),
@@ -340,10 +431,11 @@ class ModelTransitionGuardTests(unittest.TestCase):
                 self.assertEqual(decision["authorization"]["status"], "denied")
                 self.assertEqual(decision["authorization"]["reason"], reason)
 
-        for field in ("task_data_shared", "state_changed"):
+        for field in ("task_data_shared", "caller_state_mutation_requested"):
             with self.subTest(status_authority_violation=field):
                 candidate = preflight_route(daybreak)
                 candidate["preflight"][field] = True
+                seal_route(candidate)
                 decision = guard.authorize_model_transition(
                     None,
                     event("new-subagent", predecessor=None),
@@ -355,6 +447,125 @@ class ModelTransitionGuardTests(unittest.TestCase):
                     decision["authorization"]["reason"],
                     "route-status-refresh-exceeded-authority",
                 )
+
+    def test_known_stateful_status_surface_fails_closed(self) -> None:
+        guard = load_module()
+        daybreak = selection(
+            "daybreak",
+            "gpt-daybreak-blue-latest",
+            "security",
+            reasoning_effort="max",
+        )
+        candidate = preflight_route(
+            daybreak,
+            inventory_complete=False,
+            inventory_status="stale",
+            capability_status="unknown",
+            execution_authorized=False,
+            capacity="unknown",
+        )
+        candidate["preflight"].update(
+            {
+                "caller_state_mutation_requested": False,
+                "state_change_status": "unchanged",
+                "status_surface": {
+                    "implementation": "codex-app-server",
+                    "version": "0.149.0",
+                    "operations": [
+                        "initialize",
+                        "account/read:refreshToken=false",
+                        "model/list",
+                        "account/rateLimits/read",
+                    ],
+                    "safety": "side-effect-safe",
+                    "evidence_sha256": sha(
+                        "rust-v0.149.0 managed auth refresh source trace"
+                    ),
+                },
+            }
+        )
+        seal_route(candidate)
+
+        decision = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None),
+            scope("security"),
+            None,
+            candidate,
+        )
+
+        self.assertEqual(decision["authorization"]["status"], "denied")
+        self.assertEqual(
+            decision["authorization"]["reason"],
+            "route-status-unverified",
+        )
+        self.assertFalse(
+            decision["request"]["route_evidence"]["preflight"][
+                "inventory_complete"
+            ]
+        )
+        self.assertEqual(
+            decision["request"]["route_evidence"]["preflight"][
+                "status_surface"
+            ]["safety"],
+            "side-effect-safe",
+        )
+
+    def test_unverified_status_surface_is_not_model_absence(self) -> None:
+        guard = load_module()
+        candidate = preflight_route(selection())
+        candidate["preflight"]["inventory_complete"] = False
+        candidate["preflight"]["status_surface"]["safety"] = "unverified"
+        seal_route(candidate)
+
+        decision = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None),
+            scope(),
+            None,
+            candidate,
+        )
+
+        self.assertEqual(
+            decision["authorization"]["reason"],
+            "route-status-unverified",
+        )
+        self.assertNotEqual(
+            decision["authorization"]["reason"],
+            "route-model-absent",
+        )
+
+    def test_daybreak_role_requires_exact_model_and_max_effort(self) -> None:
+        guard = load_module()
+        cases = (
+            ("gpt-5.6-terra", "low"),
+            ("gpt-daybreak-blue-latest", "high"),
+            ("gpt-daybreak-blue-latest", "max"),
+        )
+        for model, effort in cases:
+            with self.subTest(model=model, effort=effort):
+                selected = selection(
+                    "daybreak",
+                    model,
+                    "security",
+                    reasoning_effort=effort,
+                )
+                decision = guard.authorize_model_transition(
+                    None,
+                    event("new-subagent", predecessor=None),
+                    scope("security"),
+                    None,
+                    route(selected),
+                )
+                if (model, effort) == ("gpt-daybreak-blue-latest", "max"):
+                    self.assertEqual(
+                        decision["authorization"]["status"], "authorized"
+                    )
+                else:
+                    self.assertEqual(
+                        decision["authorization"]["reason"],
+                        "daybreak-selector-mismatch",
+                    )
 
     def test_route_preflight_schema_and_scalar_types_are_closed(self) -> None:
         guard = load_module()

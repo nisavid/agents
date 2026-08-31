@@ -8,10 +8,18 @@
   requirements, and reject stale, ineligible, capacity-failed, downgraded, or
   tampered transitions before native spawn.
 - Require a complete permitted-route inventory before first dispatch and later
-  transitions. Bind the narrow metadata-only status refresh separately from
-  execution authority, retain timestamped redacted evidence, and distinguish
-  incomplete or denied status from capability failure, model absence, missing
-  execution authority, and capacity loss.
+  transitions. Require an authenticated, version-bound, side-effect-safe
+  interface for the narrow metadata-only status refresh, explicitly reject
+  Codex app-server 0.149.0, retain timestamped redacted evidence, and
+  distinguish unsafe, unverified, incomplete, or denied status from capability
+  failure, model absence, missing execution authority, and capacity loss.
+- Require authenticated route-evidence provenance at every native and portable
+  payload boundary. Cross-bind task, payload, immutable plan, and actuation
+  identities, reject bundle fan-out, require exact Daybreak Max selection, and
+  leave atomic one-time authorization consumption to the owning actuator. This
+  release registers no production route-evidence issuer or verifier, safe Codex
+  app-server 0.149.0 status surface, or mandatory actuator hook; successful
+  alternate-account Daybreak dispatch therefore remains blocked.
 - Bind the same transition identity through dispatch-evidence v3 plans, model
   receipts, result receipts, manifests, and canonical projections. Retain the
   truthful validator-only provider boundary; repository code still cannot

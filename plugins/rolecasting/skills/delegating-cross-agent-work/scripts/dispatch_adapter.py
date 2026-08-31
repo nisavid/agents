@@ -94,7 +94,25 @@ def _transition_guard() -> Any:
 
 def _authorized_transition(value: Any) -> dict[str, Any]:
     try:
-        return _transition_guard().validate_authorized_transition(value)
+        guard = _transition_guard()
+        transition = guard.validate_authorized_transition(value)
+        modules = globals().get("_VERIFIED_MODULES")
+        if not isinstance(modules, dict) or "route-evidence" not in modules:
+            raise AdapterError("authenticated route evidence is unavailable")
+        verifier = modules["route-evidence"]
+        validate = getattr(verifier, "validate_authenticated_route_evidence", None)
+        if not callable(validate):
+            raise AdapterError("authenticated route-evidence API drift")
+        route = transition["request"]["route_evidence"]
+        if validate(route) != route:
+            raise AdapterError("authenticated route evidence is cross-bound")
+        route_digest = getattr(guard, "route_evidence_sha256", None)
+        if (
+            not callable(route_digest)
+            or route_digest(route) != route["content_sha256"]
+        ):
+            raise AdapterError("authenticated route-evidence digest mismatch")
+        return transition
     except Exception as error:
         if isinstance(error, AdapterError):
             raise
@@ -315,6 +333,7 @@ def _fact(
         value,
         {
             "execution_id",
+            "plan_binding_sha256",
             "role",
             "target",
             "topology",
@@ -347,6 +366,9 @@ def _fact(
     if execution_id in seen:
         raise AdapterError("dispatch execution ID is duplicated")
     seen.add(execution_id)
+    plan_binding_sha256 = _sha(
+        value["plan_binding_sha256"], "dispatch.plan_binding_sha256"
+    )
     _token(value["role"], "dispatch.role")
     _target(value["target"], "dispatch.target")
     topology = _topology(value["topology"], "dispatch.topology")
@@ -382,10 +404,18 @@ def _fact(
         capability["evidence"], "model capability.evidence"
     )
     transition = _authorized_transition(value["model_transition"])
-    if transition["request"]["event"]["payload_sha256"] != value["request"][
+    transition_event = transition["request"]["event"]
+    if transition_event["payload_sha256"] != value["request"][
         "content_sha256"
     ]:
         raise AdapterError("dispatch model transition is bound to another request")
+    if transition_event["task_sha256"] != subject["content_sha256"]:
+        raise AdapterError("dispatch model transition task identity mismatch")
+    if (
+        transition_event["plan_binding_sha256"] != plan_binding_sha256
+        or transition_event["actuation_id"] != execution_id
+    ):
+        raise AdapterError("dispatch model transition plan or actuation mismatch")
     if transition["target"] != value["target"]:
         raise AdapterError("dispatch model transition target mismatch")
     if (
@@ -453,6 +483,10 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
     contexts = [value["isolation"]["context"] for value in facts]
     if len(sessions) != len(set(sessions)) or len(contexts) != len(set(contexts)):
         raise AdapterError("dispatch isolation is not distinct")
+    plan_bindings = {value["plan_binding_sha256"] for value in facts}
+    if len(plan_bindings) != 1:
+        raise AdapterError("dispatch facts do not share one plan binding")
+    plan_binding_sha256 = next(iter(plan_bindings))
 
     files: dict[str, bytes] = {}
     plan_dispatches = []
@@ -490,6 +524,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
                 key: fact[key]
                 for key in (
                     "execution_id",
+                    "plan_binding_sha256",
                     "role",
                     "target",
                     "topology",
@@ -517,6 +552,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
             "schema_version": 1,
             "contract": PLAN_CONTRACT,
             "subject": subject,
+            "plan_binding_sha256": plan_binding_sha256,
             "dispatches": plan_dispatches,
         }
     )

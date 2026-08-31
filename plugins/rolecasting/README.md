@@ -17,10 +17,18 @@ Every payload-bearing new dispatch, follow-up, resume, retry, capacity
 recovery, or reclassification passes one pure model-transition guard. Its
 content-addressed decision carries task identity, the prior judgment floor,
 sticky operator choice, Daybreak requirement, the complete permitted-route
-inventory and metadata-only status preflight, fresh selector and capability
-evidence, separate execution authority, account binding, capacity, and the
-exact selection. Native and portable paths reject missing, denied, stale,
-downgraded, or cross-bound decisions at their payload boundaries.
+inventory and authenticated side-effect-safe status preflight, fresh selector
+and capability evidence, separate execution authority, account binding,
+capacity, immutable plan and actuation identity, and the exact selection.
+Native adapters require an injected authenticated route-evidence verifier, and
+the portable validator binds a route issuer through Task Witness. Neither path
+can issue trustworthy route authority on its own. Consumers reject missing,
+denied, stale, replayed, downgraded, or cross-bound decisions at their payload
+boundaries. Codex app-server 0.149.0 is explicitly ineligible for the standing
+status-only refresh because its rate-limit path may refresh and persist managed
+authentication. This source release registers no production route-evidence
+issuer or verifier and no mandatory actuator hook, so it does not establish a
+runnable alternate-account Daybreak route.
 
 Initial operational support uses separate native-child adapter profiles for
 ChatGPT Codex and Codex CLI/TUI. Both freeze the complete plan and assurance
@@ -68,7 +76,8 @@ Rolecasting's local topology shape, not a repository-wide interchange schema.
 
 Rolecasting's registered owner validator accepts a strict, generic dispatch
 bundle and returns `rolecasting-dispatch-projection-v3`. Its pure renderer
-cannot authenticate a selected executor, and no authenticated owning harness
+cannot authenticate a selected executor or route by itself, and no
+authenticated owning harness
 integration is currently bound into the issuer identity. The registered
 provider therefore declares empty producer and issuer inventories and retains
 only the active validator plus the exact transition guard and renderer modules.
@@ -92,8 +101,8 @@ become canonical publication evidence. The skill-mediated native Codex module
 sequences pre-spawn freeze and post-result same-leader recording, but it is not
 a harness actuator and emits neither portable evidence nor product
 attestation. New publication stays blocked until a real native harness
-integration authenticates execution and its exact owning bytes are bound into
-a newly registered producer/issuer identity.
+integration authenticates both route evidence and execution and its exact
+owning bytes are bound into newly registered authority identities.
 Canonical publication specifically requires a product-attested ChatGPT Codex
 child. Ordinary consumers require controller-observed assurance for every fact
 they rely on. Self-reported dimensions are diagnostic and non-gating; the

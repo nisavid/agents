@@ -14,9 +14,9 @@ import json
 import re
 from typing import Any
 
-
 DECISION_CONTRACT = "rolecasting-model-transition-decision-v1"
 STATE_CONTRACT = "rolecasting-model-transition-state-v1"
+ROUTE_EVIDENCE_CONTRACT = "rolecasting-route-evidence-v1"
 SCHEMA_VERSION = 1
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -46,6 +46,9 @@ _PROVENANCE = {"policy", "fallback", "operator", "inherited-fixed"}
 _CAPACITY = {"available", "exhausted", "unknown"}
 _CAPABILITY_STATUS = {"available", "absent", "probe-failed", "unknown"}
 _INVENTORY_STATUS = {"fresh", "missing", "stale", "denied"}
+_STATUS_SURFACE_SAFETY = {"side-effect-safe", "unverified", "unsafe"}
+_STATE_CHANGE_STATUS = {"unchanged", "unknown", "changed"}
+_KNOWN_UNSAFE_STATUS_SURFACES = {("codex-app-server", "0.149.0")}
 _FAILURE_DISPOSITIONS = {"defer", "cross-harness", "tracker", "blocked"}
 _UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
@@ -132,6 +135,18 @@ def _target(value: Any, label: str) -> dict[str, Any]:
     _token(value["surface"], f"{label}.surface")
     _text(value["version"], f"{label}.version")
     _text(value["executor"], f"{label}.executor")
+    return value
+
+
+def _issuer(value: Any, label: str) -> dict[str, Any]:
+    value = _exact(
+        value,
+        {"issuer_id", "contract", "implementation_sha256"},
+        label,
+    )
+    _token(value["issuer_id"], f"{label}.issuer_id")
+    _token(value["contract"], f"{label}.contract")
+    _sha(value["implementation_sha256"], f"{label}.implementation_sha256")
     return value
 
 
@@ -267,6 +282,8 @@ def _event(value: Any) -> dict[str, Any]:
             "kind",
             "task_sha256",
             "payload_sha256",
+            "plan_binding_sha256",
+            "actuation_id",
             "predecessor_authorization_sha256",
             "operator_action",
         },
@@ -277,6 +294,11 @@ def _event(value: Any) -> dict[str, Any]:
         raise ModelTransitionError("model-transition event.kind is invalid")
     _sha(value["task_sha256"], "model-transition event.task_sha256")
     _sha(value["payload_sha256"], "model-transition event.payload_sha256")
+    _sha(
+        value["plan_binding_sha256"],
+        "model-transition event.plan_binding_sha256",
+    )
+    _token(value["actuation_id"], "model-transition event.actuation_id")
     _nullable_sha(
         value["predecessor_authorization_sha256"],
         "model-transition event.predecessor_authorization_sha256",
@@ -284,6 +306,40 @@ def _event(value: Any) -> dict[str, Any]:
     action = _token(value["operator_action"], "model-transition event.operator_action")
     if action not in _OPERATOR_ACTIONS:
         raise ModelTransitionError("model-transition event.operator_action is invalid")
+    return value
+
+
+def _status_surface(value: Any) -> dict[str, Any]:
+    value = _exact(
+        value,
+        {"implementation", "version", "operations", "safety", "evidence_sha256"},
+        "model-transition status surface",
+    )
+    _token(value["implementation"], "model-transition status surface.implementation")
+    _text(value["version"], "model-transition status surface.version")
+    operations = value["operations"]
+    if not isinstance(operations, list) or not operations:
+        raise ModelTransitionError(
+            "model-transition status surface.operations must be non-empty"
+        )
+    seen: set[str] = set()
+    for index, operation in enumerate(operations):
+        operation = _text(
+            operation,
+            f"model-transition status surface.operations[{index}]",
+        )
+        if operation in seen:
+            raise ModelTransitionError(
+                "model-transition status surface.operations contains a duplicate"
+            )
+        seen.add(operation)
+    safety = _token(value["safety"], "model-transition status surface.safety")
+    if safety not in _STATUS_SURFACE_SAFETY:
+        raise ModelTransitionError("model-transition status surface.safety is invalid")
+    _sha(
+        value["evidence_sha256"],
+        "model-transition status surface.evidence_sha256",
+    )
     return value
 
 
@@ -296,10 +352,12 @@ def _preflight(value: Any) -> dict[str, Any]:
             "inventory_status",
             "selected_route_in_inventory",
             "status_authorization_sha256",
+            "status_surface",
             "status_observed_at",
             "status_evidence_sha256",
             "task_data_shared",
-            "state_changed",
+            "caller_state_mutation_requested",
+            "state_change_status",
         },
         "model-transition route preflight",
     )
@@ -307,7 +365,7 @@ def _preflight(value: Any) -> dict[str, Any]:
         "inventory_complete",
         "selected_route_in_inventory",
         "task_data_shared",
-        "state_changed",
+        "caller_state_mutation_requested",
     ):
         _strict_bool(value[field], f"model-transition route preflight.{field}")
     for field in (
@@ -316,6 +374,7 @@ def _preflight(value: Any) -> dict[str, Any]:
         "status_evidence_sha256",
     ):
         _sha(value[field], f"model-transition route preflight.{field}")
+    _status_surface(value["status_surface"])
     status = _token(
         value["inventory_status"],
         "model-transition route preflight.inventory_status",
@@ -332,6 +391,14 @@ def _preflight(value: Any) -> dict[str, Any]:
         raise ModelTransitionError(
             "model-transition route preflight.status_observed_at is invalid"
         )
+    state_change_status = _token(
+        value["state_change_status"],
+        "model-transition route preflight.state_change_status",
+    )
+    if state_change_status not in _STATE_CHANGE_STATUS:
+        raise ModelTransitionError(
+            "model-transition route preflight.state_change_status is invalid"
+        )
     return value
 
 
@@ -339,12 +406,20 @@ def _route(value: Any) -> dict[str, Any]:
     value = _exact(
         value,
         {
+            "schema_version",
+            "contract",
+            "evidence_issuer",
+            "task_sha256",
+            "payload_sha256",
+            "plan_binding_sha256",
+            "actuation_id",
             "fresh",
             "eligible",
             "capacity",
             "failure_disposition",
             "target",
             "account_binding_sha256",
+            "content_sha256",
             "route_authorization_sha256",
             "selector_sha256",
             "capability_sha256",
@@ -355,6 +430,16 @@ def _route(value: Any) -> dict[str, Any]:
         },
         "model-transition route evidence",
     )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != SCHEMA_VERSION
+        or value["contract"] != ROUTE_EVIDENCE_CONTRACT
+    ):
+        raise ModelTransitionError("model-transition route evidence contract drift")
+    _issuer(value["evidence_issuer"], "model-transition route evidence issuer")
+    for field in ("task_sha256", "payload_sha256", "plan_binding_sha256"):
+        _sha(value[field], f"model-transition route evidence.{field}")
+    _token(value["actuation_id"], "model-transition route evidence.actuation_id")
     _strict_bool(value["fresh"], "model-transition route evidence.fresh")
     _strict_bool(value["eligible"], "model-transition route evidence.eligible")
     _strict_bool(
@@ -384,6 +469,7 @@ def _route(value: Any) -> dict[str, Any]:
     _target(value["target"], "model-transition route evidence.target")
     for field in (
         "account_binding_sha256",
+        "content_sha256",
         "route_authorization_sha256",
         "selector_sha256",
         "capability_sha256",
@@ -391,6 +477,18 @@ def _route(value: Any) -> dict[str, Any]:
         _sha(value[field], f"model-transition route evidence.{field}")
     _selection(value["selection"], "model-transition route evidence.selection")
     return value
+
+
+def route_evidence_sha256(value: Any) -> str:
+    """Return the digest an authenticated route producer must bind."""
+
+    route = _route(value)
+    unsigned = {
+        key: item
+        for key, item in route.items()
+        if key not in {"content_sha256", "route_authorization_sha256"}
+    }
+    return _digest(unsigned)
 
 
 def _state(value: Any) -> dict[str, Any] | None:
@@ -487,6 +585,15 @@ def _deny_reason(
         if event["predecessor_authorization_sha256"] != prior["authorization_sha256"]:
             return "predecessor-transition-mismatch", None
 
+    for field in (
+        "task_sha256",
+        "payload_sha256",
+        "plan_binding_sha256",
+        "actuation_id",
+    ):
+        if route[field] != event[field]:
+            return "route-evidence-binding-mismatch", None
+
     action = event["operator_action"]
     prior_operator = None if prior is None else prior["operator_selection"]
     if action == "preserve":
@@ -518,14 +625,27 @@ def _deny_reason(
             return "reclassification-required", effective_operator
 
     preflight = route["preflight"]
+    surface = preflight["status_surface"]
+    if (surface["implementation"], surface["version"]) in (
+        _KNOWN_UNSAFE_STATUS_SURFACES
+    ):
+        return "route-status-unverified", effective_operator
+    if surface["safety"] in {"unsafe", "unverified"}:
+        return "route-status-unverified", effective_operator
+    if preflight["state_change_status"] == "unknown":
+        return "route-status-unverified", effective_operator
+    if (
+        preflight["task_data_shared"]
+        or preflight["caller_state_mutation_requested"]
+        or preflight["state_change_status"] == "changed"
+    ):
+        return "route-status-refresh-exceeded-authority", effective_operator
+    if preflight["inventory_status"] == "denied":
+        return "route-status-denied", effective_operator
     if not preflight["inventory_complete"]:
         return "route-inventory-incomplete", effective_operator
-    if preflight["task_data_shared"] or preflight["state_changed"]:
-        return "route-status-refresh-exceeded-authority", effective_operator
     if preflight["inventory_status"] in {"missing", "stale"}:
         return "route-status-refresh-required", effective_operator
-    if preflight["inventory_status"] == "denied":
-        return "route-status-refresh-denied", effective_operator
     if not preflight["selected_route_in_inventory"]:
         return "selected-route-is-not-in-inventory", effective_operator
     if not route["fresh"]:
@@ -551,6 +671,12 @@ def _deny_reason(
             return "continuation-account-binding-changed", effective_operator
 
     selected = route["selection"]
+    if selected["role"] == "daybreak" and (
+        selected["model"] != "gpt-daybreak-blue-latest"
+        or selected["reasoning_effort"] != "max"
+        or selected["qualified_classification"] != "security"
+    ):
+        return "daybreak-selector-mismatch", effective_operator
     if _CLASSIFICATION_RANK[selected["qualified_classification"]] < _CLASSIFICATION_RANK[
         scope["classification"]
     ]:
@@ -710,8 +836,10 @@ def validate_authorized_transition(value: Any) -> dict[str, Any]:
 
 __all__ = [
     "DECISION_CONTRACT",
+    "ROUTE_EVIDENCE_CONTRACT",
     "STATE_CONTRACT",
     "ModelTransitionError",
     "authorize_model_transition",
+    "route_evidence_sha256",
     "validate_authorized_transition",
 ]

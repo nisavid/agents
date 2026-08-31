@@ -780,6 +780,10 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         'BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v3"' in source
         and '"assurance_minimum"' in source
         and '"model_transition_sha256"' in source
+        and '"plan_binding_sha256"' in source
+        and '"route_evidence_issuer"' in source
+        and '"route-evidence"' in source
+        and "authorization is duplicated" in source
         and "def _validate_bundle(" in source,
         "dispatch-evidence registered API drift",
     )
@@ -791,6 +795,10 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "def render_dispatch_bundle(",
         "does not launch a worker, choose a model, or authenticate",
         "already-observed",
+        "authenticated route evidence is unavailable",
+        '"plan_binding_sha256"',
+        "model transition task identity mismatch",
+        "model transition plan or actuation mismatch",
     ):
         require(
             term in adapter_words,
@@ -813,6 +821,9 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "Canonical new-publication evidence",
         "`usable: false` is valid evidence",
         "exact `usable` status",
+        "Codex app-server 0.149.0",
+        "authenticated route issuer",
+        "atomically consume",
     ):
         require(
             term in reference_words,
@@ -839,6 +850,10 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "must be frozen before recording",
         "frozen native dispatch is invalid",
         "verified model-transition guard is unavailable before native spawn",
+        "authenticated route evidence is unavailable before native spawn",
+        "model transition task identity mismatch",
+        "model transition plan or actuation mismatch",
+        '"task_sha256"',
         '"model_transition_sha256"',
     ):
         require(term in native_words, f"native Codex binding drift: {term}")
@@ -853,6 +868,8 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "strict Boolean",
         "Requested authority is intent",
         "App-server is an optional later transport",
+        "Codex app-server 0.149.0",
+        "atomically consume",
         "producer and issuer inventories empty",
     ):
         require(
@@ -863,12 +880,21 @@ def validate_task_witness_provider(root: Path) -> set[str]:
     for term in (
         'DECISION_CONTRACT = "rolecasting-model-transition-decision-v1"',
         'STATE_CONTRACT = "rolecasting-model-transition-state-v1"',
+        'ROUTE_EVIDENCE_CONTRACT = "rolecasting-route-evidence-v1"',
         "def authorize_model_transition(",
+        "def route_evidence_sha256(",
         "def validate_authorized_transition(",
         '"capacity-recovery"',
         '"reclassification"',
         '"daybreak"',
         '"operator"',
+        '"codex-app-server", "0.149.0"',
+        '"route-status-unverified"',
+        '"route-status-denied"',
+        '"gpt-daybreak-blue-latest"',
+        '!= "max"',
+        '"plan_binding_sha256"',
+        '"actuation_id"',
     ):
         require(term in transition_source, f"model-transition guard drift: {term}")
     for forbidden in ("subprocess", "socket", "urllib", "requests", "importlib"):

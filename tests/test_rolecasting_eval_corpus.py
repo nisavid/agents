@@ -439,7 +439,51 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "transition-before-actuator",
                 "posthoc-evidence-not-launch-authority",
                 "transition-payload-cross-binding",
+                "complete-permitted-route-inventory",
+                "unsafe-status-surface-fails-closed",
+                "status-is-not-execution-authority",
             }.issubset(expectations)
+        )
+
+    def test_status_preflight_rejects_the_known_stateful_codex_surface(
+        self,
+    ) -> None:
+        choosing = PLUGIN_ROOT / "skills" / "choosing-agent-models"
+        reference = " ".join(
+            (choosing / "references" / "capability-probes-and-fallbacks.md")
+            .read_text()
+            .split()
+        )
+        fixture = " ".join(
+            (
+                choosing
+                / "evals"
+                / "fixtures"
+                / "permitted-account-status-preflight.md"
+            )
+            .read_text()
+            .split()
+        )
+        scenario = next(
+            item
+            for item in self.documents["choosing-agent-models"]["evals"]
+            if item["name"] == "permitted-account-status-preflight"
+        )
+
+        for text in (reference, fixture, scenario["expected_output"]):
+            with self.subTest(source=text[:32]):
+                self.assertIn("Codex app-server 0.149.0", text)
+                self.assertIn("refresh", text)
+                self.assertIn("persist", text)
+        self.assertIn("Do not launch that version", reference)
+        self.assertIn("No supported flag or RPC", reference)
+        self.assertIn(
+            "do not invoke Codex app-server 0.149.0",
+            scenario["expected_output"],
+        )
+        self.assertIn(
+            "do not report Daybreak absent or unavailable",
+            scenario["expected_output"],
         )
 
     def test_transition_scenarios_cover_capacity_operator_and_pre_actuator_gates(

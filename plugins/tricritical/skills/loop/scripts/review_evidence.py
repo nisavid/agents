@@ -145,6 +145,7 @@ def _dispatch(
             "evidence_contract",
             "manifest_sha256",
             "plan_sha256",
+            "plan_binding_sha256",
             "subject",
             "producer",
             "executions",

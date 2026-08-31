@@ -20,9 +20,39 @@ During an already authorized no-task-data refresh, you may inspect route metadat
 
 ## Re-prove Continuation Capability
 
-Initial capability proof does not prove continuation capability. Before sending continuation task data, run a fresh no-task-data refresh against the same private account binding and require the exact selected model to remain exposed on the continuation surface. A task or session ID and its stored provider or model are useful identity facts, but a shared session database is not account-affinity evidence.
+Initial capability proof does not prove continuation capability. Treat every
+follow-up, resume, retry, and capacity recovery as a new transition. Before
+sending task data, run a fresh no-task-data refresh against the same private
+account binding and require the exact selection to remain exposed on the
+continuation surface. A task or session ID and its stored provider or model are
+identity facts, not account-affinity or current-capacity evidence.
 
 Require the continuation actuator to select and observe the same private account binding used for the successful initial dispatch. If it cannot, treat capability as unproven and fail closed without sending the continuation payload. A newly created dedicated task or session still requires the owning workflow's creation authority and a fresh capability proof; it does not make an unrelated task eligible.
+
+## Authorize The Transition
+
+The pure `scripts/model_transition.py` guard accepts the prior accepted state,
+event, current role classification, optional content-addressed operator
+selection, and fresh route evidence. Its route evidence binds eligibility,
+capacity, exact target, account, route authority, selector, capability, and
+selection. The selection records role, exact model and effort or explicit
+inherited-fixed absence, qualified classification, provenance, and operator
+selection identity.
+
+Apply it before every payload-bearing new task, new subagent, follow-up,
+resume, retry, capacity recovery, or reclassification. The actuator validates
+the complete `rolecasting-model-transition-decision-v1`, binds its exact
+payload and authorization identities, and sends nothing on denial. Preserve
+the returned predecessor state for the next event.
+
+Carry the prior judgment floor unless an explicit content-addressed
+reclassification changes it. Security and a prior Daybreak requirement remain
+sticky. For mixed-role work, the declared classification equals the hardest
+role. Preserve an explicit operator selection until an explicit replacement;
+an unavailable operator-selected pair blocks rather than falling through.
+Ordinary eligible fallback may change a non-operator selection only when it
+still satisfies the current floor. Capacity failover never relaxes the floor,
+task identity, target, account binding, or Daybreak requirement.
 
 ## Handle Probe Failure
 
@@ -36,7 +66,15 @@ Use a sufficient native route only when it preserves the original task contract.
 
 Choose the lowest accepted effort that preserves the task's judgment margin. Raise effort before widening scope or changing models when reasoning can resolve the uncertainty.
 
-When Luna fits the task but is absent from the native-subagent schema, use accepted Terra at the lowest safe effort. If explicit selection is unavailable, inherit an appropriate fixed model. Never invent a slug or effort, and report a fallback that materially changes confidence, cost, or speed.
+When Luna fits but is absent from the native schema, an accepted Terra pair may
+be an eligible fallback. If explicit selection is unavailable, use an
+appropriate proven inherited or environment-fixed role only when it preserves
+the floor. Never invent a slug or effort.
+
+Daybreak has no fallback. When policy or the operator requires the exact
+Daybreak route and its fresh capability or capacity proof fails, return the
+chosen no-runnable-route disposition without sending task data. Sol, Terra,
+and Luna are not replacements.
 
 For another harness, inspect its local capability surface and use only its exact supported values. Report an unavailable user-requested model rather than silently substituting.
 

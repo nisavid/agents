@@ -3014,8 +3014,8 @@ def required_review_envelope(candidate, *, producer_id="tricritical-review-loop-
             "selected_specialists": ["security"],
         },
         "final_dispatch": {
-            "contract": "rolecasting-dispatch-projection-v2",
-            "evidence_contract": "rolecasting-dispatch-evidence-v2",
+            "contract": "rolecasting-dispatch-projection-v3",
+            "evidence_contract": "rolecasting-dispatch-evidence-v3",
             "executions": executions,
         },
         "terminal": {

@@ -10,14 +10,15 @@ from typing import Any
 
 from tests.plugins.task_witness_client import test_launcher as task_witness_launcher
 from tests.plugins.task_witness_deployment._support import load_deployment_module
+from tests.plugins import test_rolecasting_model_transition as transition_contract
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v2"
-REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v2"
-ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v2"
-PRODUCER_ID = "rolecasting-bootstrap-dispatch-v2"
-ISSUER_ID = "rolecasting-bootstrap-adapter-v2"
-VALIDATOR_ID = "rolecasting-dispatch-evidence-validator-v2"
+BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v3"
+REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v3"
+ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v3"
+PRODUCER_ID = "rolecasting-bootstrap-dispatch-v3"
+ISSUER_ID = "rolecasting-bootstrap-adapter-v3"
+VALIDATOR_ID = "rolecasting-dispatch-evidence-validator-v3"
 VALIDATOR = (
     REPOSITORY
     / "plugins"
@@ -212,7 +213,9 @@ def load_validator() -> Any:
         raise AssertionError("Rolecasting validator could not be loaded")
     module = importlib.util.module_from_spec(specification)
     module.__dict__["_TASK_WITNESS"] = Witness
-    module.__dict__["_VERIFIED_MODULES"] = {}
+    module.__dict__["_VERIFIED_MODULES"] = {
+        "model-transition": transition_contract.load_module()
+    }
     specification.loader.exec_module(module)
     return module
 
@@ -224,6 +227,9 @@ def load_adapter() -> Any:
     if specification is None or specification.loader is None:
         raise AssertionError("Rolecasting bootstrap adapter could not be loaded")
     module = importlib.util.module_from_spec(specification)
+    module.__dict__["_VERIFIED_MODULES"] = {
+        "model-transition": transition_contract.load_module()
+    }
     specification.loader.exec_module(module)
     return module
 
@@ -311,6 +317,28 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         assurance_minimum = assurance_minimum or {
             field: assurance[field] for field in ASSURANCE_FIELDS
         }
+        model_name = "gpt-5-6-sol"
+        reasoning_effort = "high"
+        capability_evidence = identity("model-catalog", "gpt-5-6-sol-high")
+        transition_event = transition_contract.event(
+            "new-subagent", predecessor=None
+        )
+        transition_event["payload_sha256"] = self.request["content_sha256"]
+        transition_route = transition_contract.route(
+            transition_contract.selection(model=model_name)
+        )
+        transition_route["target"] = target
+        transition_route["capability_sha256"] = capability_evidence[
+            "content_sha256"
+        ]
+        transition = transition_contract.load_module().authorize_model_transition(
+            None,
+            transition_event,
+            transition_contract.scope(),
+            None,
+            transition_route,
+        )
+        transition_raw = canonical_document(transition)
         dispatch = {
             "execution_id": "worker-one",
             "role": "independent-checker",
@@ -323,6 +351,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
             "return_contract": "worker-report-v1",
             "verification_contract": "worker-verification-v1",
             "stop_contract": "worker-stop-v1",
+            "model_transition_sha256": sha(transition_raw),
             "model_sha256": "",
             "authority": self.authority,
             "user_authority": user_authority,
@@ -337,17 +366,18 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         model = signed(
             {
                 "schema_version": 1,
-                "contract": "rolecasting-model-selection-receipt-v2",
+                "contract": "rolecasting-model-selection-receipt-v3",
                 "issuer": self.issuer,
                 "subject": self.subject,
                 "execution_id": "worker-one",
                 "target": target,
-                "model": "gpt-5-6-sol",
-                "reasoning_effort": "high",
+                "model": model_name,
+                "reasoning_effort": reasoning_effort,
                 "capability": {
                     "status": "available",
-                    "evidence": identity("model-catalog", "gpt-5-6-sol-high"),
+                    "evidence": capability_evidence,
                 },
+                "model_transition_sha256": sha(transition_raw),
             }
         )
         model_raw = canonical_document(model)
@@ -355,7 +385,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         plan = signed(
             {
                 "schema_version": 1,
-                "contract": "rolecasting-dispatch-plan-v2",
+                "contract": "rolecasting-dispatch-plan-v3",
                 "subject": self.subject,
                 "dispatches": [dispatch],
             }
@@ -364,13 +394,14 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         result = signed(
             {
                 "schema_version": 1,
-                "contract": "rolecasting-execution-result-receipt-v2",
+                "contract": "rolecasting-execution-result-receipt-v3",
                 "issuer": self.issuer,
                 "subject": self.subject,
                 "execution_id": "worker-one",
                 "plan_sha256": sha(plan_raw),
                 "dispatch_sha256": sha(canonical_value(dispatch)),
                 "model_sha256": sha(model_raw),
+                "model_transition_sha256": sha(transition_raw),
                 "request": self.request,
                 "returned": identity("worker-report-v1", "report-one"),
                 "verification": identity("worker-verification-v1", "verification-one"),
@@ -396,6 +427,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                 "producer": self.producer,
                 "subject": self.subject,
                 "plan_sha256": sha(plan_raw),
+                "transitions": {"worker-one": sha(transition_raw)},
                 "models": {"worker-one": sha(model_raw)},
                 "results": {"worker-one": sha(result_raw)},
             }
@@ -404,13 +436,14 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         files = {
             "manifest.json": manifest_raw,
             "plan.json": plan_raw,
+            "transition-worker-one.json": transition_raw,
             "model-worker-one.json": model_raw,
             "result-worker-one.json": result_raw,
         }
         expected = signed(
             {
                 "schema_version": 1,
-                "contract": "rolecasting-dispatch-projection-v2",
+                "contract": "rolecasting-dispatch-projection-v3",
                 "evidence_contract": BUNDLE_CONTRACT,
                 "manifest_sha256": sha(manifest_raw),
                 "plan_sha256": sha(plan_raw),
@@ -428,13 +461,21 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                         "return_contract": "worker-report-v1",
                         "verification_contract": "worker-verification-v1",
                         "stop_contract": "worker-stop-v1",
+                        "model_transition_sha256": sha(transition_raw),
+                        "model_transition_authorization_sha256": transition[
+                            "authorization_sha256"
+                        ],
+                        "model_transition_event": "new-subagent",
+                        "model_transition_task_sha256": transition_event[
+                            "task_sha256"
+                        ],
                         "authority": self.authority,
                         "user_authority": user_authority,
                         "isolation": dispatch["isolation"],
                         "assurance": assurance,
                         "assurance_minimum": assurance_minimum,
-                        "model": "gpt-5-6-sol",
-                        "reasoning_effort": "high",
+                        "model": model_name,
+                        "reasoning_effort": reasoning_effort,
                         "dispatch_sha256": sha(canonical_value(dispatch)),
                         "model_sha256": sha(model_raw),
                         "result_sha256": sha(result_raw),
@@ -464,6 +505,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
 
     def adapter_request(self, bundle: Bundle) -> dict[str, Any]:
         plan = self.decoded(bundle, "plan.json")
+        transition = self.decoded(bundle, "transition-worker-one.json")
         model = self.decoded(bundle, "model-worker-one.json")
         result = self.decoded(bundle, "result-worker-one.json")
         dispatch = plan["dispatches"][0]
@@ -498,6 +540,7 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                         "model": model["model"],
                         "reasoning_effort": model["reasoning_effort"],
                         "model_capability": model["capability"],
+                        "model_transition": transition,
                         "returned": result["returned"],
                         "verification": result["verification"],
                         "stop": result["stop"],
@@ -510,9 +553,13 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         )
 
     def relink(self, bundle: Bundle) -> None:
+        transition_raw = bundle.files["transition-worker-one.json"]
         model = self.resign(self.decoded(bundle, "model-worker-one.json"))
+        model["model_transition_sha256"] = sha(transition_raw)
+        model = self.resign(model)
         model_raw = canonical_document(model)
         plan = self.decoded(bundle, "plan.json")
+        plan["dispatches"][0]["model_transition_sha256"] = sha(transition_raw)
         plan["dispatches"][0]["model_sha256"] = sha(model_raw)
         plan = self.resign(plan)
         plan_raw = canonical_document(plan)
@@ -520,10 +567,12 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
         result["plan_sha256"] = sha(plan_raw)
         result["dispatch_sha256"] = sha(canonical_value(plan["dispatches"][0]))
         result["model_sha256"] = sha(model_raw)
+        result["model_transition_sha256"] = sha(transition_raw)
         result = self.resign(result)
         result_raw = canonical_document(result)
         manifest = self.decoded(bundle, "manifest.json")
         manifest["plan_sha256"] = sha(plan_raw)
+        manifest["transitions"] = {"worker-one": sha(transition_raw)}
         manifest["models"] = {"worker-one": sha(model_raw)}
         manifest["results"] = {"worker-one": sha(result_raw)}
         manifest = self.resign(manifest)
@@ -749,6 +798,34 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                     adapter.AdapterError, "bound to this bootstrap adapter"
                 ):
                     adapter.render_dispatch_bundle(changed)
+
+    def test_transition_is_required_and_tampering_remains_rejected_after_relink(
+        self,
+    ) -> None:
+        bundle, _ = self.make_bundle()
+        del bundle.files["transition-worker-one.json"]
+        self.assert_bundle_rejected(bundle, "model transition.*absent")
+
+        bundle, _ = self.make_bundle()
+        transition = self.decoded(bundle, "transition-worker-one.json")
+        transition["request"]["route_evidence"]["selection"]["model"] = (
+            "gpt-5.6-terra"
+        )
+        bundle.files["transition-worker-one.json"] = canonical_document(
+            self.resign(transition)
+        )
+        self.relink(bundle)
+        self.assert_bundle_rejected(bundle, "model transition is not authorized")
+
+        adapter = load_adapter()
+        adapter_sha = sha(ADAPTER.read_bytes())
+        self.producer["implementation_sha256"] = adapter_sha
+        self.issuer["implementation_sha256"] = adapter_sha
+        bundle, _ = self.make_bundle()
+        request = self.adapter_request(bundle)
+        request["dispatches"][0]["model"] = "gpt-5.6-terra"
+        with self.assertRaisesRegex(adapter.AdapterError, "selection mismatch"):
+            adapter.render_dispatch_bundle(self.resign(request))
 
     def test_target_family_surface_pair_is_closed(self) -> None:
         cases = (
@@ -1017,11 +1094,18 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
             target.chmod(0o600)
         task_witness.validator.write_bytes(VALIDATOR.read_bytes())
         task_witness.validator.chmod(0o600)
+        transition_validator = task_witness.root / "model_transition.py"
+        transition_validator.write_bytes(transition_contract.MODULE_PATH.read_bytes())
+        transition_validator.chmod(0o600)
         validator_sha = sha(task_witness.validator.read_bytes())
+        transition_validator_sha = sha(transition_validator.read_bytes())
         validator_implementation = task_witness_launcher.validator_identity(
             BUNDLE_CONTRACT,
             VALIDATOR_ID,
-            [(VALIDATOR_ID, validator_sha)],
+            [
+                (VALIDATOR_ID, validator_sha),
+                ("model-transition", transition_validator_sha),
+            ],
         )
         publication_blocked = {
             "state": "active",
@@ -1062,7 +1146,12 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
                                 "name": VALIDATOR_ID,
                                 "path": str(task_witness.validator),
                                 "sha256": validator_sha,
-                            }
+                            },
+                            {
+                                "name": "model-transition",
+                                "path": str(transition_validator),
+                                "sha256": transition_validator_sha,
+                            },
                         ],
                         **validator_lifecycle,
                     }

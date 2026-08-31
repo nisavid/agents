@@ -33,6 +33,7 @@ SOURCE_PATHS = (
 )
 V4_FIXTURE_PATH = REPO_ROOT / "tests/fixtures/phase7-v4-compatibility.json"
 V5_FIXTURE_PATH = REPO_ROOT / "tests/fixtures/phase7-v5-compatibility.json"
+V6_FIXTURE_PATH = REPO_ROOT / "tests/fixtures/phase7-v6-compatibility.json"
 SCRIPT_PATH = REPO_ROOT / "scripts/phase7_compatibility_projection.py"
 
 
@@ -55,10 +56,10 @@ class Phase7CompatibilityProjectionTests(unittest.TestCase):
             json.dumps(document, indent=2) + "\n", encoding="utf-8"
         )
 
-    def test_projection_is_byte_identical_to_frozen_v5_fixture(self) -> None:
+    def test_projection_is_byte_identical_to_frozen_v6_fixture(self) -> None:
         self.assertEqual(
             projection.compatibility_bytes(REPO_ROOT),
-            V5_FIXTURE_PATH.read_bytes(),
+            V6_FIXTURE_PATH.read_bytes(),
         )
 
     def test_retained_v4_fixture_is_immutable_historical_evidence(self) -> None:
@@ -67,10 +68,18 @@ class Phase7CompatibilityProjectionTests(unittest.TestCase):
             "sha256:a62f152451781b7018180cb4e5ae0bb13071f3dd1364d4a93dbadbe2bb985f58",
         )
 
-    def test_v5_exposes_assurance_and_validator_only_provider_authority(self) -> None:
+    def test_retained_v5_fixture_is_immutable_historical_evidence(self) -> None:
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(V5_FIXTURE_PATH.read_bytes()).hexdigest(),
+            "sha256:d179ff3fa4d93eb5fdf9c4be0619dd95ebeaeaff38570f858d365bfe5d3b8067",
+        )
+
+    def test_v6_exposes_transition_guard_and_validator_only_provider_authority(
+        self,
+    ) -> None:
         document = projection.compatibility_document(REPO_ROOT)
 
-        self.assertEqual(document["schema_version"], 5)
+        self.assertEqual(document["schema_version"], 6)
         self.assertEqual(
             document["rolecasting"]["assurance_contract"],
             {
@@ -99,7 +108,11 @@ class Phase7CompatibilityProjectionTests(unittest.TestCase):
         self.assertEqual(rolecasting_provider["issuers"], [])
         self.assertEqual(
             rolecasting_provider["validators"][0]["contract"],
-            "rolecasting-dispatch-evidence-v2",
+            "rolecasting-dispatch-evidence-v3",
+        )
+        self.assertEqual(
+            [module["name"] for module in rolecasting_provider["validators"][0]["modules"]],
+            ["validator", "model-transition", "adapter"],
         )
         tricritical_provider = document["tricritical"]["task_witness_provider"]
         self.assertEqual(tricritical_provider["producers"], [])
@@ -129,7 +142,7 @@ class Phase7CompatibilityProjectionTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, V5_FIXTURE_PATH.read_bytes())
+        self.assertEqual(result.stdout, V6_FIXTURE_PATH.read_bytes())
         self.assertEqual(result.stderr, b"")
 
     def test_isolated_cli_fails_closed_when_a_source_is_absent(self) -> None:

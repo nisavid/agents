@@ -1385,8 +1385,8 @@ def _validate_dispatch(
     if not isinstance(value, dict):
         raise PublicationError("Rolecasting publication dispatch is unavailable")
     if (
-        value.get("contract") != "rolecasting-dispatch-projection-v2"
-        or value.get("evidence_contract") != "rolecasting-dispatch-evidence-v2"
+        value.get("contract") != "rolecasting-dispatch-projection-v3"
+        or value.get("evidence_contract") != "rolecasting-dispatch-evidence-v3"
     ):
         raise PublicationError("Rolecasting publication dispatch contract drift")
     executions = value.get("executions")

@@ -3781,6 +3781,10 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             "tests/fixtures/phase7-v5-compatibility.json",
             self.module.COMMON_SUPPORT_PATHS,
         )
+        self.assertIn(
+            "tests/fixtures/phase7-v6-compatibility.json",
+            self.module.COMMON_SUPPORT_PATHS,
+        )
 
     def test_cli_refuses_routing_evidence_in_source_stage(self) -> None:
         evidence_root = Path(self.temporary_directory.name) / "routing-evidence"

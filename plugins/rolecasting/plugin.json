@@ -16,14 +16,14 @@
       "interface": {
         "displayName": "Rolecasting",
         "shortDescription": "Choose agent roles, models, and delegation topology.",
-        "longDescription": "Rolecasting keeps consequential decisions with the leader, delegates bounded work, and selects an available model suitable for each settled role.",
+        "longDescription": "Rolecasting keeps consequential decisions with the leader, delegates bounded work, and reauthorizes an eligible model route before every payload-bearing transition.",
         "developerName": "Ivan D Vasin",
         "category": "Developer Tools",
         "capabilities": ["Orchestration"],
         "websiteURL": "https://github.com/nisavid/agents/tree/main/plugins/rolecasting",
         "defaultPrompt": [
-          "Use $rolecasting:delegating-cross-agent-work to choose a worker topology and hand off this bounded task.",
-          "Use $rolecasting:choosing-agent-models to select the model and reasoning effort for this delegated task."
+          "Use $rolecasting:delegating-cross-agent-work to freeze topology and enforce the transition gate for this bounded dispatch.",
+          "Use $rolecasting:choosing-agent-models to authorize the model transition before this task payload is dispatched."
         ]
       }
     }

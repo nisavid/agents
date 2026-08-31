@@ -22,8 +22,8 @@ REVISION_CONTRACT = "tricritical-revision-v1"
 MUTATION_AUTHORITY_CONTRACT = "tricritical-mutation-authority-v1"
 OPERATOR_CHOICE_CONTRACT = "tricritical-operator-choice-v1"
 EXTENSION_ELIGIBILITY_CONTRACT = "tricritical-extension-eligibility-v1"
-ROLECASTING_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v2"
-ROLECASTING_PROJECTION_CONTRACT = "rolecasting-dispatch-projection-v2"
+ROLECASTING_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v3"
+ROLECASTING_PROJECTION_CONTRACT = "rolecasting-dispatch-projection-v3"
 
 TERMINALS = {
     "clean",

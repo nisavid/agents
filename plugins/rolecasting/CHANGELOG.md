@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Authorize every payload-bearing lifecycle event through one pure,
+  content-addressed model-transition guard. Preserve task and account affinity,
+  judgment floors, explicit operator selections, security and Daybreak
+  requirements, and reject stale, ineligible, capacity-failed, downgraded, or
+  tampered transitions before native spawn.
+- Bind the same transition identity through dispatch-evidence v3 plans, model
+  receipts, result receipts, manifests, and canonical projections. Retain the
+  truthful validator-only provider boundary; repository code still cannot
+  attest the effective product model or make harness integration mandatory.
 - Re-prove the original account binding before every task continuation, bind
   alternate-account Codex CLI resumes with explicit `CODEX_HOME`, and reject
   ambient resumes before sending task data when account affinity is unproven.

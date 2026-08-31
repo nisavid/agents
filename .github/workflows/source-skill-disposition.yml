@@ -27,11 +27,20 @@ jobs:
           python-version: "3.13"
 
       - name: Install validation dependencies
-        run: python -m pip install jsonschema==4.26.0 PyYAML==6.0.3
+        run: python -m pip install jsonschema==4.26.0 PyYAML==6.0.3 uv==0.12.5
 
-      - name: Validate source-skill disposition and Rolecasting
+      - name: Validate source-skill disposition and affected closure
         run: |
           python -m unittest tests.test_validate_source_skill_disposition
           python scripts/validate_source_skill_disposition.py .
+          python -m unittest tests.plugins.test_rolecasting_model_transition tests.plugins.test_rolecasting_native_codex tests.plugins.test_rolecasting_dispatch_evidence
           python -m unittest tests.test_validate_rolecasting tests.test_rolecasting_eval_corpus
           python scripts/validate_rolecasting.py .
+          python -m unittest tests.plugins.test_tricritical_review_evidence tests.test_validate_tricritical tests.test_tricritical_eval_corpus
+          python scripts/validate_tricritical.py .
+          python -m unittest discover -s tests/plugins/mergecraft/publishing-reviewable-prs -p 'test_publish_reviewable_pr.py'
+          python -m unittest tests.test_validate_mergecraft
+          python scripts/validate_mergecraft.py . --source-stage
+          python -m unittest tests.test_validate_artifact_customs tests.test_artifact_customs_eval_corpus tests.test_artifact_customs_behavior_eval
+          python scripts/validate_artifact_customs.py . --source-stage
+          python -m unittest tests.test_phase7_compatibility_projection

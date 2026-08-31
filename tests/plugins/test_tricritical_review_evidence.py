@@ -633,14 +633,14 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
         projection = signed(
             {
                 "schema_version": 1,
-                "contract": "rolecasting-dispatch-projection-v2",
-                "evidence_contract": "rolecasting-dispatch-evidence-v2",
+                "contract": "rolecasting-dispatch-projection-v3",
+                "evidence_contract": "rolecasting-dispatch-evidence-v3",
                 "manifest_sha256": "3" * 64,
                 "plan_sha256": "4" * 64,
                 "subject": subject,
                 "producer": {
-                    "producer_id": "rolecasting-bootstrap-dispatch-v2",
-                    "contract": "rolecasting-dispatch-evidence-v2",
+                    "producer_id": "rolecasting-bootstrap-dispatch-v3",
+                    "contract": "rolecasting-dispatch-evidence-v3",
                     "implementation_sha256": "5" * 64,
                 },
                 "executions": executions,
@@ -653,12 +653,12 @@ class TricriticalReviewEvidenceTests(unittest.TestCase):
             "producer": {
                 **projection["producer"],
                 "validator_id": "rolecasting-dispatch-evidence-validator-v2",
-                "validator_contract": "rolecasting-dispatch-evidence-v2",
+                "validator_contract": "rolecasting-dispatch-evidence-v3",
                 "validator_implementation_sha256": "6" * 64,
             },
             "validator": {
                 "validator_id": "rolecasting-dispatch-evidence-validator-v2",
-                "contract": "rolecasting-dispatch-evidence-v2",
+                "contract": "rolecasting-dispatch-evidence-v3",
                 "implementation_sha256": "6" * 64,
             },
             "projection": projection,

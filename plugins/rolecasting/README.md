@@ -13,6 +13,14 @@ self-reported assurance for each evidence dimension. Model choice remains
 separate. A transport never determines the
 relationship, and a user-owned peer requires explicit user consent.
 
+Every payload-bearing new dispatch, follow-up, resume, retry, capacity
+recovery, or reclassification passes one pure model-transition guard. Its
+content-addressed decision carries task identity, the prior judgment floor,
+sticky operator choice, Daybreak requirement, fresh selector and capability
+evidence, account binding, capacity, and the exact selection. Native and
+portable paths reject missing, denied, stale, downgraded, or cross-bound
+decisions at their payload boundaries.
+
 Initial operational support uses separate native-child adapter profiles for
 ChatGPT Codex and Codex CLI/TUI. Both freeze the complete plan and assurance
 minima before native spawn and bind same-leader launch, status, and result
@@ -58,11 +66,12 @@ stays inside the package. The `schema_version` in `topology.json` versions
 Rolecasting's local topology shape, not a repository-wide interchange schema.
 
 Rolecasting's registered owner validator accepts a strict, generic dispatch
-bundle and returns `rolecasting-dispatch-projection-v2`. Its pure renderer
+bundle and returns `rolecasting-dispatch-projection-v3`. Its pure renderer
 cannot authenticate a selected executor, and no authenticated owning harness
 integration is currently bound into the issuer identity. The registered
 provider therefore declares empty producer and issuer inventories and retains
-only the active validator plus its exact renderer module. Task Witness remains
+only the active validator plus the exact transition guard and renderer modules.
+Task Witness remains
 the only front door, and current publication attempts fail closed:
 
 ```text
@@ -74,7 +83,7 @@ The owner interface is documented in the delegating skill's
 path CLI and does not interpret review or publication semantics. Its separate
 native adapter deterministically freezes supplied, already-observed execution
 facts; it does not launch workers or claim to authenticate observations the
-harness has not supplied. Its `rolecasting-bootstrap-adapter-v2` issuer contract
+harness has not supplied. Its `rolecasting-bootstrap-adapter-v3` issuer contract
 is independent of the dispatch-evidence bundle contract. Private tests may
 construct test-owned bootstrap trust to exercise historical validation, but no
 Rolecasting historical trust has been installed and those results cannot
@@ -104,6 +113,7 @@ uv run --with PyYAML python -m unittest tests/test_validate_rolecasting.py
 python3 -m unittest tests/test_rolecasting_eval_corpus.py
 python3 -m unittest tests/plugins/test_rolecasting_dispatch_evidence.py
 python3 -m unittest tests/plugins/test_rolecasting_native_codex.py
+python3 -m unittest tests/plugins/test_rolecasting_model_transition.py
 ```
 
 The validator rejects Agent Plugins schema drift, duplicate keys and non-finite

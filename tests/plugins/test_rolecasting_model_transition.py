@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -569,6 +570,26 @@ class ModelTransitionGuardTests(unittest.TestCase):
                 None,
                 route(selection()),
             )
+
+    def test_decision_validation_uses_canonical_json_equality(self) -> None:
+        guard = load_module()
+        decision = initial_decision(guard)
+
+        for field_path in (("schema_version",), ("next_state", "sequence")):
+            with self.subTest(field_path=field_path):
+                mutated = copy.deepcopy(decision)
+                target = mutated
+                for field in field_path[:-1]:
+                    target = target[field]
+                target[field_path[-1]] = True
+
+                self.assertEqual(mutated, decision)
+                self.assertNotEqual(canonical(mutated), canonical(decision))
+                with self.assertRaisesRegex(
+                    guard.ModelTransitionError,
+                    "decision content mismatch",
+                ):
+                    guard.validate_authorized_transition(mutated)
 
 
 if __name__ == "__main__":

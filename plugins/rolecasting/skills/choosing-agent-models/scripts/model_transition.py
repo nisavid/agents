@@ -592,11 +592,11 @@ def validate_authorized_transition(value: Any) -> dict[str, Any]:
         request["operator_selection"],
         request["route_evidence"],
     )
-    if value != recomputed:
+    if _canonical(value) != _canonical(recomputed):
         raise ModelTransitionError("model-transition decision content mismatch")
-    if value["authorization"]["status"] != "authorized":
+    if recomputed["authorization"]["status"] != "authorized":
         raise ModelTransitionError("model transition is not authorized")
-    return value
+    return recomputed
 
 
 __all__ = [

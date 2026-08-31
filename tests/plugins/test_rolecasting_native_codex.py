@@ -187,7 +187,7 @@ class NativeCodexBindingTests(unittest.TestCase):
         )
         self.assertEqual(
             denied["model_transition"]["authorization"]["reason"],
-            "route-capacity-unavailable",
+            "route-capacity-exhausted",
         )
         with self.assertRaisesRegex(
             native.NativeDispatchError,
@@ -202,6 +202,37 @@ class NativeCodexBindingTests(unittest.TestCase):
             "bound to another request",
         ):
             native.freeze_native_dispatch(cross_bound)
+
+    def test_first_dispatch_rejects_unfinished_route_preflight(self) -> None:
+        native = load_module()
+        requested = intent()
+        transition_event = transition_contract.event(
+            "new-subagent", predecessor=None
+        )
+        transition_event["payload_sha256"] = requested["request_sha256"]
+        unfinished = transition_contract.preflight_route(
+            transition_contract.selection(),
+            inventory_status="stale",
+        )
+        requested["model_transition"] = (
+            transition_contract.load_module().authorize_model_transition(
+                None,
+                transition_event,
+                transition_contract.scope(),
+                None,
+                unfinished,
+            )
+        )
+
+        self.assertEqual(
+            requested["model_transition"]["authorization"]["reason"],
+            "route-status-refresh-required",
+        )
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "model transition is not authorized",
+        ):
+            native.freeze_native_dispatch(requested)
 
     def test_native_binding_rejects_user_task_transition(self) -> None:
         native = load_module()

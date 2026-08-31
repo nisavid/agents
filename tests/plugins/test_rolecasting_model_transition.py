@@ -88,8 +88,56 @@ def route(selected: dict[str, Any]) -> dict[str, Any]:
         "route_authorization_sha256": sha("authorized route"),
         "selector_sha256": sha("fresh target selector"),
         "capability_sha256": sha("fresh exact capability"),
+        "capability_status": "available",
+        "execution_authorized": True,
+        "preflight": {
+            "inventory_complete": True,
+            "inventory_sha256": sha("redacted complete permitted route inventory"),
+            "inventory_status": "fresh",
+            "selected_route_in_inventory": True,
+            "status_authorization_sha256": sha(
+                "authorized metadata-only status refresh"
+            ),
+            "status_observed_at": "2026-08-31T18:50:00Z",
+            "status_evidence_sha256": sha("timestamped redacted route status"),
+            "task_data_shared": False,
+            "state_changed": False,
+        },
         "selection": selected,
     }
+
+
+def preflight_route(
+    selected: dict[str, Any],
+    *,
+    inventory_complete: bool = True,
+    inventory_status: str = "fresh",
+    selected_route_in_inventory: bool = True,
+    capability_status: str = "available",
+    execution_authorized: bool = True,
+    capacity: str = "available",
+) -> dict[str, Any]:
+    value = route(selected)
+    value["preflight"] = {
+        "inventory_complete": inventory_complete,
+        "inventory_sha256": sha(
+            "redacted ambient route plus permitted alternate routes"
+        ),
+        "inventory_status": inventory_status,
+        "selected_route_in_inventory": selected_route_in_inventory,
+        "status_authorization_sha256": sha(
+            "authorized metadata-only status refresh"
+        ),
+        "status_observed_at": "2026-08-31T18:50:00Z",
+        "status_evidence_sha256": sha("timestamped redacted route status"),
+        "task_data_shared": False,
+        "state_changed": False,
+    }
+    value["capability_status"] = capability_status
+    value["execution_authorized"] = execution_authorized
+    value["capacity"] = capacity
+    value["fresh"] = inventory_status == "fresh"
+    return value
 
 
 def event(
@@ -178,6 +226,198 @@ class ModelTransitionGuardTests(unittest.TestCase):
                 self.assertEqual(
                     guard.validate_authorized_transition(decision), decision
                 )
+
+    def test_permitted_route_preflight_distinguishes_status_execution_and_availability(
+        self,
+    ) -> None:
+        guard = load_module()
+        daybreak = selection(
+            "daybreak",
+            "gpt-daybreak-blue-latest",
+            "security",
+        )
+        alternate = preflight_route(daybreak)
+        alternate["account_binding_sha256"] = sha("permitted alternate account")
+        alternate["route_authorization_sha256"] = sha(
+            "alternate account execution authorization"
+        )
+
+        authorized = guard.authorize_model_transition(
+            None,
+            event("new-subagent", predecessor=None),
+            scope("security"),
+            None,
+            alternate,
+        )
+        self.assertEqual(authorized["authorization"]["status"], "authorized")
+        self.assertEqual(
+            authorized["next_state"]["account_binding_sha256"],
+            sha("permitted alternate account"),
+        )
+
+        cases = (
+            (
+                "incomplete-inventory",
+                {"inventory_complete": False},
+                {},
+                "route-inventory-incomplete",
+            ),
+            (
+                "missing-status",
+                {"inventory_status": "missing"},
+                {},
+                "route-status-refresh-required",
+            ),
+            (
+                "stale-status",
+                {"inventory_status": "stale"},
+                {},
+                "route-status-refresh-required",
+            ),
+            (
+                "status-denied",
+                {"inventory_status": "denied"},
+                {},
+                "route-status-refresh-denied",
+            ),
+            (
+                "route-not-in-inventory",
+                {"selected_route_in_inventory": False},
+                {},
+                "selected-route-is-not-in-inventory",
+            ),
+            (
+                "execution-unauthorized",
+                {},
+                {"execution_authorized": False},
+                "route-execution-unauthorized",
+            ),
+            (
+                "probe-failed",
+                {},
+                {"capability_status": "probe-failed"},
+                "route-capability-probe-failed",
+            ),
+            (
+                "model-availability-unknown",
+                {},
+                {"capability_status": "unknown"},
+                "route-model-availability-unproven",
+            ),
+            (
+                "model-absent",
+                {},
+                {"capability_status": "absent"},
+                "route-model-absent",
+            ),
+            (
+                "capacity-exhausted",
+                {},
+                {"capacity": "exhausted"},
+                "route-capacity-exhausted",
+            ),
+            (
+                "capacity-unknown",
+                {},
+                {"capacity": "unknown"},
+                "route-capacity-unknown",
+            ),
+        )
+        for name, preflight_changes, route_changes, reason in cases:
+            with self.subTest(name=name):
+                candidate = preflight_route(daybreak, **route_changes)
+                candidate["preflight"].update(preflight_changes)
+                candidate["fresh"] = (
+                    candidate["preflight"]["inventory_status"] == "fresh"
+                )
+                decision = guard.authorize_model_transition(
+                    None,
+                    event("new-subagent", predecessor=None),
+                    scope("security"),
+                    None,
+                    candidate,
+                )
+                self.assertEqual(decision["authorization"]["status"], "denied")
+                self.assertEqual(decision["authorization"]["reason"], reason)
+
+        for field in ("task_data_shared", "state_changed"):
+            with self.subTest(status_authority_violation=field):
+                candidate = preflight_route(daybreak)
+                candidate["preflight"][field] = True
+                decision = guard.authorize_model_transition(
+                    None,
+                    event("new-subagent", predecessor=None),
+                    scope("security"),
+                    None,
+                    candidate,
+                )
+                self.assertEqual(
+                    decision["authorization"]["reason"],
+                    "route-status-refresh-exceeded-authority",
+                )
+
+    def test_route_preflight_schema_and_scalar_types_are_closed(self) -> None:
+        guard = load_module()
+        mutations = (
+            (
+                "missing-field",
+                lambda value: value["preflight"].pop("inventory_sha256"),
+                "route preflight schema drift",
+            ),
+            (
+                "extra-field",
+                lambda value: value["preflight"].update(extra=True),
+                "route preflight schema drift",
+            ),
+            (
+                "boolean-alias",
+                lambda value: value["preflight"].update(inventory_complete=1),
+                "must be a strict Boolean",
+            ),
+            (
+                "invalid-status",
+                lambda value: value["preflight"].update(
+                    inventory_status="unavailable"
+                ),
+                "inventory_status is invalid",
+            ),
+            (
+                "invalid-timestamp",
+                lambda value: value["preflight"].update(
+                    status_observed_at="yesterday"
+                ),
+                "status_observed_at is invalid",
+            ),
+            (
+                "invalid-status-digest",
+                lambda value: value["preflight"].update(
+                    status_evidence_sha256="redacted"
+                ),
+                "must be a SHA-256 digest",
+            ),
+            (
+                "invalid-capability-status",
+                lambda value: value.update(capability_status="unavailable"),
+                "capability_status is invalid",
+            ),
+            (
+                "execution-boolean-alias",
+                lambda value: value.update(execution_authorized=1),
+                "must be a strict Boolean",
+            ),
+        )
+        for name, mutate, message in mutations:
+            with self.subTest(name=name):
+                candidate = route(selection())
+                mutate(candidate)
+                with self.assertRaisesRegex(guard.ModelTransitionError, message):
+                    guard.authorize_model_transition(
+                        None,
+                        event("new-subagent", predecessor=None),
+                        scope(),
+                        None,
+                        candidate,
+                    )
 
     def test_capacity_recovery_rejects_terra_and_luna_below_carried_sol_floor(
         self,
@@ -277,8 +517,8 @@ class ModelTransitionGuardTests(unittest.TestCase):
         cases = (
             ("fresh", False, "route-evidence-is-stale"),
             ("eligible", False, "route-is-ineligible"),
-            ("capacity", "exhausted", "route-capacity-unavailable"),
-            ("capacity", "unknown", "route-capacity-unavailable"),
+            ("capacity", "exhausted", "route-capacity-exhausted"),
+            ("capacity", "unknown", "route-capacity-unknown"),
         )
         for field, value, reason in cases:
             with self.subTest(field=field, value=value):
@@ -549,7 +789,7 @@ class ModelTransitionGuardTests(unittest.TestCase):
             no_capacity,
         )
         self.assertEqual(
-            denied["authorization"]["reason"], "route-capacity-unavailable"
+            denied["authorization"]["reason"], "route-capacity-exhausted"
         )
 
     def test_continuation_preserves_target_account_and_predecessor_identity(self) -> None:

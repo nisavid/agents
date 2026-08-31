@@ -16,10 +16,11 @@ relationship, and a user-owned peer requires explicit user consent.
 Every payload-bearing new dispatch, follow-up, resume, retry, capacity
 recovery, or reclassification passes one pure model-transition guard. Its
 content-addressed decision carries task identity, the prior judgment floor,
-sticky operator choice, Daybreak requirement, fresh selector and capability
-evidence, account binding, capacity, and the exact selection. Native and
-portable paths reject missing, denied, stale, downgraded, or cross-bound
-decisions at their payload boundaries.
+sticky operator choice, Daybreak requirement, the complete permitted-route
+inventory and metadata-only status preflight, fresh selector and capability
+evidence, separate execution authority, account binding, capacity, and the
+exact selection. Native and portable paths reject missing, denied, stale,
+downgraded, or cross-bound decisions at their payload boundaries.
 
 Initial operational support uses separate native-child adapter profiles for
 ChatGPT Codex and Codex CLI/TUI. Both freeze the complete plan and assurance

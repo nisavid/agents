@@ -44,7 +44,10 @@ _ROLE_CLASSIFICATION_CEILING = {
 _ROLES = {"luna", "terra", "sol", "daybreak", "inherited-fixed", "other"}
 _PROVENANCE = {"policy", "fallback", "operator", "inherited-fixed"}
 _CAPACITY = {"available", "exhausted", "unknown"}
+_CAPABILITY_STATUS = {"available", "absent", "probe-failed", "unknown"}
+_INVENTORY_STATUS = {"fresh", "missing", "stale", "denied"}
 _FAILURE_DISPOSITIONS = {"defer", "cross-harness", "tracker", "blocked"}
+_UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
 
 class ModelTransitionError(ValueError):
@@ -284,6 +287,54 @@ def _event(value: Any) -> dict[str, Any]:
     return value
 
 
+def _preflight(value: Any) -> dict[str, Any]:
+    value = _exact(
+        value,
+        {
+            "inventory_complete",
+            "inventory_sha256",
+            "inventory_status",
+            "selected_route_in_inventory",
+            "status_authorization_sha256",
+            "status_observed_at",
+            "status_evidence_sha256",
+            "task_data_shared",
+            "state_changed",
+        },
+        "model-transition route preflight",
+    )
+    for field in (
+        "inventory_complete",
+        "selected_route_in_inventory",
+        "task_data_shared",
+        "state_changed",
+    ):
+        _strict_bool(value[field], f"model-transition route preflight.{field}")
+    for field in (
+        "inventory_sha256",
+        "status_authorization_sha256",
+        "status_evidence_sha256",
+    ):
+        _sha(value[field], f"model-transition route preflight.{field}")
+    status = _token(
+        value["inventory_status"],
+        "model-transition route preflight.inventory_status",
+    )
+    if status not in _INVENTORY_STATUS:
+        raise ModelTransitionError(
+            "model-transition route preflight.inventory_status is invalid"
+        )
+    observed_at = _text(
+        value["status_observed_at"],
+        "model-transition route preflight.status_observed_at",
+    )
+    if _UTC_TIMESTAMP.fullmatch(observed_at) is None:
+        raise ModelTransitionError(
+            "model-transition route preflight.status_observed_at is invalid"
+        )
+    return value
+
+
 def _route(value: Any) -> dict[str, Any]:
     value = _exact(
         value,
@@ -297,12 +348,19 @@ def _route(value: Any) -> dict[str, Any]:
             "route_authorization_sha256",
             "selector_sha256",
             "capability_sha256",
+            "capability_status",
+            "execution_authorized",
+            "preflight",
             "selection",
         },
         "model-transition route evidence",
     )
     _strict_bool(value["fresh"], "model-transition route evidence.fresh")
     _strict_bool(value["eligible"], "model-transition route evidence.eligible")
+    _strict_bool(
+        value["execution_authorized"],
+        "model-transition route evidence.execution_authorized",
+    )
     capacity = _token(value["capacity"], "model-transition route evidence.capacity")
     if capacity not in _CAPACITY:
         raise ModelTransitionError("model-transition route evidence.capacity is invalid")
@@ -314,6 +372,15 @@ def _route(value: Any) -> dict[str, Any]:
         raise ModelTransitionError(
             "model-transition route evidence.failure_disposition is invalid"
         )
+    capability_status = _token(
+        value["capability_status"],
+        "model-transition route evidence.capability_status",
+    )
+    if capability_status not in _CAPABILITY_STATUS:
+        raise ModelTransitionError(
+            "model-transition route evidence.capability_status is invalid"
+        )
+    _preflight(value["preflight"])
     _target(value["target"], "model-transition route evidence.target")
     for field in (
         "account_binding_sha256",
@@ -450,12 +517,33 @@ def _deny_reason(
         if prior is not None and _scope_core(scope) != _scope_core(prior["scope"]):
             return "reclassification-required", effective_operator
 
+    preflight = route["preflight"]
+    if not preflight["inventory_complete"]:
+        return "route-inventory-incomplete", effective_operator
+    if preflight["task_data_shared"] or preflight["state_changed"]:
+        return "route-status-refresh-exceeded-authority", effective_operator
+    if preflight["inventory_status"] in {"missing", "stale"}:
+        return "route-status-refresh-required", effective_operator
+    if preflight["inventory_status"] == "denied":
+        return "route-status-refresh-denied", effective_operator
+    if not preflight["selected_route_in_inventory"]:
+        return "selected-route-is-not-in-inventory", effective_operator
     if not route["fresh"]:
         return "route-evidence-is-stale", effective_operator
     if not route["eligible"]:
         return "route-is-ineligible", effective_operator
-    if route["capacity"] != "available":
-        return "route-capacity-unavailable", effective_operator
+    if route["capability_status"] == "probe-failed":
+        return "route-capability-probe-failed", effective_operator
+    if route["capability_status"] == "unknown":
+        return "route-model-availability-unproven", effective_operator
+    if route["capability_status"] == "absent":
+        return "route-model-absent", effective_operator
+    if route["capacity"] == "exhausted":
+        return "route-capacity-exhausted", effective_operator
+    if route["capacity"] == "unknown":
+        return "route-capacity-unknown", effective_operator
+    if not route["execution_authorized"]:
+        return "route-execution-unauthorized", effective_operator
     if prior is not None:
         if route["target"] != prior["target"]:
             return "continuation-target-changed", effective_operator

@@ -45,11 +45,12 @@ and consumer assurance minima before model choice or edit authority.
 
 Use `choosing-agent-models` before every payload-bearing new dispatch,
 follow-up, resume, retry, capacity recovery, or reclassification—even when a
-model was previously resolved. Require fresh eligibility, selector,
-capability, account, target, and capacity evidence. Run the pure transition
-guard and bind its authorized decision immediately before the actuator accepts
-the exact payload. Denial means no payload is sent. Never convert capacity
-loss into an implicit weaker-model or different-account route.
+model was previously resolved. Require complete route inventory and status
+preflight plus fresh eligibility, selector, capability, account, target,
+execution-authority, and capacity evidence. Bind the guard's authorized
+decision immediately before the actuator accepts the payload; denial sends
+none. Never treat denied status as model absence or capacity loss as a
+downgrade route.
 
 ## Bounded Handoff
 

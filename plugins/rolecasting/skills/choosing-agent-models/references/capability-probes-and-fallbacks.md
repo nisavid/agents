@@ -4,7 +4,7 @@
 
 1. Identify the exact target family, surface, version, executor, and transport
    from the invocation topology receipt.
-2. For a Codex target, refresh the live catalog with `codex debug models`. For every non-Codex target, refresh that target harness's live model catalog instead.
+2. Inventory every route permitted by the operator and worker contract. For the ambient Codex account, `codex debug models` may provide its live catalog. For another permitted Codex account, use the supported metadata-only `codex app-server` status interface described below. For every non-Codex target, refresh that target harness's live model catalog instead.
 3. Inspect the target executor tool or schema for accepted model slugs and reasoning efforts.
 4. Record the exact live-catalog and target-executor-schema intersection, and pass only a pair present in both.
 
@@ -14,7 +14,11 @@ prove its paired surface. Model support also does not prove relationship,
 ownership, transport, or assurance. When the target exposes no selection
 fields, omit them and use an appropriate inherited or environment-fixed model.
 
-Model selection does not grant authority to invoke a model, peer, CLI, API, or external harness. Capability inspection and any proof invocation must remain within the authority already granted by the operator and worker contract.
+Model selection does not grant authority to invoke a model, peer, CLI, API, or external harness. Status inspection, capability proof, and task execution are separate authorities.
+
+The standing Codex status refresh is read-only and carries no task data. Select only a permitted account home from the private binding catalog, and expose it only to the child process. Start `codex app-server` from an operating-system temporary directory, initialize it, and limit requests to `account/read` with `refreshToken: false`, `model/list`, and `account/rateLimits/read`. Do not read `auth.json` or another credential file directly, refresh a token, create a task or turn, send task data, access workspace files or tools, change login or configuration, delegate or execute work, or treat the refresh as the separately authorized harmless task-work probe.
+
+Record a timestamped redacted inventory digest, status-authorization digest, and status-evidence digest. Raw account identifiers and credentials remain local. Missing or stale status triggers the narrow refresh automatically, even when task execution or project-data authority is absent. If refresh is denied, record `route-status-refresh-denied`; do not report the model as absent or unavailable. Keep `route-inventory-incomplete`, `route-status-refresh-required`, `route-execution-unauthorized`, `route-capability-probe-failed`, `route-model-availability-unproven`, `route-model-absent`, `route-capacity-unknown`, and `route-capacity-exhausted` distinct.
 
 During an already authorized no-task-data refresh, you may inspect route metadata exposed for unrelated tasks, including advertised model availability; this does not authorize reading task data. An existing task is eligible only when delegation created it for the current source task and bounded purpose, or the operator identified it as a same-purpose companion. Do not use an unrelated task as an execution or authorization route for current-task work, including to execute with its model or under its account, entitlement, permissions, or context.
 
@@ -33,11 +37,14 @@ Require the continuation actuator to select and observe the same private account
 
 The pure `scripts/model_transition.py` guard accepts the prior accepted state,
 event, current role classification, optional content-addressed operator
-selection, and fresh route evidence. Its route evidence binds eligibility,
-capacity, exact target, account, route authority, selector, capability, and
-selection. The selection records role, exact model and effort or explicit
-inherited-fixed absence, qualified classification, provenance, and operator
-selection identity.
+selection, and fresh route evidence. Its route preflight binds a complete
+permitted-route inventory, redacted timestamped status evidence, the status
+authorization, absence of task-data transfer or state mutation, and membership
+of the selected route. The remaining route evidence binds eligibility,
+capability status, execution authority, capacity, exact target, account,
+selector, capability, and selection. The selection records role, exact model
+and effort or explicit inherited-fixed absence, qualified classification,
+provenance, and operator selection identity.
 
 Apply it before every payload-bearing new task, new subagent, follow-up,
 resume, retry, capacity recovery, or reclassification. The actuator validates

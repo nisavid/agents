@@ -20,17 +20,20 @@ The normal topology for either profile is:
 
 Do not use this binding to create or steer a user-owned task. That ownership
 requires explicit user consent and a separately classified route.
-App-server is an optional later transport, not a Codex surface and not an
-initial-release dependency.
+App-server is an optional later transport for dispatch, not a Codex surface and
+not an initial-release dependency. Its narrowly supported metadata-only use for
+permitted-account status inventory is a preflight inspection surface, not a
+dispatch or task-work transport.
 
 ## Freeze before launch
 
 First apply the verified `model-transition` module to the prior state, exact
 lifecycle event, current role classification, optional operator selection, and
-fresh route evidence. Do this for new subagents, follow-ups, resumes, retries,
-capacity recovery, and reclassification. A denial stops before the native tool
-accepts task data. A `new-task` decision is invalid here because this binding
-owns only leader-owned children.
+fresh route evidence with its complete permitted-route preflight. Do this for
+new subagents, follow-ups, resumes, retries, capacity recovery, and
+reclassification. A denial stops before the native tool accepts task data. A
+`new-task` decision is invalid here because this binding owns only leader-owned
+children.
 
 Then freeze the complete content-addressed Rolecasting plan, including its
 exact request, target version and executor, topology, authorized transition,

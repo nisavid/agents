@@ -7,6 +7,11 @@
   judgment floors, explicit operator selections, security and Daybreak
   requirements, and reject stale, ineligible, capacity-failed, downgraded, or
   tampered transitions before native spawn.
+- Require a complete permitted-route inventory before first dispatch and later
+  transitions. Bind the narrow metadata-only status refresh separately from
+  execution authority, retain timestamped redacted evidence, and distinguish
+  incomplete or denied status from capability failure, model absence, missing
+  execution authority, and capacity loss.
 - Bind the same transition identity through dispatch-evidence v3 plans, model
   receipts, result receipts, manifests, and canonical projections. Retain the
   truthful validator-only provider boundary; repository code still cannot

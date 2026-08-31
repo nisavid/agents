@@ -21,7 +21,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             for skill in SKILLS
         }
 
-    def test_rolecasting_has_exactly_thirty_detailed_scenarios(self) -> None:
+    def test_rolecasting_has_exactly_thirty_one_detailed_scenarios(self) -> None:
         observed = {
             item["name"]
             for document in self.documents.values()
@@ -40,6 +40,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "unrelated-task-model-is-not-a-route",
                 "daybreak-capacity-has-no-local-fallthrough",
                 "mixed-role-reclassification-preserves-floor",
+                "permitted-account-status-preflight",
                 "no-user-owned-task-without-explicit-request",
                 "foreign-peer-bounded-authority",
                 "leader-integrates-worker-results",

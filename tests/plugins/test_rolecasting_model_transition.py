@@ -751,25 +751,74 @@ class ModelTransitionGuardTests(unittest.TestCase):
                 route(selection()),
             )
 
-    def test_decision_validation_uses_canonical_json_equality(self) -> None:
+    def test_predecessor_schema_version_requires_exact_integer(self) -> None:
+        guard = load_module()
+        initial = initial_decision(guard)
+
+        for schema_version in (True, 1.0):
+            with self.subTest(schema_version=schema_version):
+                predecessor = copy.deepcopy(initial["next_state"])
+                predecessor["schema_version"] = schema_version
+                unsigned = {
+                    key: value
+                    for key, value in predecessor.items()
+                    if key != "state_sha256"
+                }
+                predecessor["state_sha256"] = hashlib.sha256(
+                    canonical(unsigned)
+                ).hexdigest()
+
+                with self.assertRaisesRegex(
+                    guard.ModelTransitionError,
+                    "prior model-transition state contract drift",
+                ):
+                    guard.authorize_model_transition(
+                        predecessor,
+                        event(
+                            "resume",
+                            predecessor=predecessor["authorization_sha256"],
+                        ),
+                        scope(),
+                        None,
+                        route(selection()),
+                    )
+
+    def test_decision_schema_version_requires_exact_integer(self) -> None:
         guard = load_module()
         decision = initial_decision(guard)
 
-        for field_path in (("schema_version",), ("next_state", "sequence")):
-            with self.subTest(field_path=field_path):
+        for schema_version in (True, 1.0):
+            with self.subTest(schema_version=schema_version):
                 mutated = copy.deepcopy(decision)
-                target = mutated
-                for field in field_path[:-1]:
-                    target = target[field]
-                target[field_path[-1]] = True
+                mutated["schema_version"] = schema_version
+                unsigned = {
+                    key: value
+                    for key, value in mutated.items()
+                    if key != "content_sha256"
+                }
+                mutated["content_sha256"] = hashlib.sha256(
+                    canonical(unsigned)
+                ).hexdigest()
 
-                self.assertEqual(mutated, decision)
-                self.assertNotEqual(canonical(mutated), canonical(decision))
                 with self.assertRaisesRegex(
                     guard.ModelTransitionError,
-                    "decision content mismatch",
+                    "model-transition decision contract drift",
                 ):
                     guard.validate_authorized_transition(mutated)
+
+    def test_nested_decision_validation_uses_canonical_json_equality(self) -> None:
+        guard = load_module()
+        decision = initial_decision(guard)
+        mutated = copy.deepcopy(decision)
+        mutated["next_state"]["sequence"] = True
+
+        self.assertEqual(mutated, decision)
+        self.assertNotEqual(canonical(mutated), canonical(decision))
+        with self.assertRaisesRegex(
+            guard.ModelTransitionError,
+            "decision content mismatch",
+        ):
+            guard.validate_authorized_transition(mutated)
 
 
 if __name__ == "__main__":

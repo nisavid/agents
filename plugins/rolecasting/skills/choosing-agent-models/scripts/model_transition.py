@@ -346,7 +346,11 @@ def _state(value: Any) -> dict[str, Any] | None:
         },
         "prior model-transition state",
     )
-    if value["schema_version"] != SCHEMA_VERSION or value["contract"] != STATE_CONTRACT:
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != SCHEMA_VERSION
+        or value["contract"] != STATE_CONTRACT
+    ):
         raise ModelTransitionError("prior model-transition state contract drift")
     _sha(value["task_sha256"], "prior model-transition state.task_sha256")
     if type(value["sequence"]) is not int or value["sequence"] < 1:
@@ -585,7 +589,11 @@ def validate_authorized_transition(value: Any) -> dict[str, Any]:
         },
         "model-transition decision",
     )
-    if value["schema_version"] != SCHEMA_VERSION or value["contract"] != DECISION_CONTRACT:
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != SCHEMA_VERSION
+        or value["contract"] != DECISION_CONTRACT
+    ):
         raise ModelTransitionError("model-transition decision contract drift")
     request = _exact(
         value["request"],

@@ -24,6 +24,10 @@ Reusable Hindsight control-plane code, local-stack tooling, agent skills, policy
   validation status.
 - [Product requirements](docs/PRD.md) for the complete safety and migration
   design.
+- [Durable journal publication](docs/journal-publication-design.md) for the
+  selected PostgreSQL publication-owner architecture and the constraints that
+  its still-open restart, compatibility, evidence, and acceptance work must
+  preserve.
 
 ## Harness authority
 

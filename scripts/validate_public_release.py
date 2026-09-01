@@ -37,7 +37,7 @@ from types import MappingProxyType, ModuleType
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNING_AS_ENTRYPOINT = __name__ == "__main__"
-SOURCE_SHA256 = "024f2b7c57a029860c31c98b986ddb74bcad329e3d699c6dfd7fb1b73de666d1"
+SOURCE_SHA256 = "946e9559712581cb7cf6360464f4338e99922738082de7ce4c33014cf159a2e7"
 PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
 MAX_PROOF_SOURCE_BYTES = 2 * 1024 * 1024
 RELEASE_SUPPORT_SOURCES = (
@@ -91,6 +91,7 @@ COMMON_SUPPORT_PATHS = {
     "tests/phase7_v4_fixture.py",
     "tests/fixtures/phase7-v4-compatibility.json",
     "tests/fixtures/phase7-v5-compatibility.json",
+    "tests/fixtures/phase7-v6-compatibility.json",
     "tests/test_control_plane_behavior_eval.py",
     "tests/test_skill_routing_eval.py",
     "tests/test_agent_plugins_standard.py",

@@ -7,13 +7,17 @@ description: Use when deciding whether and how to delegate across child, peer, e
 
 ## Scope
 
-Keep ambiguity, consequential judgment, architecture, copy, and coordination local. Delegate bounded parallel, specialist, or waiting work.
+Keep consequential judgment and coordination local. Delegate bounded parallel,
+specialist, or waiting work.
 
-[choosing-agent-models](../choosing-agent-models/SKILL.md) owns model and effort selection. This skill owns target surface, worker topology, authority, bounded handoffs, assurance, and leader integration.
+[choosing-agent-models](../choosing-agent-models/SKILL.md) owns model selection,
+fresh capability proof, and transition policy. This skill owns target surface,
+topology, authority, the pre-actuator transition gate, bounded handoffs,
+assurance, and leader integration.
 
 ## Choose the Worker Contract
 
-Choose each axis independently:
+Freeze each axis independently:
 
 - target: exact family, surface, version, and executor;
 - relationship: `child`, `peer`, or `external`;
@@ -21,22 +25,47 @@ Choose each axis independently:
 - transport: `native-tool`, `task-api`, `cli`, `app-server`, or `remote-api`; and
 - required assurance: `product-attested`, `controller-observed`, or `self-reported`.
 
-Do not infer one axis from another. Use a leader-owned child for bounded work the leader creates and ends. A leader-owned peer may have an independent session while remaining leader-controlled. A user-owned peer or task requires explicit user consent to create or steer. Use an external worker only when crossing the selected product or control boundary materially helps.
+Do not infer one axis from another. A leader-owned child is bounded work the
+leader creates and ends. A leader-owned peer may have an independent session.
+A user-owned peer requires explicit consent to create or steer. Cross a
+product or control boundary only when it materially helps.
 
-Task identity and bounded purpose are route gates: model availability never makes an unrelated task valid. Read [foreign-harness-peers.md](references/foreign-harness-peers.md) before probing a non-native, separately owned, companion, sibling, or dedicated-task surface.
+Task identity and purpose are route gates; model availability never makes an
+unrelated task valid. Read
+[foreign-harness-peers.md](references/foreign-harness-peers.md) before using a
+non-native, separately owned, companion, sibling, or dedicated-task surface.
 
 ## Kickoff
 
-Record the leader, repository, branch, immutable base, dirty state, submodules, and owning worktree. Compare plans with live state and policy before dispatch. Freeze every topology axis and the consumer's minimum assurance before model choice or edit authority. If model or effort remains unresolved, use `choosing-agent-models`.
+Record leader, repository, branch, immutable base, dirty state, submodules, and
+owning worktree. Compare the plan with live state and policy. Freeze topology
+and consumer assurance minima before model choice or edit authority.
+
+## Gate Every Payload
+
+Use `choosing-agent-models` before every payload-bearing lifecycle event. Require authenticated
+route evidence binding complete inventory, safe status preflight, eligibility,
+selector, capability, account, target, execution authority, capacity, task,
+payload, plan, and actuation. Validate and atomically consume it before payload
+acceptance; denial sends none. Missing production issuer, verifier, or actuator
+integration blocks dispatch. Never recast denied or unverified status as model
+absence, or capacity loss as permission to downgrade.
 
 ## Bounded Handoff
 
-Every prompt is a bounded task contract: goal, success criteria, worktree, immutable base, relevant facts, target behavior, scope, read/write and subdelegation authority, external-action authority, verification, output, and stop conditions. Unstated authority is absent. Workers preserve existing edits.
+Every prompt binds goal, success criteria, worktree, immutable base, relevant
+facts, target behavior, scope, read/write and subdelegation authority,
+external-action authority, verification, output, and stop conditions.
+Unstated authority is absent. Workers preserve existing edits.
 
 For native ChatGPT Codex or Codex CLI/TUI children, follow
 [native-codex-subagents.md](references/native-codex-subagents.md).
 
-For frozen multi-worker plans, issue [invocation-topology-receipt.md](references/invocation-topology-receipt.md); the harness adapter serializes it as `adapter:rolecasting-invocation-topology-receipt`. Model selection never supplies dispatch authority. Use [dispatch-evidence.md](references/dispatch-evidence.md) for witnessed execution and assurance minima.
+For frozen multi-worker plans, issue
+[invocation-topology-receipt.md](references/invocation-topology-receipt.md).
+The harness serializes it as `adapter:rolecasting-invocation-topology-receipt`.
+Model selection never supplies dispatch authority. Use
+[dispatch-evidence.md](references/dispatch-evidence.md) for witnessed execution.
 
 Ask workers to return one status:
 
@@ -45,19 +74,19 @@ Ask workers to return one status:
 - `NEEDS_CONTEXT`: a named fact or decision is missing
 - `BLOCKED`: impossible within current scope, authority, or environment
 
-On `NEEDS_CONTEXT` or `BLOCKED`, change the input, authority, boundary, or capability before retrying.
+Before retrying `NEEDS_CONTEXT` or `BLOCKED`, change the named missing input,
+authority, boundary, or capability and authorize a new transition.
 
 ## Batch and Wait
 
-Batch small independent same-shape work into one dispatch; review its diff as one unit. Separate work needing its own judgment, own tests, or review surface.
-
-Do useful local work before waiting. Avoid short polling; use a bounded wait when idle. Then reconcile live children and recover missed terminal results.
+Batch small independent same-shape work; separate work needing its own judgment,
+tests, or review surface. Do useful local work before a bounded wait, then
+reconcile live children and recover missed terminal results.
 
 ## Leader Integration
 
-- Keep parallel edit scopes disjoint.
-- Record the immutable base before edit-capable delegation; never infer it as `HEAD~1`.
+- Keep parallel edit scopes disjoint and record the immutable base before edits.
 - Review returned patches, claims, captures, logs, and summaries.
-- Treat every worker result as input, not an integrated decision.
-- Reconcile and integrate centrally in the owning worktree, then verify the final contract.
-- Retain final authority for architecture, root cause, user-facing wording, and consequential external actions.
+- Treat results as inputs; reconcile, integrate, and verify centrally.
+- Retain final authority for architecture, root cause, user-facing wording, and
+  consequential external actions.

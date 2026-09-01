@@ -148,7 +148,7 @@ class ValidateTricriticalTests(unittest.TestCase):
             "tricritical-terminal-review-evidence-v2",
             "tricritical-terminal-review-evidence-validator-v2",
             "tricritical-terminal-review-projection-v2",
-            "rolecasting-dispatch-projection-v2",
+            "rolecasting-dispatch-projection-v3",
             "preserves the complete registered Rolecasting projection verbatim as "
             "`final_dispatch`",
             "does not upgrade or collapse `product-attested`, "

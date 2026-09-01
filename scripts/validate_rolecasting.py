@@ -50,8 +50,14 @@ NATIVE_CODEX_REFERENCE = (
     "skills/delegating-cross-agent-work/references/native-codex-subagents.md"
 )
 NATIVE_CODEX_RUNTIME = "skills/delegating-cross-agent-work/scripts/native_codex.py"
+MODEL_TRANSITION_RUNTIME = (
+    "skills/choosing-agent-models/scripts/model_transition.py"
+)
+ROUTE_EVIDENCE_RUNTIME = (
+    "skills/choosing-agent-models/scripts/route_evidence.py"
+)
 TASK_WITNESS_PROVIDER = "task-witness-provider.json"
-DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v2"
+DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v3"
 PROVIDER_CONTRACT = "task-witness-provider-declaration-v1"
 VALIDATOR_MANIFEST_CONTRACT = "task-witness-validator-artifact-manifest-v1"
 EXPECTED_RECEIPT_CONTRACT = {
@@ -306,7 +312,7 @@ def validate_topology(root: Path) -> dict:
     require_integer(
         topology["schema_version"], "topology schema_version must be an integer"
     )
-    require(topology["schema_version"] == 3, "topology schema_version drift")
+    require(topology["schema_version"] == 4, "topology schema_version drift")
     require(
         topology["receipt_contract"] == EXPECTED_RECEIPT_CONTRACT,
         "invocation topology receipt metadata drift",
@@ -360,8 +366,9 @@ def validate_topology(root: Path) -> dict:
     require(
         len(delegating_calls) == 1
         and delegating_calls[0]["skill"] == CHOOSING_SKILL
-        and delegating_calls[0]["when"] == "model-or-effort-unresolved",
-        "delegation may call model selection only when model or effort is unresolved",
+        and delegating_calls[0]["when"]
+        == "before-every-payload-bearing-dispatch-or-continuation",
+        "delegation must call model transition policy before every payload dispatch",
     )
     require(
         skills[CHOOSING_SKILL]["may_call"] == [],
@@ -683,6 +690,10 @@ def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
 def validate_task_witness_provider(root: Path) -> set[str]:
     runtime_raw = read_bytes(root, DISPATCH_EVIDENCE_RUNTIME)
     runtime_sha256 = hashlib.sha256(runtime_raw).hexdigest()
+    transition_raw = read_bytes(root, MODEL_TRANSITION_RUNTIME)
+    transition_sha256 = hashlib.sha256(transition_raw).hexdigest()
+    route_evidence_raw = read_bytes(root, ROUTE_EVIDENCE_RUNTIME)
+    route_evidence_sha256 = hashlib.sha256(route_evidence_raw).hexdigest()
     adapter_raw = read_bytes(root, DISPATCH_ADAPTER_RUNTIME)
     adapter_sha256 = hashlib.sha256(adapter_raw).hexdigest()
     modules = [
@@ -691,6 +702,18 @@ def validate_task_witness_provider(root: Path) -> set[str]:
             "relative_path": DISPATCH_EVIDENCE_RUNTIME,
             "length": len(runtime_raw),
             "sha256": runtime_sha256,
+        },
+        {
+            "name": "model-transition",
+            "relative_path": MODEL_TRANSITION_RUNTIME,
+            "length": len(transition_raw),
+            "sha256": transition_sha256,
+        },
+        {
+            "name": "route-evidence",
+            "relative_path": ROUTE_EVIDENCE_RUNTIME,
+            "length": len(route_evidence_raw),
+            "sha256": route_evidence_sha256,
         },
         {
             "name": "adapter",
@@ -722,12 +745,12 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "plugin_id": "rolecasting",
         "publisher": "nisavid",
         "repository": "https://github.com/nisavid/agents",
-        "authority_profile": "rolecasting-cooperative-dispatch-v2",
+        "authority_profile": "rolecasting-cooperative-dispatch-v3",
         "producers": [],
         "issuers": [],
         "validators": [
             {
-                "validator_id": "rolecasting-dispatch-evidence-validator-v2",
+                "validator_id": "rolecasting-dispatch-evidence-validator-v3",
                 "contract": DISPATCH_EVIDENCE_CONTRACT,
                 "implementation_sha256": implementation,
                 "entrypoint": "validator",
@@ -743,7 +766,7 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "Task Witness provider must be canonical JSON with one trailing LF",
     )
     require(
-        provider.get("authority_profile") == "rolecasting-cooperative-dispatch-v2",
+        provider.get("authority_profile") == "rolecasting-cooperative-dispatch-v3",
         "provider authority profile drift",
     )
     expected = {
@@ -765,19 +788,39 @@ def validate_task_witness_provider(root: Path) -> set[str]:
             f"{forbidden}",
         )
     require(
-        'BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v2"' in source
+        'BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v3"' in source
         and '"assurance_minimum"' in source
+        and '"model_transition_sha256"' in source
+        and '"plan_binding_sha256"' in source
+        and '"route_evidence_issuer"' in source
+        and '"route-evidence"' in source
+        and "authorization is duplicated" in source
         and "def _validate_bundle(" in source,
         "dispatch-evidence registered API drift",
+    )
+    route_verifier = read(root, ROUTE_EVIDENCE_RUNTIME)
+    for forbidden in ("subprocess", "socket", "urllib", "requests", "importlib"):
+        require(
+            forbidden not in route_verifier,
+            f"route-evidence verifier is not pure: {forbidden}",
+        )
+    require(
+        "def validate_authenticated_route_evidence(" in route_verifier
+        and "no production route-evidence verifier is registered" in route_verifier,
+        "route-evidence verifier truth boundary drift",
     )
     adapter = read(root, DISPATCH_ADAPTER_RUNTIME)
     adapter_words = " ".join(adapter.split())
     for term in (
-        'REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v2"',
-        'ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v2"',
+        'REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v3"',
+        'ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v3"',
         "def render_dispatch_bundle(",
         "does not launch a worker, choose a model, or authenticate",
         "already-observed",
+        "authenticated route evidence is unavailable",
+        '"plan_binding_sha256"',
+        "model transition task identity mismatch",
+        "model transition plan or actuation mismatch",
     ):
         require(
             term in adapter_words,
@@ -788,10 +831,11 @@ def validate_task_witness_provider(root: Path) -> set[str]:
     for term in (
         "task-witness validate --bundle <absolute-bundle>",
         DISPATCH_EVIDENCE_CONTRACT,
-        "rolecasting-dispatch-plan-v2",
-        "rolecasting-model-selection-receipt-v2",
-        "rolecasting-execution-result-receipt-v2",
-        "rolecasting-dispatch-projection-v2",
+        "rolecasting-dispatch-plan-v3",
+        "rolecasting-model-selection-receipt-v3",
+        "rolecasting-execution-result-receipt-v3",
+        "rolecasting-dispatch-projection-v3",
+        "rolecasting-model-transition-decision-v1",
         "`assurance_minimum`",
         "Rolecasting exposes no runtime-path, trust-path, discovery, or fallback CLI",
         "empty producer and issuer inventories",
@@ -799,6 +843,10 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "Canonical new-publication evidence",
         "`usable: false` is valid evidence",
         "exact `usable` status",
+        "Every canonical Codex app-server version with a `0.149.0` semantic version core",
+        "authenticated route issuer",
+        "authenticated route-evidence verifier",
+        "atomically consume",
     ):
         require(
             term in reference_words,
@@ -824,6 +872,12 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "non-completed native result cannot be usable",
         "must be frozen before recording",
         "frozen native dispatch is invalid",
+        "verified model-transition guard is unavailable before native spawn",
+        "authenticated route evidence is unavailable before native spawn",
+        "model transition task identity mismatch",
+        "model transition plan or actuation mismatch",
+        '"task_sha256"',
+        '"model_transition_sha256"',
     ):
         require(term in native_words, f"native Codex binding drift: {term}")
     native_reference = read(root, NATIVE_CODEX_REFERENCE)
@@ -837,17 +891,50 @@ def validate_task_witness_provider(root: Path) -> set[str]:
         "strict Boolean",
         "Requested authority is intent",
         "App-server is an optional later transport",
+        "Codex app-server 0.149.0",
+        "atomically consume",
         "producer and issuer inventories empty",
     ):
         require(
             term in native_reference_words,
             f"native Codex reference drift: {term}",
         )
+    transition_source = read(root, MODEL_TRANSITION_RUNTIME)
+    for term in (
+        'DECISION_CONTRACT = "rolecasting-model-transition-decision-v1"',
+        'STATE_CONTRACT = "rolecasting-model-transition-state-v1"',
+        'ROUTE_EVIDENCE_CONTRACT = "rolecasting-route-evidence-v1"',
+        "def authorize_model_transition(",
+        "def route_evidence_sha256(",
+        "def validate_authorized_transition(",
+        '"capacity-recovery"',
+        '"reclassification"',
+        '"daybreak"',
+        '"operator"',
+        '("codex-app-server", ("0", "149", "0"))',
+        "_CANONICAL_SEMANTIC_VERSION",
+        "_MAX_STATUS_SURFACE_VERSION_LENGTH",
+        "def _status_surface_is_unsafe_or_unversioned(",
+        '"route-status-unverified"',
+        '"route-status-denied"',
+        '"gpt-daybreak-blue-latest"',
+        '!= "max"',
+        '"plan_binding_sha256"',
+        '"actuation_id"',
+    ):
+        require(term in transition_source, f"model-transition guard drift: {term}")
+    for forbidden in ("subprocess", "socket", "urllib", "requests", "importlib"):
+        require(
+            forbidden not in transition_source,
+            f"model-transition guard is not pure: {forbidden}",
+        )
     return {
         TASK_WITNESS_PROVIDER,
         DISPATCH_EVIDENCE_RUNTIME,
         DISPATCH_ADAPTER_RUNTIME,
         NATIVE_CODEX_RUNTIME,
+        MODEL_TRANSITION_RUNTIME,
+        ROUTE_EVIDENCE_RUNTIME,
     }
 
 

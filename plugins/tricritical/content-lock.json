@@ -67,10 +67,10 @@
     "skills/loop/SKILL.md": "c8079f0ad32ab2dd86dce7992801c9c83f743ac48e20b0977d89d853bff1dadf",
     "skills/loop/references/invocation-boundary.md": "6624708d8ec548ce096553242406b7bf0828342d279650c932e6b3f626c7bc9a",
     "skills/loop/references/operator-choice.md": "387c3875b5422d622dac14cec504cd8b9c273e23044601a39dabd00c546a0b4e",
-    "skills/loop/references/review-evidence.md": "0a119bb45340faf3a4f834766eeb5b4f472301963f613444d236f0fdced7f04f",
+    "skills/loop/references/review-evidence.md": "470eb3379a747e91bd447a4769e7bbf5cd06e09d8f945eafec0f992c7143d478",
     "skills/loop/references/review-input-boundary.md": "cf697d0b7825cbc87929276e3b92f743441f57749dcabc4976f9b9764e19c03c",
     "skills/loop/references/topology.json": "a77da49e18d66d39b4d81246b2f4efebfd12ac321a40822383fc9bdd4ab91351",
-    "skills/loop/scripts/review_evidence.py": "0d91b2c197d9256a57ee9d696c7b99a11f8ff4809788b6875f25e0e9d7faf1f9",
+    "skills/loop/scripts/review_evidence.py": "54a5479eb60d55a1c0296541299bd7cca5edcb62eef7d5ef49dd5a0b0984da83",
     "skills/review/SKILL.md": "ce7c8cc31b823f4f0f6263f3e251505fff2967dcea23322eb9fea3c15d7ea8b6",
     "skills/review/references/completeness-and-synthesis.md": "c75c97ce222b8afd22c25fad301b5d2b8696a244b02cec010caf226878e08a2b",
     "skills/review/references/invocation-boundary.md": "6624708d8ec548ce096553242406b7bf0828342d279650c932e6b3f626c7bc9a",
@@ -93,7 +93,7 @@
     "skills/structure/references/review-output-contract.md": "111bf26d2e3e5ed53d6493a6a09d55ad1d9055aedefcffa04fa20535cd7fb96e",
     "skills/structure/references/rubric.md": "af0bb975b1fb28c214fadc4e5ba7a0c0be2aa53d8a6d0db240c754c28cf00d96",
     "skills/structure/references/topology.json": "a77da49e18d66d39b4d81246b2f4efebfd12ac321a40822383fc9bdd4ab91351",
-    "task-witness-provider.json": "e29d0e9b30f0e2facdbf52d3ad9d3eca5e1c2d769be2c1a8cfd9e4a1a39f65ad",
+    "task-witness-provider.json": "079e28e6ed8530f7886ff9f7847d4390b2b649c0e710d11a4b1394892efb1142",
     "topology.json": "a77da49e18d66d39b4d81246b2f4efebfd12ac321a40822383fc9bdd4ab91351"
   }
 }

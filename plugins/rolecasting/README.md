@@ -13,6 +13,27 @@ self-reported assurance for each evidence dimension. Model choice remains
 separate. A transport never determines the
 relationship, and a user-owned peer requires explicit user consent.
 
+Every payload-bearing new dispatch, follow-up, resume, retry, capacity
+recovery, or reclassification passes one pure model-transition guard. Its
+content-addressed decision carries task identity, the prior judgment floor,
+sticky operator choice, Daybreak requirement, the complete permitted-route
+inventory and authenticated side-effect-safe status preflight, fresh selector
+and capability evidence, separate execution authority, account binding,
+capacity, immutable plan and actuation identity, and the exact selection.
+Native adapters and the portable validator require an injected authenticated
+route-evidence verifier; Task Witness separately binds the portable issuer and
+exact verifier module. Neither path can issue trustworthy route authority on
+its own. Consumers reject missing, denied, stale, downgraded, or cross-bound
+decisions at their payload boundaries. Replay rejection additionally requires
+the owning actuator to atomically consume each authorization. Every canonical
+Codex app-server semantic version with a `0.149.0` core is explicitly
+ineligible for the standing status-only refresh because its rate-limit path may
+refresh and persist managed authentication; noncanonical or unparseable
+app-server versions also fail closed. This source release registers no
+production route-evidence issuer or accepting verifier and no mandatory
+actuator hook, so it does not establish a runnable alternate-account Daybreak
+route.
+
 Initial operational support uses separate native-child adapter profiles for
 ChatGPT Codex and Codex CLI/TUI. Both freeze the complete plan and assurance
 minima before native spawn and bind same-leader launch, status, and result
@@ -58,11 +79,13 @@ stays inside the package. The `schema_version` in `topology.json` versions
 Rolecasting's local topology shape, not a repository-wide interchange schema.
 
 Rolecasting's registered owner validator accepts a strict, generic dispatch
-bundle and returns `rolecasting-dispatch-projection-v2`. Its pure renderer
-cannot authenticate a selected executor, and no authenticated owning harness
+bundle and returns `rolecasting-dispatch-projection-v3`. Its pure renderer
+cannot authenticate a selected executor or route by itself, and no
+authenticated owning harness
 integration is currently bound into the issuer identity. The registered
 provider therefore declares empty producer and issuer inventories and retains
-only the active validator plus its exact renderer module. Task Witness remains
+only the active validator plus the exact transition guard and renderer modules.
+Task Witness remains
 the only front door, and current publication attempts fail closed:
 
 ```text
@@ -74,7 +97,7 @@ The owner interface is documented in the delegating skill's
 path CLI and does not interpret review or publication semantics. Its separate
 native adapter deterministically freezes supplied, already-observed execution
 facts; it does not launch workers or claim to authenticate observations the
-harness has not supplied. Its `rolecasting-bootstrap-adapter-v2` issuer contract
+harness has not supplied. Its `rolecasting-bootstrap-adapter-v3` issuer contract
 is independent of the dispatch-evidence bundle contract. Private tests may
 construct test-owned bootstrap trust to exercise historical validation, but no
 Rolecasting historical trust has been installed and those results cannot
@@ -82,8 +105,8 @@ become canonical publication evidence. The skill-mediated native Codex module
 sequences pre-spawn freeze and post-result same-leader recording, but it is not
 a harness actuator and emits neither portable evidence nor product
 attestation. New publication stays blocked until a real native harness
-integration authenticates execution and its exact owning bytes are bound into
-a newly registered producer/issuer identity.
+integration authenticates both route evidence and execution and its exact
+owning bytes are bound into newly registered authority identities.
 Canonical publication specifically requires a product-attested ChatGPT Codex
 child. Ordinary consumers require controller-observed assurance for every fact
 they rely on. Self-reported dimensions are diagnostic and non-gating; the
@@ -104,6 +127,7 @@ uv run --with PyYAML python -m unittest tests/test_validate_rolecasting.py
 python3 -m unittest tests/test_rolecasting_eval_corpus.py
 python3 -m unittest tests/plugins/test_rolecasting_dispatch_evidence.py
 python3 -m unittest tests/plugins/test_rolecasting_native_codex.py
+python3 -m unittest tests/plugins/test_rolecasting_model_transition.py
 ```
 
 The validator rejects Agent Plugins schema drift, duplicate keys and non-finite

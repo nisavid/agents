@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "receipt_contract": {
     "id": "adapter:rolecasting-invocation-topology-receipt",
     "owner": "delegating-cross-agent-work",
@@ -34,13 +34,14 @@
         "authority",
         "handoffs",
         "native-codex-dispatch",
+        "pre-actuator-transition-enforcement",
         "invocation-topology-receipt",
         "leader-integration"
       ],
       "may_call": [
         {
           "skill": "choosing-agent-models",
-          "when": "model-or-effort-unresolved"
+          "when": "before-every-payload-bearing-dispatch-or-continuation"
         }
       ]
     },
@@ -48,7 +49,9 @@
       "owns": [
         "model-selection",
         "reasoning-effort-selection",
-        "capability-proof"
+        "capability-proof",
+        "model-transition-policy",
+        "model-transition-decision"
       ],
       "may_call": []
     }

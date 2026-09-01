@@ -56,7 +56,7 @@ class SourceSkillDispositionWorkflowTests(unittest.TestCase):
             },
         )
 
-    def test_workflow_runs_rolecasting_regressions(self) -> None:
+    def test_workflow_runs_affected_closure_regressions(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text())
         commands = {
             line.strip()
@@ -70,9 +70,26 @@ class SourceSkillDispositionWorkflowTests(unittest.TestCase):
                 "python -m unittest tests.test_validate_source_skill_disposition",
                 "python scripts/validate_source_skill_disposition.py .",
                 "python scripts/validate_rolecasting.py .",
+                "python -m unittest tests.plugins.test_rolecasting_model_transition tests.plugins.test_rolecasting_native_codex tests.plugins.test_rolecasting_dispatch_evidence",
                 "python -m unittest tests.test_validate_rolecasting tests.test_rolecasting_eval_corpus",
+                "python -m unittest tests.plugins.test_tricritical_review_evidence tests.test_validate_tricritical tests.test_tricritical_eval_corpus",
+                "python scripts/validate_tricritical.py .",
+                "python -m unittest discover -s tests/plugins/mergecraft/publishing-reviewable-prs -p 'test_publish_reviewable_pr.py'",
+                "python -m unittest tests.test_validate_mergecraft",
+                "python scripts/validate_mergecraft.py . --source-stage",
+                "python -m unittest tests.test_validate_artifact_customs tests.test_artifact_customs_eval_corpus tests.test_artifact_customs_behavior_eval",
+                "python scripts/validate_artifact_customs.py . --source-stage",
+                "python -m unittest tests.test_phase7_compatibility_projection",
             }
             <= commands
+        )
+
+    def test_workflow_keeps_plugin_inventory_free_of_python_bytecode(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+
+        self.assertEqual(
+            workflow["jobs"]["validate"]["env"]["PYTHONDONTWRITEBYTECODE"],
+            "1",
         )
 
 

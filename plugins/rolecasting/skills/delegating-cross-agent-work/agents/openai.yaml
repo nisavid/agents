@@ -1,4 +1,4 @@
 interface:
   display_name: "Delegate Cross-Agent Work"
-  short_description: "Choose worker topology and bounded handoffs"
-  default_prompt: "Use $rolecasting:delegating-cross-agent-work to choose a worker topology and hand off this bounded task."
+  short_description: "Gate bounded cross-agent dispatches"
+  default_prompt: "Use $rolecasting:delegating-cross-agent-work to freeze topology and enforce the transition gate for this bounded dispatch."

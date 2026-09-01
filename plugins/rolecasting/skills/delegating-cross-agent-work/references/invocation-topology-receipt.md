@@ -6,7 +6,10 @@ separate from `adapter:model-selection-receipt`: model selection proves an
 available model configuration, while this receipt alone binds who may be
 dispatched, through which topology and transport, with what authority, and at
 what assurance. Neither receipt may be embedded in or substituted for the
-other.
+other. The separate `rolecasting-model-transition-decision-v1` proves that the
+current selection is authorized for one exact payload-bearing lifecycle event.
+All three contracts remain distinct and are cross-bound by their adapter; none
+substitutes for another.
 
 ## Independent dimensions
 
@@ -46,6 +49,8 @@ Every dispatch entry records:
   consumer assurance minimum;
 - a separately supplied model-selection
   receipt identity when selection is required;
+- the authorized model-transition decision identity for the exact payload and
+  event;
 - the same candidate, review-input, and requirements identities as the plan;
 - bounded scope and read-only authority;
 - return shape, verification, and stop conditions;
@@ -67,11 +72,13 @@ surface.
 
 ## Dispatch and change control
 
-The adapter verifies the plan and relevant live executor capabilities before
-each dispatch, then records the bound entry and result. Dispatch no identity
+The adapter verifies the plan, fresh route evidence, and authorized transition
+immediately before each actuator accepts its payload, then records the bound
+entry and result. Dispatch no identity
 outside the closed set and use each entry at most once. A target, relationship,
 ownership, transport, scope, isolation, authority, assurance minimum,
-or selected-execution change is not a fallback under the existing receipt:
+selected execution, task identity, account, judgment floor, or operator choice
+change is not a fallback under the existing receipt:
 freeze and issue a new valid plan. Preserve raw failure evidence. Any selected
 execution that is absent, failed, timed out, unusable, or unverified leaves the
 requested ensemble incomplete.

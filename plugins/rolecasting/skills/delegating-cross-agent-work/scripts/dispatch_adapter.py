@@ -1,4 +1,4 @@
-"""Freeze supplied execution facts into one Rolecasting v2 evidence bundle.
+"""Freeze supplied execution facts into one Rolecasting v3 evidence bundle.
 
 This pure bootstrap renderer does not launch a worker, choose a model, or
 authenticate facts outside its process. Its caller must supply already-observed
@@ -18,14 +18,14 @@ import stat
 from pathlib import Path
 from typing import Any
 
-REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v2"
-BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v2"
-PLAN_CONTRACT = "rolecasting-dispatch-plan-v2"
-MODEL_CONTRACT = "rolecasting-model-selection-receipt-v2"
-RESULT_CONTRACT = "rolecasting-execution-result-receipt-v2"
-PRODUCER_ID = "rolecasting-bootstrap-dispatch-v2"
-ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v2"
-ISSUER_ID = "rolecasting-bootstrap-adapter-v2"
+REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v3"
+BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v3"
+PLAN_CONTRACT = "rolecasting-dispatch-plan-v3"
+MODEL_CONTRACT = "rolecasting-model-selection-receipt-v3"
+RESULT_CONTRACT = "rolecasting-execution-result-receipt-v3"
+PRODUCER_ID = "rolecasting-bootstrap-dispatch-v3"
+ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v3"
+ISSUER_ID = "rolecasting-bootstrap-adapter-v3"
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -80,6 +80,43 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _transition_guard() -> Any:
+    modules = globals().get("_VERIFIED_MODULES")
+    if not isinstance(modules, dict) or "model-transition" not in modules:
+        raise AdapterError("verified model-transition guard is unavailable")
+    guard = modules["model-transition"]
+    if not callable(getattr(guard, "validate_authorized_transition", None)):
+        raise AdapterError("verified model-transition guard API drift")
+    return guard
+
+
+def _authorized_transition(value: Any) -> dict[str, Any]:
+    try:
+        guard = _transition_guard()
+        transition = guard.validate_authorized_transition(value)
+        modules = globals().get("_VERIFIED_MODULES")
+        if not isinstance(modules, dict) or "route-evidence" not in modules:
+            raise AdapterError("authenticated route evidence is unavailable")
+        verifier = modules["route-evidence"]
+        validate = getattr(verifier, "validate_authenticated_route_evidence", None)
+        if not callable(validate):
+            raise AdapterError("authenticated route-evidence API drift")
+        route = transition["request"]["route_evidence"]
+        if validate(route) != route:
+            raise AdapterError("authenticated route evidence is cross-bound")
+        route_digest = getattr(guard, "route_evidence_sha256", None)
+        if (
+            not callable(route_digest)
+            or route_digest(route) != route["content_sha256"]
+        ):
+            raise AdapterError("authenticated route-evidence digest mismatch")
+        return transition
+    except Exception as error:
+        if isinstance(error, AdapterError):
+            raise
+        raise AdapterError("dispatch model transition is not authorized") from error
 
 
 def _document(value: dict[str, Any]) -> dict[str, Any]:
@@ -296,6 +333,7 @@ def _fact(
         value,
         {
             "execution_id",
+            "plan_binding_sha256",
             "role",
             "target",
             "topology",
@@ -314,6 +352,7 @@ def _fact(
             "model",
             "reasoning_effort",
             "model_capability",
+            "model_transition",
             "returned",
             "verification",
             "stop",
@@ -327,6 +366,9 @@ def _fact(
     if execution_id in seen:
         raise AdapterError("dispatch execution ID is duplicated")
     seen.add(execution_id)
+    plan_binding_sha256 = _sha(
+        value["plan_binding_sha256"], "dispatch.plan_binding_sha256"
+    )
     _token(value["role"], "dispatch.role")
     _target(value["target"], "dispatch.target")
     topology = _topology(value["topology"], "dispatch.topology")
@@ -349,14 +391,43 @@ def _fact(
         assurance,
         "dispatch.assurance_minimum",
     )
-    _text(value["model"], "dispatch.model")
-    _text(value["reasoning_effort"], "dispatch.reasoning_effort")
+    model = _text(value["model"], "dispatch.model")
+    reasoning_effort = _text(
+        value["reasoning_effort"], "dispatch.reasoning_effort"
+    )
     capability = _exact(
         value["model_capability"], {"status", "evidence"}, "model capability"
     )
     if capability["status"] != "available":
         raise AdapterError("selected model is not evidenced as available")
-    _identity(capability["evidence"], "model capability.evidence")
+    capability_evidence = _identity(
+        capability["evidence"], "model capability.evidence"
+    )
+    transition = _authorized_transition(value["model_transition"])
+    transition_event = transition["request"]["event"]
+    if transition_event["payload_sha256"] != value["request"][
+        "content_sha256"
+    ]:
+        raise AdapterError("dispatch model transition is bound to another request")
+    if transition_event["task_sha256"] != subject["content_sha256"]:
+        raise AdapterError("dispatch model transition task identity mismatch")
+    if (
+        transition_event["plan_binding_sha256"] != plan_binding_sha256
+        or transition_event["actuation_id"] != execution_id
+    ):
+        raise AdapterError("dispatch model transition plan or actuation mismatch")
+    if transition["target"] != value["target"]:
+        raise AdapterError("dispatch model transition target mismatch")
+    if (
+        transition["selection"]["model"] != model
+        or transition["selection"]["reasoning_effort"] != reasoning_effort
+    ):
+        raise AdapterError("dispatch model transition selection mismatch")
+    if (
+        transition["request"]["route_evidence"]["capability_sha256"]
+        != capability_evidence["content_sha256"]
+    ):
+        raise AdapterError("dispatch model capability is cross-bound")
     returned = _identity(value["returned"], "dispatch.returned")
     verification = _identity(value["verification"], "dispatch.verification")
     stop = _identity(value["stop"], "dispatch.stop")
@@ -412,13 +483,24 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
     contexts = [value["isolation"]["context"] for value in facts]
     if len(sessions) != len(set(sessions)) or len(contexts) != len(set(contexts)):
         raise AdapterError("dispatch isolation is not distinct")
+    plan_bindings = {value["plan_binding_sha256"] for value in facts}
+    if len(plan_bindings) != 1:
+        raise AdapterError("dispatch facts do not share one plan binding")
+    plan_binding_sha256 = next(iter(plan_bindings))
 
     files: dict[str, bytes] = {}
     plan_dispatches = []
+    transition_digests: dict[str, str] = {}
     model_digests: dict[str, str] = {}
     model_raw: dict[str, bytes] = {}
     for fact in facts:
         execution_id = fact["execution_id"]
+        transition = fact["model_transition"]
+        transition_bytes = _raw(transition)
+        transition_digests[execution_id] = hashlib.sha256(
+            transition_bytes
+        ).hexdigest()
+        files[f"transition-{execution_id}.json"] = transition_bytes
         model = _document(
             {
                 "schema_version": 1,
@@ -430,6 +512,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
                 "model": fact["model"],
                 "reasoning_effort": fact["reasoning_effort"],
                 "capability": fact["model_capability"],
+                "model_transition_sha256": transition_digests[execution_id],
             }
         )
         raw = _raw(model)
@@ -441,6 +524,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
                 key: fact[key]
                 for key in (
                     "execution_id",
+                    "plan_binding_sha256",
                     "role",
                     "target",
                     "topology",
@@ -454,6 +538,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
                 )
             }
             | {
+                "model_transition_sha256": transition_digests[execution_id],
                 "model_sha256": model_digests[execution_id],
                 "authority": fact["authority"],
                 "user_authority": fact["user_authority"],
@@ -467,6 +552,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
             "schema_version": 1,
             "contract": PLAN_CONTRACT,
             "subject": subject,
+            "plan_binding_sha256": plan_binding_sha256,
             "dispatches": plan_dispatches,
         }
     )
@@ -485,6 +571,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
                 "plan_sha256": hashlib.sha256(plan_raw).hexdigest(),
                 "dispatch_sha256": _digest(dispatch),
                 "model_sha256": model_digests[execution_id],
+                "model_transition_sha256": transition_digests[execution_id],
                 "request": fact["request"],
                 "returned": fact["returned"],
                 "verification": fact["verification"],
@@ -512,6 +599,7 @@ def render_dispatch_bundle(request: Any) -> dict[str, bytes]:
             "producer": producer,
             "subject": subject,
             "plan_sha256": hashlib.sha256(plan_raw).hexdigest(),
+            "transitions": transition_digests,
             "models": model_digests,
             "results": result_digests,
         }

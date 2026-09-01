@@ -20,21 +20,36 @@ The normal topology for either profile is:
 
 Do not use this binding to create or steer a user-owned task. That ownership
 requires explicit user consent and a separately classified route.
-App-server is an optional later transport, not a Codex surface and not an
-initial-release dependency.
+App-server is an optional later transport for dispatch, not a Codex surface and
+not an initial-release dependency. A qualified metadata-only interface may be
+a preflight inspection surface, never a dispatch or task-work transport. Codex
+app-server 0.149.0 is not qualified for that standing status authority because
+its rate-limit request path may refresh and persist managed authentication.
 
 ## Freeze before launch
 
-First freeze the complete content-addressed Rolecasting plan, including its
-exact request, target version and executor, topology, model-selection identity
-or explicit absence, bounded return and stop contracts, requested authority,
-and the consumer's minimum for all five assurance dimensions. Requested
-authority is intent; it is not evidence that the product enforced effective
-authority.
+First apply the verified `model-transition` module and authenticated
+`route-evidence` verifier to the prior state, exact
+lifecycle event, current role classification, optional operator selection, and
+fresh route evidence with its complete permitted-route preflight. Do this for
+new subagents, follow-ups, resumes, retries, capacity recovery, and
+reclassification. A denial stops before the native tool accepts task data. A
+`new-task` decision is invalid here because this binding owns only leader-owned
+children.
+
+Then freeze the complete content-addressed Rolecasting plan, including its
+exact request, target version and executor, topology, authorized transition,
+bounded return and stop contracts, requested authority, and consumer assurance
+minima. Requested authority is intent; it is not evidence that the product
+enforced effective authority.
 
 Call `freeze_native_dispatch` before invoking the native subagent tool. The
-freeze binds the plan and request digests, dispatch ID, exact Codex surface,
-version, executor, context, read-only authority intent, and assurance minima.
+freeze validates and binds the complete
+`rolecasting-model-transition-decision-v1`, plan and request digests, dispatch
+ID, task identity, exact Codex surface, version, executor, context, read-only authority
+intent, and assurance minima. The transition payload digest must equal the
+request digest, its immutable plan and actuation identities must equal the
+native plan and dispatch IDs, and its target must equal the native profile.
 It derives the fixed child, leader-owned, native-tool topology. It rejects the
 dispatch before launch when any consumer minimum exceeds the selected native
 profile.
@@ -65,6 +80,19 @@ dispatch. Pass the bounded worker request and least authority allowed by the
 live tool schema. Preserve the frozen context; a changed worktree, scope,
 request, target, ownership, or authority requires a new freeze.
 
+The caller supplies the guard and route verifier to `native_codex.py` as the
+verified `model-transition` and `route-evidence` modules. Missing, changed, or
+unauthenticated evidence fails closed before spawn. The repository module
+remains a sequencing seam, not the harness actuator; the owning harness must
+make the freeze mandatory at its payload boundary and atomically consume each
+plan- and actuation-bound authorization so a second invocation cannot replay
+it.
+
+No such production issuer, verifier, or mandatory actuator integration is
+registered by this release. These native profiles therefore describe the
+required boundary but do not establish a runnable alternate-account Daybreak
+route.
+
 Take the agent or worker ID, session or task ID, context binding, and
 launch acknowledgement only from the native tool protocol. Continue with the
 same native controller until it returns terminal status observations and the
@@ -84,11 +112,12 @@ Worker statements may remain self-reported evidence, but they cannot populate
 controller-observed fields.
 
 Call `record_native_observation` only after the terminal native result. Supply
-the exact frozen binding plus the host-protocol launch, status, result, and
-verification digests and the strict usability Boolean. The recorder rejects
-cross-bound plan, request, dispatch, or context values, missing or out-of-order
-terminal status, malformed verification, non-Boolean usability, and any usable
-non-completed result. Its output is an in-process same-leader record with
+the exact frozen binding and transition identities plus the host-protocol
+launch, status, result, and verification digests and the strict usability
+Boolean. The recorder rejects cross-bound plan, request, transition, dispatch,
+or context values, missing or out-of-order terminal status, malformed
+verification, non-Boolean usability, and any usable non-completed result. Its
+output is an in-process same-leader record with
 `portable_evidence: false` and `product_attested: false`.
 
 ## Assurance boundary

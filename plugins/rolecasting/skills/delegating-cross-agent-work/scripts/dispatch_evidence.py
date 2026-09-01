@@ -1,4 +1,4 @@
-"""Validate one generic Rolecasting v2 dispatch-evidence bundle.
+"""Validate one generic Rolecasting v3 dispatch-evidence bundle.
 
 Task Witness injects the descriptor-bound bundle view and retained trust
 snapshot. This module deliberately exposes no standalone path- or trust-taking
@@ -10,11 +10,11 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v2"
-PLAN_CONTRACT = "rolecasting-dispatch-plan-v2"
-MODEL_CONTRACT = "rolecasting-model-selection-receipt-v2"
-RESULT_CONTRACT = "rolecasting-execution-result-receipt-v2"
-PROJECTION_CONTRACT = "rolecasting-dispatch-projection-v2"
+BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v3"
+PLAN_CONTRACT = "rolecasting-dispatch-plan-v3"
+MODEL_CONTRACT = "rolecasting-model-selection-receipt-v3"
+RESULT_CONTRACT = "rolecasting-execution-result-receipt-v3"
+PROJECTION_CONTRACT = "rolecasting-dispatch-projection-v3"
 
 _TARGET_PAIRS = {
     ("codex", "chatgpt-codex"),
@@ -51,6 +51,42 @@ def _witness() -> Any:
     if witness is None:
         raise RuntimeError("Rolecasting dispatch evidence requires Task Witness")
     return witness
+
+
+def _transition_guard() -> Any:
+    modules = globals().get("_VERIFIED_MODULES")
+    if not isinstance(modules, dict) or "model-transition" not in modules:
+        raise RuntimeError("Rolecasting model-transition guard is unavailable")
+    guard = modules["model-transition"]
+    if not callable(getattr(guard, "validate_authorized_transition", None)):
+        raise RuntimeError("Rolecasting model-transition guard API drift")
+    return guard
+
+
+def _authenticated_route_evidence(value: Any) -> dict[str, Any]:
+    witness = _witness()
+    modules = globals().get("_VERIFIED_MODULES")
+    if not isinstance(modules, dict) or "route-evidence" not in modules:
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route evidence is unavailable"
+        )
+    verifier = modules["route-evidence"]
+    validate = getattr(verifier, "validate_authenticated_route_evidence", None)
+    if not callable(validate):
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route-evidence API drift"
+        )
+    try:
+        authenticated = validate(value)
+    except Exception as error:
+        raise witness.EvidenceError(
+            "Rolecasting route evidence is not authenticated"
+        ) from error
+    if authenticated != value:
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route evidence is cross-bound"
+        )
+    return value
 
 
 def _raw_sha256(raw: bytes) -> str:
@@ -177,6 +213,7 @@ def _dispatch(
         value,
         {
             "execution_id",
+            "plan_binding_sha256",
             "role",
             "target",
             "topology",
@@ -187,6 +224,7 @@ def _dispatch(
             "return_contract",
             "verification_contract",
             "stop_contract",
+            "model_transition_sha256",
             "model_sha256",
             "authority",
             "user_authority",
@@ -200,6 +238,9 @@ def _dispatch(
     if execution_id in seen:
         raise witness.EvidenceError("Rolecasting dispatch execution ID is duplicated")
     seen.add(execution_id)
+    plan_binding_sha256 = witness.sha(
+        value["plan_binding_sha256"], "dispatch.plan_binding_sha256"
+    )
     role = witness.token(value["role"], "dispatch.role")
     target = _target(value["target"], "dispatch.target")
     topology = _topology(value["topology"], "dispatch.topology")
@@ -213,6 +254,9 @@ def _dispatch(
         value["verification_contract"], "dispatch.verification_contract"
     )
     stop_contract = witness.text(value["stop_contract"], "dispatch.stop_contract")
+    model_transition_sha256 = witness.sha(
+        value["model_transition_sha256"], "dispatch.model_transition_sha256"
+    )
     model_sha256 = witness.sha(value["model_sha256"], "dispatch.model_sha256")
     authority = _authority(value["authority"], "dispatch.authority")
     user_authority = _user_authority(
@@ -229,6 +273,7 @@ def _dispatch(
     )
     return {
         "execution_id": execution_id,
+        "plan_binding_sha256": plan_binding_sha256,
         "role": role,
         "target": target,
         "topology": topology,
@@ -238,6 +283,7 @@ def _dispatch(
         "return_contract": return_contract,
         "verification_contract": verification_contract,
         "stop_contract": stop_contract,
+        "model_transition_sha256": model_transition_sha256,
         "model_sha256": model_sha256,
         "authority": authority,
         "user_authority": user_authority,
@@ -257,12 +303,81 @@ def _issuer(
     return _witness().issuer(value, trust_snapshot, label, capability)
 
 
+def _transition(
+    value: Any,
+    raw: bytes,
+    dispatch: dict[str, Any],
+    subject: dict[str, Any],
+    trust_snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    witness = _witness()
+    try:
+        guard = _transition_guard()
+        transition = guard.validate_authorized_transition(value)
+    except Exception as error:
+        raise witness.EvidenceError(
+            "Rolecasting model transition is not authorized"
+        ) from error
+    transition_sha256 = _raw_sha256(raw)
+    if transition_sha256 != dispatch["model_transition_sha256"]:
+        raise witness.EvidenceError("Rolecasting model-transition digest mismatch")
+    route = _authenticated_route_evidence(
+        transition["request"]["route_evidence"]
+    )
+    route_digest = getattr(guard, "route_evidence_sha256", None)
+    if (
+        not callable(route_digest)
+        or route_digest(route) != route["content_sha256"]
+    ):
+        raise witness.EvidenceError(
+            "Rolecasting authenticated route-evidence digest mismatch"
+        )
+    route_issuer = _issuer(
+        route["evidence_issuer"],
+        trust_snapshot,
+        "Rolecasting route-evidence issuer",
+        "route-evidence",
+    )
+    event = transition["request"]["event"]
+    if (
+        event["payload_sha256"] != dispatch["request"]["content_sha256"]
+        or transition["target"] != dispatch["target"]
+    ):
+        raise witness.EvidenceError("Rolecasting model transition is cross-bound")
+    if event["task_sha256"] != subject["content_sha256"]:
+        raise witness.EvidenceError(
+            "Rolecasting model transition task identity mismatch"
+        )
+    if (
+        event["plan_binding_sha256"] != dispatch["plan_binding_sha256"]
+        or event["actuation_id"] != dispatch["execution_id"]
+    ):
+        raise witness.EvidenceError(
+            "Rolecasting model transition plan or actuation mismatch"
+        )
+    return (
+        {
+            "model_transition_sha256": transition_sha256,
+            "model_transition_authorization_sha256": transition[
+                "authorization_sha256"
+            ],
+            "model_transition_event": transition["request"]["event"]["kind"],
+            "model_transition_task_sha256": transition["request"]["event"][
+                "task_sha256"
+            ],
+            "route_evidence_issuer": route_issuer,
+        },
+        transition,
+    )
+
+
 def _model(
     value: Any,
     raw: bytes,
     dispatch: dict[str, Any],
     subject: dict[str, Any],
     trust_snapshot: dict[str, Any],
+    transition: dict[str, Any],
 ) -> dict[str, Any]:
     witness = _witness()
     value = witness.document(
@@ -275,6 +390,7 @@ def _model(
             "model",
             "reasoning_effort",
             "capability",
+            "model_transition_sha256",
         },
         "Rolecasting model selection receipt",
         MODEL_CONTRACT,
@@ -295,6 +411,20 @@ def _model(
     if capability["status"] != "available":
         raise witness.EvidenceError("Rolecasting model capability is unavailable")
     _identity(capability["evidence"], "model.capability.evidence")
+    if (
+        witness.sha(
+            value["model_transition_sha256"],
+            "model.model_transition_sha256",
+        )
+        != dispatch["model_transition_sha256"]
+        or transition["selection"]["model"] != model
+        or transition["selection"]["reasoning_effort"] != reasoning_effort
+        or transition["request"]["route_evidence"]["capability_sha256"]
+        != capability["evidence"]["content_sha256"]
+    ):
+        raise witness.EvidenceError(
+            "Rolecasting model selection receipt transition mismatch"
+        )
     model_sha256 = _raw_sha256(raw)
     if model_sha256 != dispatch["model_sha256"]:
         raise witness.EvidenceError(
@@ -315,6 +445,7 @@ def _result(
     raw: bytes,
     plan_raw: bytes,
     model_raw: bytes,
+    transition_raw: bytes,
     dispatch: dict[str, Any],
     subject: dict[str, Any],
     trust_snapshot: dict[str, Any],
@@ -329,6 +460,7 @@ def _result(
             "plan_sha256",
             "dispatch_sha256",
             "model_sha256",
+            "model_transition_sha256",
             "request",
             "returned",
             "verification",
@@ -359,6 +491,7 @@ def _result(
         value["plan_sha256"] != _raw_sha256(plan_raw)
         or value["dispatch_sha256"] != dispatch["dispatch_sha256"]
         or value["model_sha256"] != _raw_sha256(model_raw)
+        or value["model_transition_sha256"] != _raw_sha256(transition_raw)
     ):
         raise witness.EvidenceError(
             "Rolecasting execution-result receipt provenance mismatch"
@@ -427,7 +560,14 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
     )
     manifest = witness.document(
         manifest,
-        {"producer", "subject", "plan_sha256", "models", "results"},
+        {
+            "producer",
+            "subject",
+            "plan_sha256",
+            "transitions",
+            "models",
+            "results",
+        },
         "Rolecasting dispatch-evidence manifest",
         BUNDLE_CONTRACT,
     )
@@ -443,37 +583,52 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
         raise witness.EvidenceError("Rolecasting dispatch plan digest mismatch")
     plan = witness.document(
         plan,
-        {"subject", "dispatches"},
+        {"subject", "plan_binding_sha256", "dispatches"},
         "Rolecasting dispatch plan",
         PLAN_CONTRACT,
     )
     if _identity(plan["subject"], "Rolecasting plan subject") != subject:
         raise witness.EvidenceError("Rolecasting dispatch plan subject is cross-bound")
+    plan_binding_sha256 = witness.sha(
+        plan["plan_binding_sha256"], "Rolecasting plan binding"
+    )
     if not isinstance(plan["dispatches"], list) or not plan["dispatches"]:
         raise witness.EvidenceError("Rolecasting dispatch plan must be nonempty")
     seen: set[str] = set()
     dispatches = [_dispatch(value, subject, seen) for value in plan["dispatches"]]
+    if any(
+        dispatch["plan_binding_sha256"] != plan_binding_sha256
+        for dispatch in dispatches
+    ):
+        raise witness.EvidenceError("Rolecasting dispatch plan binding is cross-bound")
     sessions = [value["isolation"]["session"] for value in dispatches]
     contexts = [value["isolation"]["context"] for value in dispatches]
     if len(sessions) != len(set(sessions)) or len(contexts) != len(set(contexts)):
         raise witness.EvidenceError("Rolecasting dispatch isolation is not distinct")
     if (
-        not isinstance(manifest["models"], dict)
+        not isinstance(manifest["transitions"], dict)
+        or not isinstance(manifest["models"], dict)
         or not isinstance(manifest["results"], dict)
+        or set(manifest["transitions"]) != seen
         or set(manifest["models"]) != seen
         or set(manifest["results"]) != seen
     ):
         raise witness.EvidenceError(
-            "Rolecasting model/result inventory does not match the dispatch plan"
+            "Rolecasting transition/model/result inventory does not match the dispatch plan"
         )
 
     expected_names = {"manifest.json", "plan.json"}
     executions: dict[str, Any] = {}
+    transition_authorizations: set[str] = set()
     for dispatch in dispatches:
         execution_id = dispatch["execution_id"]
+        transition_name = f"transition-{execution_id}.json"
         model_name = f"model-{execution_id}.json"
         result_name = f"result-{execution_id}.json"
-        expected_names.update((model_name, result_name))
+        expected_names.update((transition_name, model_name, result_name))
+        transition, transition_raw = bundle.read_json(
+            transition_name, f"Rolecasting model transition {execution_id}"
+        )
         model, model_raw = bundle.read_json(
             model_name, f"Rolecasting model {execution_id}"
         )
@@ -481,6 +636,9 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
             result_name, f"Rolecasting result {execution_id}"
         )
         if witness.sha(
+            manifest["transitions"][execution_id],
+            f"Rolecasting transition inventory {execution_id}",
+        ) != _raw_sha256(transition_raw) or witness.sha(
             manifest["models"][execution_id],
             f"Rolecasting model inventory {execution_id}",
         ) != _raw_sha256(model_raw) or witness.sha(
@@ -490,12 +648,33 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
             raise witness.EvidenceError(
                 "Rolecasting artifact inventory digest mismatch"
             )
-        model_projection = _model(model, model_raw, dispatch, subject, trust_snapshot)
+        transition_projection, transition = _transition(
+            transition,
+            transition_raw,
+            dispatch,
+            subject,
+            trust_snapshot,
+        )
+        authorization_sha256 = transition["authorization_sha256"]
+        if authorization_sha256 in transition_authorizations:
+            raise witness.EvidenceError(
+                "Rolecasting model-transition authorization is duplicated"
+            )
+        transition_authorizations.add(authorization_sha256)
+        model_projection = _model(
+            model,
+            model_raw,
+            dispatch,
+            subject,
+            trust_snapshot,
+            transition,
+        )
         result_projection = _result(
             result,
             result_raw,
             plan_raw,
             model_raw,
+            transition_raw,
             dispatch,
             subject,
             trust_snapshot,
@@ -504,6 +683,7 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
             key: dispatch[key]
             for key in (
                 "execution_id",
+                "plan_binding_sha256",
                 "role",
                 "target",
                 "topology",
@@ -513,6 +693,7 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
                 "return_contract",
                 "verification_contract",
                 "stop_contract",
+                "model_transition_sha256",
                 "authority",
                 "user_authority",
                 "isolation",
@@ -521,6 +702,7 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
                 "dispatch_sha256",
             )
         }
+        executions[execution_id].update(transition_projection)
         executions[execution_id].update(model_projection)
         executions[execution_id].update(result_projection)
     if bundle.names != expected_names:
@@ -532,6 +714,7 @@ def _validate_bundle(bundle: Any, *, trust_snapshot: dict[str, Any]) -> dict[str
         "evidence_contract": BUNDLE_CONTRACT,
         "manifest_sha256": _raw_sha256(manifest_raw),
         "plan_sha256": _raw_sha256(plan_raw),
+        "plan_binding_sha256": plan_binding_sha256,
         "subject": subject,
         "producer": producer,
         "executions": executions,

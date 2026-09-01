@@ -1,4 +1,4 @@
 interface:
   display_name: "Choose Agent Models"
-  short_description: "Select models and reasoning effort safely"
-  default_prompt: "Use $rolecasting:choosing-agent-models to select the model and reasoning effort for this delegated task."
+  short_description: "Authorize model choices across task transitions"
+  default_prompt: "Use $rolecasting:choosing-agent-models to authorize the model transition before this task payload is dispatched."

@@ -13,12 +13,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = REPO_ROOT / "scripts" / "validate_rolecasting.py"
 AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
-DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v2"
+DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v3"
 DISPATCH_EVIDENCE_RUNTIME = (
     "skills/delegating-cross-agent-work/scripts/dispatch_evidence.py"
 )
 DISPATCH_ADAPTER_RUNTIME = (
     "skills/delegating-cross-agent-work/scripts/dispatch_adapter.py"
+)
+MODEL_TRANSITION_RUNTIME = "skills/choosing-agent-models/scripts/model_transition.py"
+ROUTE_EVIDENCE_RUNTIME = (
+    "skills/choosing-agent-models/scripts/route_evidence.py"
 )
 CANONICAL_MANIFEST_KEYS = {
     "$schema",
@@ -115,7 +119,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         self.assertEqual(provider["publisher"], "nisavid")
         self.assertEqual(provider["repository"], "https://github.com/nisavid/agents")
         self.assertEqual(
-            provider["authority_profile"], "rolecasting-cooperative-dispatch-v2"
+            provider["authority_profile"], "rolecasting-cooperative-dispatch-v3"
         )
         unsigned = {
             key: value for key, value in provider.items() if key != "content_sha256"
@@ -136,6 +140,12 @@ class ValidateRolecastingTests(unittest.TestCase):
         adapter = self.plugin / DISPATCH_ADAPTER_RUNTIME
         adapter_raw = adapter.read_bytes()
         adapter_sha = hashlib.sha256(adapter_raw).hexdigest()
+        transition = self.plugin / MODEL_TRANSITION_RUNTIME
+        transition_raw = transition.read_bytes()
+        transition_sha = hashlib.sha256(transition_raw).hexdigest()
+        route_evidence = self.plugin / ROUTE_EVIDENCE_RUNTIME
+        route_evidence_raw = route_evidence.read_bytes()
+        route_evidence_sha = hashlib.sha256(route_evidence_raw).hexdigest()
         validator = provider["validators"][0]
         self.assertEqual(validator["entrypoint"], "validator")
         self.assertEqual(
@@ -144,7 +154,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         )
         self.assertEqual(
             validator["validator_id"],
-            "rolecasting-dispatch-evidence-validator-v2",
+            "rolecasting-dispatch-evidence-validator-v3",
         )
         self.assertEqual(validator["contract"], DISPATCH_EVIDENCE_CONTRACT)
         self.assertEqual(
@@ -155,6 +165,18 @@ class ValidateRolecastingTests(unittest.TestCase):
                     "relative_path": DISPATCH_EVIDENCE_RUNTIME,
                     "length": len(runtime_raw),
                     "sha256": runtime_sha,
+                },
+                {
+                    "name": "model-transition",
+                    "relative_path": MODEL_TRANSITION_RUNTIME,
+                    "length": len(transition_raw),
+                    "sha256": transition_sha,
+                },
+                {
+                    "name": "route-evidence",
+                    "relative_path": ROUTE_EVIDENCE_RUNTIME,
+                    "length": len(route_evidence_raw),
+                    "sha256": route_evidence_sha,
                 },
                 {
                     "name": "adapter",
@@ -170,6 +192,8 @@ class ValidateRolecastingTests(unittest.TestCase):
             "entrypoint_module": "validator",
             "modules": [
                 {"name": "validator", "content_sha256": runtime_sha},
+                {"name": "model-transition", "content_sha256": transition_sha},
+                {"name": "route-evidence", "content_sha256": route_evidence_sha},
                 {"name": "adapter", "content_sha256": adapter_sha},
             ],
         }
@@ -186,6 +210,14 @@ class ValidateRolecastingTests(unittest.TestCase):
 
     def test_rejects_adapter_mutation_without_provider_identity_refresh(self) -> None:
         path = self.plugin / DISPATCH_ADAPTER_RUNTIME
+        path.write_bytes(path.read_bytes() + b"\n# drift\n")
+
+        self.assert_rejected("Task Witness provider declaration drift")
+
+    def test_rejects_route_verifier_mutation_without_provider_identity_refresh(
+        self,
+    ) -> None:
+        path = self.plugin / ROUTE_EVIDENCE_RUNTIME
         path.write_bytes(path.read_bytes() + b"\n# drift\n")
 
         self.assert_rejected("Task Witness provider declaration drift")
@@ -434,7 +466,7 @@ class ValidateRolecastingTests(unittest.TestCase):
             with self.subTest(constant=constant):
                 path.write_text(
                     original.replace(
-                        '"schema_version": 3', f'"schema_version": {constant}'
+                        '"schema_version": 4', f'"schema_version": {constant}'
                     )
                 )
                 self.assert_rejected(f"contains non-finite JSON value: {constant}")
@@ -444,7 +476,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         topology = self.plugin / "topology.json"
         topology.write_text(
             topology.read_text().replace(
-                '"schema_version": 3', '"schema_version": true'
+                '"schema_version": 4', '"schema_version": true'
             )
         )
         self.assert_rejected("topology schema_version must be an integer")
@@ -513,8 +545,8 @@ class ValidateRolecastingTests(unittest.TestCase):
         path = self.plugin / "skills" / "choosing-agent-models" / "SKILL.md"
         original = path.read_text()
         mutated = original.replace(
-            "preferred bounded GPT-5.6 role snapshot as of 2026-07-20",
-            "current model role family",
+            "This is a role policy, not a live catalog",
+            "This live catalog is the complete policy",
         )
         self.assertNotEqual(mutated, original)
         path.write_text(mutated)
@@ -524,8 +556,8 @@ class ValidateRolecastingTests(unittest.TestCase):
         path = self.plugin / "skills" / "choosing-agent-models" / "SKILL.md"
         original = path.read_text()
         mutated = original.replace(
-            "otherwise probe the target harness",
-            "otherwise reuse the Codex live model catalog",
+            "Use only a pair in both the target's fresh live catalog and executor schema",
+            "Reuse the Codex catalog for every target",
         )
         self.assertNotEqual(mutated, original)
         path.write_text(mutated)
@@ -614,7 +646,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         document["skills"]["delegating-cross-agent-work"]["may_call"] = []
         path.write_text(json.dumps(document, indent=2) + "\n")
         self.assert_rejected(
-            "may call model selection only when model or effort is unresolved"
+            "delegation must call model transition policy before every payload dispatch"
         )
 
     def test_rejects_reverse_selection_edge(self) -> None:
@@ -640,7 +672,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         self,
     ) -> None:
         topology = json.loads((self.plugin / "topology.json").read_text())
-        self.assertEqual(topology["schema_version"], 3)
+        self.assertEqual(topology["schema_version"], 4)
         self.assertEqual(
             topology["receipt_contract"],
             {

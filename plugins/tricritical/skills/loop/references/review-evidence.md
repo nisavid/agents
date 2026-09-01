@@ -4,7 +4,8 @@ Task Witness validates `tricritical-terminal-review-evidence-v2` with the
 registered `tricritical-terminal-review-evidence-validator-v2`. The bundle is
 one canonical `manifest.json` and returns
 `tricritical-terminal-review-projection-v2`. Each cycle binds a frozen subject, a registered
-`rolecasting-dispatch-projection-v2`, raw critic reports, a disposition-free
+`rolecasting-dispatch-projection-v3`, including its authenticated route issuer
+and task, plan, actuation, and transition bindings, raw critic reports, a disposition-free
 ensemble, post-freeze feedback, independent adjudication, optional revision,
 budget state, and one closed owner. Non-occurring phases are explicit `null`.
 

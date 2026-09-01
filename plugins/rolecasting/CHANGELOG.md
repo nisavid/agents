@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Authorize every payload-bearing lifecycle event through one pure,
+  content-addressed model-transition guard. Preserve task and account affinity,
+  judgment floors, explicit operator selections, security and Daybreak
+  requirements, and reject stale, ineligible, capacity-failed, downgraded, or
+  tampered transitions before native spawn.
+- Require a complete permitted-route inventory before first dispatch and later
+  transitions. Require an authenticated, version-bound, side-effect-safe
+  interface for the narrow metadata-only status refresh, explicitly reject
+  every Codex app-server version with a canonical `0.149.0` semantic-version
+  core, fail closed on noncanonical app-server versions, retain timestamped
+  redacted evidence, and
+  distinguish unsafe, unverified, incomplete, or denied status from capability
+  failure, model absence, missing execution authority, and capacity loss.
+- Require authenticated route-evidence provenance at every native and portable
+  payload boundary. Cross-bind task, payload, immutable plan, and actuation
+  identities, reject bundle fan-out, require exact Daybreak Max selection, and
+  leave atomic one-time authorization consumption to the owning actuator. This
+  release registers a denial-only verifier but no production route-evidence
+  issuer or accepting verifier, safe Codex app-server 0.149.0 status surface,
+  or mandatory actuator hook; successful
+  alternate-account Daybreak dispatch therefore remains blocked.
+- Bind the same transition identity through dispatch-evidence v3 plans, model
+  receipts, result receipts, manifests, and canonical projections. Retain the
+  truthful validator-only provider boundary; repository code still cannot
+  attest the effective product model or make harness integration mandatory.
 - Re-prove the original account binding before every task continuation, bind
   alternate-account Codex CLI resumes with explicit `CODEX_HOME`, and reject
   ambient resumes before sending task data when account affinity is unproven.

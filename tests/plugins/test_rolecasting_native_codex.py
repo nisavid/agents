@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import unittest
 from pathlib import Path
 from typing import Any
+
+from tests.plugins import test_rolecasting_model_transition as transition_contract
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 MODULE_PATH = (
@@ -22,21 +25,42 @@ def sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def load_module() -> Any:
+def load_module(*, with_route_verifier: bool = True) -> Any:
     spec = importlib.util.spec_from_file_location(
         "rolecasting_native_codex", MODULE_PATH
     )
     if spec is None or spec.loader is None:
         raise AssertionError("native Codex binding cannot be loaded")
     module = importlib.util.module_from_spec(spec)
+    modules = {"model-transition": transition_contract.load_module()}
+    if with_route_verifier:
+        modules["route-evidence"] = transition_contract.route_verifier()
+    module.__dict__["_VERIFIED_MODULES"] = modules
     spec.loader.exec_module(module)
     return module
 
 
 def intent(surface: str = "chatgpt-codex") -> dict[str, Any]:
+    request_sha256 = sha("bounded worker request")
+    event = transition_contract.event("new-subagent", predecessor=None)
+    event["payload_sha256"] = request_sha256
+    event["plan_binding_sha256"] = sha("complete frozen dispatch plan")
+    event["actuation_id"] = "reviewer-one"
+    selected = transition_contract.selection()
+    route = transition_contract.route(selected, event)
+    route["target"]["surface"] = surface
+    transition_contract.seal_route(route)
+    transition = transition_contract.load_module().authorize_model_transition(
+        None,
+        event,
+        transition_contract.scope(),
+        None,
+        route,
+    )
     return {
+        "task_sha256": event["task_sha256"],
         "plan_sha256": sha("complete frozen dispatch plan"),
-        "request_sha256": sha("bounded worker request"),
+        "request_sha256": request_sha256,
         "dispatch_id": "reviewer-one",
         "surface": surface,
         "version": "2026.08",
@@ -54,6 +78,7 @@ def intent(surface: str = "chatgpt-codex") -> dict[str, Any]:
             "authority": "self-reported",
             "execution_result": "controller-observed",
         },
+        "model_transition": transition,
     }
 
 
@@ -79,6 +104,10 @@ def observation(
         ),
         "result_sha256": sha("raw native result envelope"),
         "verification_observation_sha256": sha(verification),
+        "model_transition_sha256": frozen.model_transition["content_sha256"],
+        "model_transition_authorization_sha256": frozen.model_transition[
+            "authorization_sha256"
+        ],
         "usable": usable,
     }
 
@@ -97,6 +126,10 @@ class NativeCodexBindingTests(unittest.TestCase):
                 self.assertEqual(frozen.topology.transport, "native-tool")
                 self.assertFalse(frozen.authority_intent.subdelegation)
                 self.assertFalse(frozen.authority_intent.external_action)
+                self.assertEqual(
+                    frozen.model_transition["authorization"]["status"],
+                    "authorized",
+                )
 
                 recorded = native.record_native_observation(frozen, observation(frozen))
                 self.assertEqual(recorded.agent_id, "agent-42")
@@ -109,6 +142,11 @@ class NativeCodexBindingTests(unittest.TestCase):
                 )
                 self.assertFalse(recorded.portable_evidence)
                 self.assertFalse(recorded.product_attested)
+                self.assertEqual(recorded.model, "gpt-5.6-sol")
+                self.assertEqual(
+                    recorded.model_transition_sha256,
+                    frozen.model_transition["content_sha256"],
+                )
 
     def test_profile_minimum_is_rejected_before_native_spawn(self) -> None:
         native = load_module()
@@ -131,6 +169,157 @@ class NativeCodexBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(
             native.NativeDispatchError,
             "executor does not match native profile",
+        ):
+            native.freeze_native_dispatch(requested)
+
+    def test_transition_denial_or_cross_binding_is_rejected_before_native_spawn(
+        self,
+    ) -> None:
+        native = load_module()
+
+        denied = intent()
+        denied_event = transition_contract.event("new-subagent", predecessor=None)
+        denied_event["payload_sha256"] = denied["request_sha256"]
+        denied_route = transition_contract.route(
+            transition_contract.selection(), denied_event
+        )
+        denied_route["capacity"] = "exhausted"
+        denied["model_transition"] = (
+            transition_contract.load_module().authorize_model_transition(
+                None,
+                denied_event,
+                transition_contract.scope(),
+                None,
+                denied_route,
+            )
+        )
+        self.assertEqual(
+            denied["model_transition"]["authorization"]["reason"],
+            "route-capacity-exhausted",
+        )
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "model transition is not authorized",
+        ):
+            native.freeze_native_dispatch(denied)
+
+        cross_bound = intent()
+        cross_bound["request_sha256"] = sha("another payload")
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "bound to another request",
+        ):
+            native.freeze_native_dispatch(cross_bound)
+
+    def test_transition_requires_authenticated_route_evidence(self) -> None:
+        native = load_module(with_route_verifier=False)
+
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "authenticated route evidence is unavailable",
+        ):
+            native.freeze_native_dispatch(intent())
+
+    def test_transition_cannot_be_reused_for_another_plan_or_actuation(self) -> None:
+        native = load_module()
+        original = intent()
+        reused = copy.deepcopy(original)
+        reused["plan_sha256"] = sha("different frozen plan")
+        reused["dispatch_id"] = "reviewer-two"
+
+        native.freeze_native_dispatch(original)
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "plan or actuation",
+        ):
+            native.freeze_native_dispatch(reused)
+
+    def test_transition_task_identity_is_cross_bound(self) -> None:
+        native = load_module()
+        requested = intent()
+        requested["task_sha256"] = sha("another task")
+
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "task identity mismatch",
+        ):
+            native.freeze_native_dispatch(requested)
+
+    def test_forged_route_authorization_is_rejected(self) -> None:
+        native = load_module()
+        requested = intent()
+        transition_request = requested["model_transition"]["request"]
+        route = copy.deepcopy(transition_request["route_evidence"])
+        route["route_authorization_sha256"] = sha("forged route authorization")
+        requested["model_transition"] = (
+            transition_contract.load_module().authorize_model_transition(
+                transition_request["prior_state"],
+                transition_request["event"],
+                transition_request["current_scope"],
+                transition_request["operator_selection"],
+                route,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "model transition is not authorized",
+        ):
+            native.freeze_native_dispatch(requested)
+
+    def test_first_dispatch_rejects_unfinished_route_preflight(self) -> None:
+        native = load_module()
+        requested = intent()
+        transition_event = transition_contract.event(
+            "new-subagent", predecessor=None
+        )
+        transition_event["payload_sha256"] = requested["request_sha256"]
+        unfinished = transition_contract.preflight_route(
+            transition_contract.selection(),
+            bound_event=transition_event,
+            inventory_status="stale",
+        )
+        requested["model_transition"] = (
+            transition_contract.load_module().authorize_model_transition(
+                None,
+                transition_event,
+                transition_contract.scope(),
+                None,
+                unfinished,
+            )
+        )
+
+        self.assertEqual(
+            requested["model_transition"]["authorization"]["reason"],
+            "route-status-refresh-required",
+        )
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "model transition is not authorized",
+        ):
+            native.freeze_native_dispatch(requested)
+
+    def test_native_binding_rejects_user_task_transition(self) -> None:
+        native = load_module()
+        requested = intent()
+        guard = transition_contract.load_module()
+        task_event = transition_contract.event("new-task", predecessor=None)
+        task_event["payload_sha256"] = requested["request_sha256"]
+        task_event["plan_binding_sha256"] = requested["plan_sha256"]
+        task_event["actuation_id"] = requested["dispatch_id"]
+        requested["model_transition"] = guard.authorize_model_transition(
+            None,
+            task_event,
+            transition_contract.scope(),
+            None,
+            transition_contract.route(
+                transition_contract.selection(), task_event
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            native.NativeDispatchError,
+            "cannot create a user task",
         ):
             native.freeze_native_dispatch(requested)
 

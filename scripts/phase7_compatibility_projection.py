@@ -19,8 +19,8 @@ from evidence_transport import (  # noqa: E402
 )
 
 
-COMPATIBILITY_CONTRACT = "phase7-public-private-compatibility-v5"
-COMPATIBILITY_SCHEMA_VERSION = 5
+COMPATIBILITY_CONTRACT = "phase7-public-private-compatibility-v6"
+COMPATIBILITY_SCHEMA_VERSION = 6
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 
 ROLECASTING_TOPOLOGY = Path("plugins/rolecasting/topology.json")

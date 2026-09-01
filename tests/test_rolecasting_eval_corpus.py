@@ -21,7 +21,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             for skill in SKILLS
         }
 
-    def test_rolecasting_has_exactly_twenty_five_detailed_scenarios(self) -> None:
+    def test_rolecasting_has_exactly_thirty_one_detailed_scenarios(self) -> None:
         observed = {
             item["name"]
             for document in self.documents.values()
@@ -38,6 +38,9 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "high-risk-independent-review",
                 "cursor-grok-consequential-review",
                 "unrelated-task-model-is-not-a-route",
+                "daybreak-capacity-has-no-local-fallthrough",
+                "mixed-role-reclassification-preserves-floor",
+                "permitted-account-status-preflight",
                 "no-user-owned-task-without-explicit-request",
                 "foreign-peer-bounded-authority",
                 "leader-integrates-worker-results",
@@ -55,6 +58,9 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "bounded-wait-and-live-child-reconciliation",
                 "isolated-task-companion-boundary",
                 "dedicated-daybreak-resume-rebinds-account-route",
+                "same-task-capacity-recovery-rejects-terra-luna",
+                "sticky-operator-selection-requires-explicit-override",
+                "transition-receipt-required-before-payload",
             },
         )
 
@@ -118,7 +124,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
 
         for phrase in (
             "task identity",
-            "bounded purpose",
+            "purpose are route gates",
             "peer, sibling, companion, or dedicated task",
             "newly created for the current source task",
             "same-purpose companion",
@@ -155,19 +161,19 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
 
         for phrase in (
             "initial capability proof does not prove continuation capability",
-            "before sending continuation task data",
+            "before sending task data",
             "same private account binding",
-            "shared session database is not account-affinity evidence",
+            "not account-affinity or current-capacity evidence",
         ):
             with self.subTest(source="capability", phrase=phrase):
                 self.assertIn(phrase, capabilities)
 
         for phrase in (
-            "every follow-up or resume as a new dispatch gate",
+            "every follow-up, resume, retry, capacity recovery, or reclassification",
             "explicitly set `codex_home`",
             "`codex exec resume`",
-            "ambient default account",
-            "fail closed before sending the payload",
+            "ambient account",
+            "fail closed",
         ):
             with self.subTest(source="delegation", phrase=phrase):
                 self.assertIn(phrase, foreign_peers)
@@ -196,9 +202,9 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             / "SKILL.md"
         ).read_text()
 
-        self.assertRegex(skill, r"(?is)same[- ]shape.+one dispatch")
-        self.assertRegex(skill, r"(?is)review.+diff.+one unit")
-        self.assertRegex(skill, r"(?is)own judgment.+own tests.+review surface")
+        self.assertRegex(skill, r"(?is)same[- ]shape")
+        self.assertRegex(skill, r"(?is)review.+results")
+        self.assertRegex(skill, r"(?is)own judgment.+tests.+review surface")
 
     def test_delegation_skill_uses_bounded_waits_and_reconciles_live_children(
         self,
@@ -210,7 +216,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             / "SKILL.md"
         ).read_text()
 
-        self.assertRegex(skill, r"(?is)short (?:timeouts|polling).+bounded")
+        self.assertRegex(skill, r"(?is)bounded wait")
         self.assertRegex(skill, r"(?is)local work.+wait")
         self.assertRegex(skill, r"(?is)reconcile.+live children")
 
@@ -276,7 +282,7 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
             sources["topology_receipt"],
         )
         self.assertIn(
-            "Model choice is a separate decision",
+            "Model choice cannot repair topology",
             sources["choosing"],
         )
         self.assertIn(
@@ -418,8 +424,91 @@ class RolecastingEvalCorpusTests(unittest.TestCase):
                 "same-purpose-companion-only",
                 "no-model-slot-repurpose",
                 "task-creation-authority",
+                "daybreak-no-fallthrough",
+                "capacity-is-new-transition",
+                "no-payload-on-capacity-denial",
+                "mixed-role-hardest-floor",
+                "security-floor-sticky",
+                "no-terra-security-downgrade",
+                "capacity-carried-floor",
+                "same-task-terra-luna-rejected",
+                "capacity-payload-withheld",
+                "operator-selection-sticky",
+                "operator-replacement-explicit",
+                "no-implicit-operator-downgrade",
+                "transition-before-actuator",
+                "posthoc-evidence-not-launch-authority",
+                "transition-payload-cross-binding",
+                "complete-permitted-route-inventory",
+                "unsafe-status-surface-fails-closed",
+                "status-is-not-execution-authority",
             }.issubset(expectations)
         )
+
+    def test_status_preflight_rejects_the_known_stateful_codex_surface(
+        self,
+    ) -> None:
+        choosing = PLUGIN_ROOT / "skills" / "choosing-agent-models"
+        reference = " ".join(
+            (choosing / "references" / "capability-probes-and-fallbacks.md")
+            .read_text()
+            .split()
+        )
+        fixture = " ".join(
+            (
+                choosing
+                / "evals"
+                / "fixtures"
+                / "permitted-account-status-preflight.md"
+            )
+            .read_text()
+            .split()
+        )
+        scenario = next(
+            item
+            for item in self.documents["choosing-agent-models"]["evals"]
+            if item["name"] == "permitted-account-status-preflight"
+        )
+
+        for text in (reference, fixture, scenario["expected_output"]):
+            with self.subTest(source=text[:32]):
+                self.assertIn("Codex app-server 0.149.0", text)
+                self.assertIn("refresh", text)
+                self.assertIn("persist", text)
+        self.assertIn("Do not launch that version", reference)
+        self.assertIn("No supported flag or RPC", reference)
+        self.assertIn(
+            "do not invoke Codex app-server 0.149.0",
+            scenario["expected_output"],
+        )
+        self.assertIn(
+            "do not report Daybreak absent or unavailable",
+            scenario["expected_output"],
+        )
+
+    def test_transition_scenarios_cover_capacity_operator_and_pre_actuator_gates(
+        self,
+    ) -> None:
+        scenarios = {
+            item["name"]: item
+            for document in self.documents.values()
+            for item in document["evals"]
+        }
+        for name in (
+            "daybreak-capacity-has-no-local-fallthrough",
+            "mixed-role-reclassification-preserves-floor",
+            "same-task-capacity-recovery-rejects-terra-luna",
+            "sticky-operator-selection-requires-explicit-override",
+            "transition-receipt-required-before-payload",
+        ):
+            with self.subTest(name=name):
+                self.assertIn("Do not use tools.", scenarios[name]["prompt"])
+                self.assertTrue(
+                    any(
+                        expectation["severity"] == "safety"
+                        for expectation in scenarios[name]["expectations"]
+                    )
+                )
 
     def test_fable_scenario_denies_ungranted_proof_invocation(self) -> None:
         choosing_evals = self.documents["choosing-agent-models"]["evals"]

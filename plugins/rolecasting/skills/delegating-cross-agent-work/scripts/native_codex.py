@@ -79,6 +79,7 @@ class _NativeProfile(NamedTuple):
 
 class FrozenNativeDispatch(NamedTuple):
     binding_sha256: str
+    task_sha256: str
     plan_sha256: str
     request_sha256: str
     dispatch_id: str
@@ -89,10 +90,12 @@ class FrozenNativeDispatch(NamedTuple):
     assurance_minimum: Assurance
     profile_maximum_assurance: Assurance
     adapter_id: str
+    model_transition: dict[str, Any]
 
 
 class NativeDispatchRecord(NamedTuple):
     binding_sha256: str
+    task_sha256: str
     plan_sha256: str
     request_sha256: str
     dispatch_id: str
@@ -109,6 +112,10 @@ class NativeDispatchRecord(NamedTuple):
     terminal_status: str
     result_sha256: str
     verification_observation_sha256: str
+    model_transition_sha256: str
+    model_transition_authorization_sha256: str
+    model: str | None
+    reasoning_effort: str | None
     usable: bool
     portable_evidence: bool
     product_attested: bool
@@ -154,6 +161,49 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _transition_guard() -> Any:
+    modules = globals().get("_VERIFIED_MODULES")
+    if not isinstance(modules, dict) or "model-transition" not in modules:
+        raise NativeDispatchError(
+            "verified model-transition guard is unavailable before native spawn"
+        )
+    guard = modules["model-transition"]
+    if not callable(getattr(guard, "validate_authorized_transition", None)):
+        raise NativeDispatchError("verified model-transition guard API drift")
+    return guard
+
+
+def _authorized_transition(value: Any) -> dict[str, Any]:
+    try:
+        guard = _transition_guard()
+        transition = guard.validate_authorized_transition(value)
+        modules = globals().get("_VERIFIED_MODULES")
+        if not isinstance(modules, dict) or "route-evidence" not in modules:
+            raise NativeDispatchError(
+                "authenticated route evidence is unavailable before native spawn"
+            )
+        verifier = modules["route-evidence"]
+        validate = getattr(verifier, "validate_authenticated_route_evidence", None)
+        if not callable(validate):
+            raise NativeDispatchError("authenticated route-evidence API drift")
+        route = transition["request"]["route_evidence"]
+        if validate(route) != route:
+            raise NativeDispatchError("authenticated route evidence is cross-bound")
+        route_digest = getattr(guard, "route_evidence_sha256", None)
+        if (
+            not callable(route_digest)
+            or route_digest(route) != route["content_sha256"]
+        ):
+            raise NativeDispatchError(
+                "authenticated route-evidence digest mismatch"
+            )
+        return transition
+    except Exception as error:
+        if isinstance(error, NativeDispatchError):
+            raise
+        raise NativeDispatchError("model transition is not authorized") from error
 
 
 def _exact(value: Any, keys: set[str], label: str) -> dict[str, Any]:
@@ -217,6 +267,7 @@ def _authority_intent(value: Any) -> AuthorityIntent:
 
 def _frozen_payload(frozen: FrozenNativeDispatch) -> dict[str, Any]:
     return {
+        "task_sha256": frozen.task_sha256,
         "plan_sha256": frozen.plan_sha256,
         "request_sha256": frozen.request_sha256,
         "dispatch_id": frozen.dispatch_id,
@@ -227,6 +278,7 @@ def _frozen_payload(frozen: FrozenNativeDispatch) -> dict[str, Any]:
         "assurance_minimum": frozen.assurance_minimum._asdict(),
         "profile_maximum_assurance": frozen.profile_maximum_assurance._asdict(),
         "adapter_id": frozen.adapter_id,
+        "model_transition": frozen.model_transition,
     }
 
 
@@ -235,6 +287,7 @@ def _validate_frozen(frozen: Any) -> FrozenNativeDispatch:
         raise NativeDispatchError("native dispatch must be frozen before recording")
     try:
         _sha(frozen.binding_sha256, "frozen native dispatch.binding_sha256")
+        _sha(frozen.task_sha256, "frozen native dispatch.task_sha256")
         _sha(frozen.plan_sha256, "frozen native dispatch.plan_sha256")
         _sha(frozen.request_sha256, "frozen native dispatch.request_sha256")
         _token(frozen.dispatch_id, "frozen native dispatch.dispatch_id")
@@ -292,6 +345,21 @@ def _validate_frozen(frozen: Any) -> FrozenNativeDispatch:
                 raise NativeDispatchError("assurance minimum exceeds native profile")
         if frozen.adapter_id != profile.adapter_id:
             raise NativeDispatchError("adapter does not match native profile")
+        transition = _authorized_transition(frozen.model_transition)
+        transition_event = transition["request"]["event"]
+        if transition_event["payload_sha256"] != frozen.request_sha256:
+            raise NativeDispatchError("model transition is bound to another request")
+        if transition_event["task_sha256"] != frozen.task_sha256:
+            raise NativeDispatchError("model transition task identity mismatch")
+        if (
+            transition_event["plan_binding_sha256"] != frozen.plan_sha256
+            or transition_event["actuation_id"] != frozen.dispatch_id
+        ):
+            raise NativeDispatchError("model transition plan or actuation mismatch")
+        if transition["target"] != frozen.target._asdict():
+            raise NativeDispatchError("model transition target mismatch")
+        if transition["request"]["event"]["kind"] == "new-task":
+            raise NativeDispatchError("native child binding cannot create a user task")
         if _digest(_frozen_payload(frozen)) != frozen.binding_sha256:
             raise NativeDispatchError("binding digest mismatch")
     except NativeDispatchError as error:
@@ -312,6 +380,7 @@ def freeze_native_dispatch(intent: Any) -> FrozenNativeDispatch:
     intent = _exact(
         intent,
         {
+            "task_sha256",
             "plan_sha256",
             "request_sha256",
             "dispatch_id",
@@ -321,6 +390,7 @@ def freeze_native_dispatch(intent: Any) -> FrozenNativeDispatch:
             "context",
             "authority_intent",
             "assurance_minimum",
+            "model_transition",
         },
         "native dispatch intent",
     )
@@ -330,6 +400,7 @@ def freeze_native_dispatch(intent: Any) -> FrozenNativeDispatch:
     except KeyError as error:
         raise NativeDispatchError("native Codex surface is unsupported") from error
 
+    task_sha256 = _sha(intent["task_sha256"], "native dispatch intent.task_sha256")
     plan_sha256 = _sha(intent["plan_sha256"], "native dispatch intent.plan_sha256")
     request_sha256 = _sha(
         intent["request_sha256"], "native dispatch intent.request_sha256"
@@ -363,8 +434,25 @@ def freeze_native_dispatch(intent: Any) -> FrozenNativeDispatch:
                 f"{field} assurance minimum exceeds native profile"
             )
 
+    transition = _authorized_transition(intent["model_transition"])
+    transition_event = transition["request"]["event"]
+    if transition_event["payload_sha256"] != request_sha256:
+        raise NativeDispatchError("model transition is bound to another request")
+    if transition_event["task_sha256"] != task_sha256:
+        raise NativeDispatchError("model transition task identity mismatch")
+    if (
+        transition_event["plan_binding_sha256"] != plan_sha256
+        or transition_event["actuation_id"] != dispatch_id
+    ):
+        raise NativeDispatchError("model transition plan or actuation mismatch")
+    if transition["target"] != target._asdict():
+        raise NativeDispatchError("model transition target mismatch")
+    if transition["request"]["event"]["kind"] == "new-task":
+        raise NativeDispatchError("native child binding cannot create a user task")
+
     frozen = FrozenNativeDispatch(
         binding_sha256="",
+        task_sha256=task_sha256,
         plan_sha256=plan_sha256,
         request_sha256=request_sha256,
         dispatch_id=dispatch_id,
@@ -375,6 +463,7 @@ def freeze_native_dispatch(intent: Any) -> FrozenNativeDispatch:
         assurance_minimum=minimum,
         profile_maximum_assurance=profile.maximum_assurance,
         adapter_id=profile.adapter_id,
+        model_transition=transition,
     )
     return frozen._replace(binding_sha256=_digest(_frozen_payload(frozen)))
 
@@ -405,6 +494,8 @@ def record_native_observation(
             "status_observations",
             "result_sha256",
             "verification_observation_sha256",
+            "model_transition_sha256",
+            "model_transition_authorization_sha256",
             "usable",
         },
         "native observation",
@@ -415,6 +506,10 @@ def record_native_observation(
         "request_sha256": frozen.request_sha256,
         "dispatch_id": frozen.dispatch_id,
         "context": frozen.context,
+        "model_transition_sha256": frozen.model_transition["content_sha256"],
+        "model_transition_authorization_sha256": frozen.model_transition[
+            "authorization_sha256"
+        ],
     }
     for field, expected in bound_values.items():
         observed = _text(observation[field], f"native observation.{field}")
@@ -466,6 +561,7 @@ def record_native_observation(
 
     return NativeDispatchRecord(
         binding_sha256=frozen.binding_sha256,
+        task_sha256=frozen.task_sha256,
         plan_sha256=frozen.plan_sha256,
         request_sha256=frozen.request_sha256,
         dispatch_id=frozen.dispatch_id,
@@ -482,6 +578,12 @@ def record_native_observation(
         terminal_status=terminal_status,
         result_sha256=result_sha256,
         verification_observation_sha256=verification_sha256,
+        model_transition_sha256=frozen.model_transition["content_sha256"],
+        model_transition_authorization_sha256=frozen.model_transition[
+            "authorization_sha256"
+        ],
+        model=frozen.model_transition["selection"]["model"],
+        reasoning_effort=frozen.model_transition["selection"]["reasoning_effort"],
         usable=usable,
         portable_evidence=False,
         product_attested=False,

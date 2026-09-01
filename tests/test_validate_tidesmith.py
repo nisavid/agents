@@ -240,7 +240,9 @@ class ValidateTidesmithTests(unittest.TestCase):
             import yaml  # noqa: F401
         except ModuleNotFoundError:
             self.skipTest("PyYAML is required for the strict frontmatter loader")
-        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        scripts_dir = str(REPO_ROOT / "scripts")
+        sys.path.insert(0, scripts_dir)
+        self.addCleanup(lambda: sys.path.remove(scripts_dir))
         import validate_tidesmith as module
 
         crlf = "---\r\nname: writing-for-people\r\ndescription: Use when x.\r\n---\r\nBody\r\n"

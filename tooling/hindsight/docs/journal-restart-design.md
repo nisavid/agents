@@ -62,6 +62,7 @@ action
   x unresolved next-stage outcome
   x continuity and admission context
   x deadline context
+  x mutation-lineage and predecessor-verification context
   x verification outcome
 ```
 
@@ -97,6 +98,9 @@ The protected recovery interface also derives these observable dispositions:
 | `QUALIFICATION_AMBIGUOUS` | Specifically, an original `R` attempt may still commit. It never authorizes `M`. |
 | `UNPROVEN` | Protected resolution proved that no original `R` can commit and no durable authorizing `R` exists. |
 | `FENCED` | Admission, epoch, adapter, session, or incarnation continuity required for mutation is lost. |
+| `PREDECESSOR_VERIFICATION_PENDING` | The canonical lineage head has `M` but no conclusive verification outcome. A bounded evidence-only attempt may verify it; no successor `J` or `M` may begin. |
+| `PREDECESSOR_VERIFICATION_MISMATCH` | The canonical lineage head has a terminal mismatch. Ordinary successor publication is blocked pending separately approved remediation. |
+| `LINEAGE_HEAD_DRIFT` | Before its own `M`, a `JOURNALED`, `PROVEN`, or `VALID` aggregate's bound predecessor generation, head, or `V` no longer equals the canonical current state. The old aggregate cannot rebase or mutate. |
 | `VERIFICATION_BLOCKED` | `M` exists, but the evidence-only verifier could not reach a conclusion. |
 | `VERIFICATION_MISMATCH` | A conclusive target mismatch was recorded after `M`. |
 | `CONFLICT` | A caller presented a different binding under an existing stable key. The existing aggregate is unchanged. |
@@ -105,8 +109,13 @@ The protected recovery interface also derives these observable dispositions:
 `STAGE_AMBIGUOUS` is never silently mapped to absence. `FENCED` does not erase
 or downgrade a durable prefix. `CONFLICT` is scoped to the mismatched
 request and does not freeze the correctly bound aggregate. `LATE`, `UNPROVEN`,
+`PREDECESSOR_VERIFICATION_MISMATCH`, `LINEAGE_HEAD_DRIFT`,
 `VERIFICATION_MISMATCH`, and `INVARIANT_VIOLATION` are terminal for ordinary
-advancement of the affected aggregate.
+advancement of the affected aggregate. `PREDECESSOR_VERIFICATION_PENDING` is a
+bounded retry state, not mutation authority. `LINEAGE_HEAD_DRIFT` never applies
+after the aggregate has committed its own `M`: a `MUTATED` aggregate with an
+empty terminal slot requires the current lineage head to be its own `M`, and a
+terminal historical aggregate need not remain the current head.
 
 ## Recovery entry points
 
@@ -124,10 +133,12 @@ reconciler. The reconciler:
 1. authenticates the exact aggregate key and binding;
 2. reads and locks the protected aggregate through the stage interface;
 3. resolves any predecessor transaction outcome before considering a retry;
-4. revalidates every predicate required for the next stage;
-5. performs at most the uniquely permitted exact transition;
-6. commits or resolves that transition before considering another; and
-7. records a bounded, queryable recovery observation for every refusal,
+4. resolves the canonical lineage head's verification state before creating a
+   successor `J`;
+5. revalidates every predicate required for the next stage;
+6. performs at most the uniquely permitted exact transition;
+7. commits or resolves that transition before considering another; and
+8. records a bounded, queryable recovery observation for every refusal,
    ambiguity, fence, or successful advancement.
 
 It may continue through multiple safe stages during one recovery pass, but each
@@ -136,12 +147,28 @@ queue, qualification daemon, or generic background worker. Concurrent startup
 paths converge through the same aggregate serialization and stage uniqueness
 rules.
 
-`M` and conclusive verification also take a protected target-lineage lock keyed
-to the exact database and mutation domain; overlapping cohorts share one
-lineage. A later Hindsight mutation cannot overtake verification of the
-immediately preceding `M`. A successor `M` requires the predecessor either to
-have no mutation receipt or to have matching `V`; terminal mismatch requires a
-separately approved remediation path.
+The initial profile has one protected mutation lineage for the entire Hindsight
+mutation surface in each target datastore. PostgreSQL derives its key from the
+attested database identity, canonical protected target relation set, and
+publication protocol family; callers cannot define a mutation domain. Exact,
+partially overlapping, merging, and disjoint cohorts all share the lineage.
+This deliberately conservative serialization avoids any need to infer overlap.
+
+Before creating `J`, recovery locks the lineage row and binds explicit genesis
+or the exact current head `M` and its matching `V`. If the head is unverified,
+recovery reports `PREDECESSOR_VERIFICATION_PENDING` and may make a bounded
+evidence-only verification attempt for that predecessor. A match permits the
+lineage gate to be reevaluated; `UNABLE_TO_VERIFY` leaves it pending for a later
+pass. A terminal mismatch reports `PREDECESSOR_VERIFICATION_MISMATCH` and
+requires separately approved remediation.
+
+Every pre-`M` authority-bearing `J`, `P`, and `R` transaction locks that same
+row and requires its generation, head, and predecessor `V` to equal the values
+bound by `J`. At `M`, recovery repeats the check, then atomically mutates the
+target, writes `M`, and advances the lineage head. If another aggregate advanced
+first, the next attempted `P`, `R`, or `M` reports `LINEAGE_HEAD_DRIFT`. It never
+substitutes the new head or reuses the old plan and approval. Consequently, two
+aggregates may bind one verified head, but only the first exact `M` can win.
 
 Recovery is bounded. Lock or transaction-resolution timeout leaves the exact
 stage ambiguous and returns control; it does not guess an outcome, start a
@@ -157,18 +184,21 @@ session, and session-local witness still satisfy #73.
 
 | Durable prefix | Continuous and before expiry | Continuous at or after expiry | Fenced or discontinuous |
 | --- | --- | --- | --- |
-| `ABSENT` | Revalidate the approval, complete binding, target generation, exact selected and preserved cohorts, and preparation evidence; create the exact `J`. | Refuse. No new durable authority may begin; require a separately approved replacement aggregate. | Preserve preparation evidence only; require a new epoch and separately approved aggregate. |
+| `ABSENT` | Revalidate the approval, complete binding, target generation, exact selected and preserved cohorts, preparation evidence, and canonical lineage gate; create the exact `J` only from genesis or an exactly verified head. | Refuse. No new durable authority may begin; require a separately approved replacement aggregate. | Preserve preparation evidence only; require a new epoch and separately approved aggregate. |
 | `JOURNALED` | Exact-replay `J`, then create `P`. | Preserve and query `J`; it cannot newly gain mutation authority. | Preserve and query; require a new epoch and separately approved aggregate. |
 | `PROVEN` | Exact-replay `JP`, then make one protected `R` attempt with a fresh post-proof monotonic sample. | Resolve only an original `R` attempt. If no such transaction can commit and no durable `R` exists, record `UNPROVEN`. Never take a fresh sample. | Resolve an original attempt for evidence only. Even a recovered `VALID R` remains fenced from `M`. |
-| `VALID` | Automatically perform exact `M`. | Automatically perform exact `M`; expiry does not revoke a durable timely receipt. | Preserve `R`, refuse `M`, and require a new epoch and separately approved replacement aggregate. |
+| `VALID` | Automatically perform exact `M` only while the bound lineage generation, head, and predecessor `V` remain current. | Same; expiry does not revoke a durable timely receipt, but it does not override the lineage gate. | Preserve `R`, refuse `M`, and require a new epoch and separately approved replacement aggregate. |
 | `LATE` | Preserve as terminal and nonauthorizing. | Preserve as terminal and nonauthorizing. | Preserve unchanged. |
 | `MUTATED` | Never repeat `M`; resolve its receipt and automatically attempt evidence-only verification. | Same. | Never repeat `M`; a fresh evidence-only verifier may still verify it. |
 | `VERIFIED` | Return exact terminal replay and status. | Return exact terminal replay and status. | Preserve as terminal historical evidence. |
 
 Contextual dispositions override the prefix row's ordinary transition. In
-particular, `MUTATED + VERIFICATION_MISMATCH` is terminal rather than eligible
-for another successful verification attempt, and any `INVARIANT_VIOLATION`
-permits diagnosis only.
+particular, `PREDECESSOR_VERIFICATION_PENDING` permits only bounded
+evidence-only predecessor verification, `PREDECESSOR_VERIFICATION_MISMATCH`
+permits separately approved remediation only, and `LINEAGE_HEAD_DRIFT` requires
+a new plan and approval. `MUTATED + VERIFICATION_MISMATCH` is terminal rather
+than eligible for another successful verification attempt, and any
+`INVARIANT_VIOLATION` permits diagnosis only.
 
 A wrong binding under an existing stable key returns `CONFLICT` for
 that request. It neither changes the durable prefix nor prevents a correctly
@@ -200,8 +230,12 @@ When the prefix is `ABSENT` and approval remains valid, automatic recovery may
 discard or reconstruct partial preparation. Immediately before creating `J`,
 it revalidates the exact plan and approval, action, database, publication
 epoch, expected generation, selected and preserved cohort, journal bytes,
-preimage, and every authority-bearing digest. A mismatch refuses the old
-aggregate; it does not repair the binding in place.
+preimage, and every authority-bearing digest. It also locks the server-derived
+canonical mutation-lineage row and requires explicit genesis or the exact head
+`M` with matching `V`. The new aggregate binds that lineage generation, head,
+and `V`. An unverified head triggers bounded evidence-only predecessor
+verification; mismatch blocks ordinary publication. A mismatch in any binding
+refuses the old aggregate; it does not repair the binding in place.
 
 At or after expiry, preparation cannot be promoted to `J`, regardless of an
 earlier request time, cached journal bytes, pending marker, or process-local
@@ -219,9 +253,13 @@ Every protected stage uses the aggregate row lock and a unique stage key. A
 same-key, same-binding caller returns the exact committed stage; a same-key,
 different-binding caller receives request-scoped `CONFLICT`, while the
 existing aggregate retains its prefix and authority. Two recovery clients can
-never create two stage rows or apply the target effect twice. `M` and
-conclusive verification additionally share the protected target-lineage lock,
-so another Hindsight aggregate cannot mutate the covered target between them.
+never create two stage rows or apply the target effect twice. Each `J`, `P`,
+`R`, `M`, and conclusive verification transaction takes the protected lineage
+lock for its own check or update. The lock is not held between transactions.
+Instead, the first committed `M` atomically advances the head; a new `J` cannot
+bind the unverified head, and every preexisting sibling fails its bound-head
+check at its next `P`, `R`, or `M`. Thus another Hindsight aggregate cannot
+mutate the datastore before verification.
 
 The resolver treats each uncertain stage as follows:
 
@@ -293,7 +331,12 @@ continuity.
 Each verification attempt has a stable evidence identity. The protected
 transaction locks the aggregate, exact `M`, covered target rows, target lineage,
 and the aggregate's terminal verification slot before reading the target. It
-then appends one immutable outcome with `synchronous_commit=on`:
+requires the lineage head to remain that exact `M` before creating a new
+observation; a different head with an empty terminal slot is
+`INVARIANT_VIOLATION`, because a successor could not legitimately have passed
+the predecessor gate. An already terminal attempt exact-replays its outcome
+without requiring that historical `M` to remain the current head. A new attempt
+appends one immutable outcome with `synchronous_commit=on`:
 
 | Outcome | Effect |
 | --- | --- |
@@ -417,6 +460,12 @@ ambient artifacts:
 - approval expiry relation and recorded `R` outcome;
 - admission generation, publication epoch, and continuity or fence reason;
 - authoritative `M` generation and postimage binding, if present;
+- canonical mutation-lineage key and generation, expected and observed head,
+  and bound predecessor `V` or genesis, interpreted by durable prefix: the
+  bound predecessor before `M`, the aggregate's own `M` while verification is
+  pending, and no current-head requirement after a terminal outcome;
+- predecessor verification state and its permitted evidence-only or
+  remediation action;
 - verification outcome and evidence identity;
 - rollback-preimage availability and retirement state;
 - exact permitted next action or terminal refusal reason; and
@@ -443,6 +492,23 @@ and rollback:
   target effect;
 - a successor aggregate racing predecessor verification, with no later `M`
   before the predecessor reaches matching `V`;
+- identical, partially overlapping, merging, and disjoint cohorts deriving the
+  same canonical lineage in the initial profile;
+- two aggregates bound to one verified head, with exactly one `M` and a
+  `LINEAGE_HEAD_DRIFT` refusal that cannot reuse the losing approval;
+- a sibling `M` racing the loser's `P` or `R`, with the loser taking the
+  transaction-local lineage lock and appending no later pre-`M` authority after
+  drift;
+- successful `M` advancing the lineage to itself without deriving drift, a
+  `MUTATED` empty-terminal aggregate rejecting any other current head as an
+  invariant violation, and a historical terminal aggregate replaying after a
+  legitimate successor advances the lineage;
+- predecessor `MATCH`, repeated `UNABLE_TO_VERIFY`, and sticky `MISMATCH`
+  yielding, respectively, successor admission, bounded
+  `PREDECESSOR_VERIFICATION_PENDING`, and remediation-only
+  `PREDECESSOR_VERIFICATION_MISMATCH`;
+- every `M` receipt proving its canonical lineage key, prior head and
+  predecessor `V`, and atomic successor head;
 - admission replacement or revocation racing with `P`, `R`, and `M`;
 - ambiguous `M` with eventual commit, eventual abort, and bounded resolution
   timeout;

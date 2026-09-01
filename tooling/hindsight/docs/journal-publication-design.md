@@ -105,24 +105,26 @@ observation or after the stage commit. Revocation fences the affected epoch; it
 never edits historical evidence in place.
 
 Verification after exact `M` is a separate evidence-only boundary. It locks the
-exact aggregate, `M`, target rows, and terminal verification slot and
-authenticates the target database identity, but it does not require the old
-publication epoch, deployment attestation, incarnation capability, or
-activation-bound session to remain live. It may therefore run after expiry or
-fencing without reviving any mutation authority. Its role cannot create or
-consume `R`, execute `M`, alter the target, or activate an epoch.
+exact aggregate, `M`, target rows, canonical mutation-lineage row, and terminal
+verification slot and authenticates the target database identity, but it does
+not require the old publication epoch, deployment attestation, incarnation
+capability, or activation-bound session to remain live. It may therefore run
+after expiry or fencing without reviving any mutation authority. Its role
+cannot create or consume `R`, execute `M`, alter the target, or activate an
+epoch.
 
 Each authority-bearing stage records the exact admission generation and
 deployment-attestation digest it used. `R` additionally records the exact
 clock-envelope digest and monotonic sample used to derive `U`. Verification
 evidence instead binds the exact `M`, target database identity, observed
-generation, cohort, and postimage, and stable verification-attempt identity. A
-later ordinary evidence expiry does not rewrite a historical fact, while a
-later revocation fences the epoch before an unconsumed `R` can reach `M`. This
-keeps admission current through `P` and `R` instead of treating a startup check
-as permanent authority. Issue #76 owns the evidence used to qualify the
-admission controller, clock model, and each supported profile; it does not
-transfer attestation authorship to an ordinary runtime role.
+generation, cohort, postimage, canonical mutation-lineage key and head, and
+stable verification-attempt identity. A later ordinary evidence expiry does
+not rewrite a historical fact, while a later revocation fences the epoch before
+an unconsumed `R` can reach `M`. This keeps admission current through `P` and
+`R` instead of treating a startup check as permanent authority. Issue #76 owns
+the evidence used to qualify the admission controller, clock model, and each
+supported profile; it does not transfer attestation authorship to an ordinary
+runtime role.
 
 The initial profile admits exactly one transaction-owning adapter instance. It
 starts mutation-fenced, opens a dedicated database continuity session, and
@@ -181,6 +183,9 @@ including:
 - approval expiry;
 - the exact canonical `J` bytes and digest;
 - target database and publication-epoch identities;
+- the server-derived canonical mutation-lineage key, expected lineage
+  generation and head `M`, and exact predecessor `V`, or the explicit genesis
+  state;
 - expected generation and exact selected and preserved cohort digests; and
 - the exact predecessor, preimage, and rollback bindings required by the
   action.
@@ -203,19 +208,48 @@ and incarnation-capability digest it consumed. A stage from another retry,
 action, database, epoch, approval, journal, attestation, clock, or incarnation
 chain cannot be mixed into the aggregate.
 
-The logical relations are an aggregate row plus immutable `J`, `P`, `R`, and
-`M` rows, a terminal verification slot, immutable verification observations,
-and successful `V` rows. An exact `MATCH` fills the terminal slot with `V`; an
-exact `MISMATCH` fills it with a terminal mismatch observation. Database
-constraints prevent both outcomes for one aggregate. Exact SQL names may
-follow repository conventions, but the unique keys, foreign keys, append-only
-rules, and stage predicates are part of this design.
+The logical relations are a protected canonical mutation-lineage row, an
+aggregate row plus immutable `J`, `P`, `R`, and `M` rows, a terminal
+verification slot, immutable verification observations, and successful `V`
+rows. An exact `MATCH` fills the terminal slot with `V`; an exact `MISMATCH`
+fills it with a terminal mismatch observation. Database constraints prevent
+both outcomes for one aggregate. Exact SQL names may follow repository
+conventions, but the unique keys, foreign keys, append-only rules, role
+boundaries, and stage predicates are part of this design.
 
 Apply `J` atomically stores the exact encrypted rollback preimage and its
 integrity bindings in the protected schema. The preimage cannot become
 authoritative without the matching `J`, and apply `J` cannot commit without the
 preimage. Rollback `J` binds that retained apply preimage rather than publishing
 a second preimage boundary.
+
+## Canonical mutation lineage
+
+The initial profile maintains exactly one protected mutation-lineage row for
+each target datastore mutation surface. PostgreSQL derives its stable key from
+the attested target database identity, the canonical protected target relation
+set, and the publication protocol family. A caller cannot supply, rename, or
+alias the key.
+
+Every successor Hindsight apply and rollback aggregate that can mutate that
+surface shares the row. This includes identical, partially overlapping,
+merging, and disjoint cohorts. The coarse lineage intentionally sacrifices
+independent mutation concurrency so cohort overlap cannot be misclassified.
+Partitioned lineages require a separately accepted design that proves canonical
+membership and overlap, defines repartitioning, and migrates the durable head.
+
+The row records a monotonically increasing lineage generation and its head `M`,
+or explicit genesis. An aggregate created by `J` binds the exact lineage
+generation and head it observed. A non-genesis head is eligible only when its
+terminal slot contains matching `V`; the aggregate also binds that exact `V`.
+An unverified or mismatched head blocks `J`. Multiple aggregates may bind the
+same verified head, but only the first exact `M` can advance it. Every other
+aggregate then observes lineage-head drift and requires a new plan and approval
+rather than silently rebasing onto the winner. That drift comparison applies
+only before the aggregate has its own `M`. A committed `M` atomically makes
+itself the expected current head while its terminal slot is empty. Once that
+slot is terminal, exact historical replay no longer requires the aggregate to
+remain the lineage head.
 
 ## Inline publication protocol
 
@@ -225,12 +259,14 @@ The controller constructs and validates the complete successor journal before
 opening the transaction. For apply, it also constructs and verifies the exact
 encrypted rollback preimage. The journal has no claimed durable timestamp.
 
-The protected publication interface creates the aggregate and stores the exact
-canonical bytes and, for apply, the bound encrypted preimage in the same
-transaction, or returns the byte-identical existing rows. A different binding
-under the stable key returns `CONFLICT`. Concurrent creators converge through
-the database unique constraint; they do not infer absence while another creator
-is still committing.
+The protected publication interface locks the canonical mutation-lineage row.
+It requires explicit genesis or an exact head `M` with matching terminal `V`,
+then binds that lineage generation, head, and `V` into the aggregate. It creates
+the aggregate and stores the exact canonical bytes and, for apply, the bound
+encrypted preimage in the same transaction, or returns the byte-identical
+existing rows. A different binding under the stable key returns `CONFLICT`.
+Concurrent creators converge through the database unique constraint; they do
+not infer absence while another creator is still committing.
 
 The transaction sets `synchronous_commit=on` and verifies the admitted
 durability profile. Its success means the local server acknowledged WAL flush
@@ -240,8 +276,11 @@ exact query through the same protected interface.
 ### 2. Durable-proof transaction (`P`)
 
 `P` starts only after `J` commit acknowledgement or exact recovery of `J` from
-the protected synchronous path. It reads the exact aggregate and journal and
-inserts an immutable proof bound to their identities and digests.
+the protected synchronous path. It reads the exact aggregate and journal,
+locks the canonical mutation-lineage row, requires the exact generation, head,
+and predecessor `V` bound by `J`, and inserts an immutable proof bound to their
+identities and digests. Lineage drift refuses `P` without changing the durable
+prefix.
 
 `P` revalidates the current deployment attestation and durability profile, then
 commits with `synchronous_commit=on`. Because PostgreSQL flushes WAL in order,
@@ -255,12 +294,14 @@ row written outside the protected synchronous path is not proof.
 ### 3. Deadline-receipt transaction (`R`)
 
 `R` begins only after durable `P` acknowledgement or exact recovery. The
-transaction-owning adapter locks and reads that exact proof, the admission-state
-row, the current immutable deployment attestation, and the named immutable
-clock-health envelope for the database host. After the proof observation, while
-the transaction retains those locks, the adapter samples the qualified host
-monotonic clock and submits that sample to the protected finalization function.
-The interface computes without precision truncation:
+transaction-owning adapter locks and reads that exact proof, the canonical
+mutation-lineage row, the admission-state row, the current immutable deployment
+attestation, and the named immutable clock-health envelope for the database
+host. It requires the exact lineage generation, head, and predecessor `V` bound
+by `J`; drift refuses `R` before any authority-bearing sample. After the proof
+observation, while the transaction retains those locks, the adapter samples the
+qualified host monotonic clock and submits that sample to the protected
+finalization function. The interface computes without precision truncation:
 
 ```text
 elapsed = monotonic_sample - monotonic_anchor
@@ -298,8 +339,8 @@ the commit completed but the acknowledgement was lost, an exact query recovers
 Only an exact immutable `VALID R` admits mutation. `M` runs at serializable
 isolation and, in one transaction:
 
-1. locks the aggregate, exact `R`, and protected target-publication lineage for
-   the database and mutation domain, shared by every overlapping cohort;
+1. locks the aggregate, exact `R`, covered target rows, and server-derived
+   canonical mutation-lineage row;
 2. requires the aggregate's epoch to equal the unfenced active publication
    epoch in the current admission state and locks that state through commit;
 3. requires `M` to be running on the exact activation-bound PostgreSQL session,
@@ -309,14 +350,23 @@ isolation and, in one transaction:
    deployment-attestation and clock-envelope digests, and the strict
    `U < approval_expiry` predicate
    rather than trusting a status label;
-5. checks the expected generation and exact selected and preserved cohort and
-   refuses to overtake an earlier `M` on the covered target whose terminal
-   verification slot is empty or contains mismatch;
-6. selects the logical mutation timestamp inside the transaction;
-7. performs the target compare-and-swap mutation; and
-8. inserts the authoritative immutable mutation receipt with the consumed
-   `R` digest, pre- and post-generation, cohort and postimage digests, and
-   logical mutation timestamp.
+5. requires the current lineage generation and head to equal the values bound
+   by `J` and, for a non-genesis head, requires the exact bound predecessor `V`;
+6. checks the expected target generation and exact selected and preserved
+   cohort;
+7. selects the logical mutation timestamp inside the transaction;
+8. performs the target compare-and-swap mutation; and
+9. inserts the authoritative immutable mutation receipt and advances the
+   lineage row to that `M` atomically.
+
+The `M` receipt records the consumed `R`, canonical mutation-lineage key, prior
+lineage generation and head, predecessor `V` or genesis, new lineage generation
+and head, pre- and post-target generation, cohort and postimage digests, and
+logical mutation timestamp. If the current lineage differs from the binding,
+the pre-`M` interface returns `LINEAGE_HEAD_DRIFT` without mutation. A valid
+`R`, intact session, or unchanged cohort cannot override that refusal. A
+successful `M` is not drift: the transaction replaces the bound predecessor
+with its own receipt as the lineage head.
 
 The timestamp describes when the logical mutation was performed. It is not
 described as PostgreSQL's commit time or durable-completion time.
@@ -331,9 +381,13 @@ retry cannot apply the mutation twice.
 Verification reads the authoritative `M`, independently derives the expected
 postimage, and compares the exact live generation, cohort, and postimage while
 holding the aggregate, covered target rows, protected target-publication
-lineage, and terminal verification locks. The protected interface serializes
-every verification attempt for the exact `M` and records one immutable outcome
-with `synchronous_commit=on`:
+lineage, and terminal verification locks. The lineage head must be the exact
+`M` under verification before a new observation reads the target. A different
+head while its terminal slot is empty is an invariant violation because no
+successor `M` may have committed first. An already filled terminal slot returns
+its exact outcome without requiring that historical `M` to remain the current
+head. The protected interface serializes every verification attempt for the
+exact `M` and records one immutable outcome with `synchronous_commit=on`:
 
 - `MATCH` fills the previously empty terminal slot and appends authoritative
   `V`;
@@ -348,9 +402,12 @@ same-attempt replay returns its exact observation; a later attempt after a
 terminal outcome returns that outcome without rereading it as a new decision.
 `V` remains authoritative only for completed successful verification. A file
 export can be regenerated from `J` through `V`; losing an export never changes
-authority or requires another mutation. Because `M` and conclusive verification
-share the target-lineage lock, another Hindsight aggregate cannot mutate the
-covered target between them.
+authority or requires another mutation. `M` atomically installs itself as the
+lineage head. While that head lacks matching `V`, a new `J` cannot bind it and
+an already-created sibling fails its bound-head check at `P`, `R`, or `M`.
+Therefore no successor mutation can overtake verification. The lineage lock
+serializes each transaction's check and update; it is not held across the
+interval between `M` and verification.
 
 ## State and recovery
 
@@ -386,7 +443,8 @@ to `VALID` while all predicates still hold. At or after expiry:
 - a missing `R` remains `QUALIFICATION_AMBIGUOUS` until protected same-key
   recovery resolves any original attempt; a newly sampled post-expiry attempt
   cannot become `VALID`;
-- an exact durable `VALID R` may proceed to `M` after expiry;
+- an exact durable `VALID R` may proceed to `M` after expiry only while its
+  bound lineage generation, head, and predecessor `V` remain current;
 - `LATE` and `UNPROVEN` never admit `M`; a request-scoped `CONFLICT` cannot
   advance its mismatched request but does not freeze the correctly bound
   aggregate; and
@@ -486,12 +544,15 @@ only narrow protected interfaces:
 - the admission role alone can author or revoke deployment attestations and
   clock envelopes, fence an incarnation, and activate a publication epoch from
   the required external deployment signal and new live capability;
-- the publication role can advance and query `J`, `P`, and `R`, but cannot
-  mutate target state;
+- the publication role can advance and query `J`, `P`, and `R` and lock and read
+  the lineage row only to bind `J` and revalidate that binding at `P` and `R`,
+  but cannot update the lineage or mutate target state;
 - the mutation role can consume an exact `VALID R` through the protected `M`
-  interface, but cannot insert, update, delete, or forge prior stages;
+  interface and advance the lineage only atomically with `M`, but cannot update
+  it separately or insert, update, delete, or forge prior stages;
 - the evidence-only verification role can append an observation or `V` only
-  for the exact immutable `M`, and cannot perform any authority-bearing stage;
+  for the exact immutable `M` and may only lock and read the lineage row, but
+  cannot update it or perform any authority-bearing stage;
   and
 - no runtime role can update or delete completed stages or bypass the stable
   conflict key.
@@ -547,6 +608,18 @@ outcomes falsifiable:
 - a missing or invalid synchronous durability setting prevents authorization;
 - generation, cohort, receipt, or database-binding drift aborts `M` without
   mutation;
+- the server derives one canonical lineage for identical, partially
+  overlapping, merging, and disjoint cohorts in the initial profile;
+- `J` cannot bind a non-genesis lineage head until that exact `M` has matching
+  `V`, and a terminal predecessor mismatch blocks ordinary successors;
+- concurrent aggregates bound to the same verified head produce one lineage
+  advance; every loser reports `LINEAGE_HEAD_DRIFT` and cannot reuse its
+  approval;
+- a sibling `M` racing a loser's `P` or `R` makes the loser fail its
+  transaction-local lineage check, so no later pre-`M` authority is appended
+  after drift;
+- each `M` receipt proves the prior lineage head, consumed predecessor `V`, and
+  atomic new lineage head;
 - lost `M` acknowledgement recovers the exact postimage and never repeats the
   mutation;
 - a successor aggregate cannot execute `M` before the immediately preceding

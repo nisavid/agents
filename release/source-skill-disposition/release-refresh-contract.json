@@ -72,11 +72,11 @@
       "path": "release/source-skill-lineage/source-manifest.json"
     }
   },
-  "content_sha256": "sha256:a90ee3e714b81fa60e598db1d18f0221ba50963e2f9a850ddaa75c611517a8c6",
+  "content_sha256": "sha256:fcea3d37061c89304cc899a98794835262aed7d1c889e90b4d701d827040335f",
   "contract": "coordinated-source-skill-release-refresh-v1",
   "disposition_ledger": {
     "path": "release/source-skill-disposition/disposition-ledger.json",
-    "sha256": "sha256:83ecc0eae362dd6bf5034fae90dbbe41ddcf002946fe55d4474d5bd80031ca75"
+    "sha256": "sha256:61f0b8b3f0460b466e948d7e8e884995da33cbcf16cf63c3ff065d6181e7dd53"
   },
   "final_rescout_artifact": {
     "contract": "coordinated-final-installed-library-rescout-v1",

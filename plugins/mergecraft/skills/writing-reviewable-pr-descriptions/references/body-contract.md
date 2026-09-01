@@ -10,6 +10,10 @@ reviewed commit deserves approval. Lead with the resulting behavior and why it
 matters. Explain the concrete problem, current scope, unchanged boundaries,
 efficient review entry point, material contracts or risks, observed evidence,
 and remaining work where each concern naturally belongs.
+For a fix, say what used to go wrong: the realistic scenario, how bad it could
+get, and whether the failure was hypothetical, accidental, or exploitable,
+naming threat surface and blast radius when security is implicated, with
+severity stated honestly, neither inflated nor waved off.
 
 Do not turn those concerns into a fixed section inventory. A tiny change may
 answer them in one sentence. A large change may need an ordered review path,
@@ -99,6 +103,9 @@ confidence beyond automated checks.
    host-mutating work. State the blast radius. Every executed stateful scenario
    ends with `Cleanup:` or `Cleanup gap:`; optionality never makes cleanup
    optional.
+   When scenarios share steps, write the shared material once and state what the
+   variant changes; an unexplained verbatim repeat reads as a mistake or a
+   second run.
 4. Distinguish evidence observed at the reviewed commit from unrun or proposed
    work. Do not make reviewers repeat author-run evidence unless independent
    reproduction is a real gate. Run every safe, authorized command relied on by

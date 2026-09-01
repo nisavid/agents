@@ -173,6 +173,68 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertEqual(self.readme(), stale)
         self.assertEqual((self.plugin / "content-lock.json").read_bytes(), lock_before)
 
+    def publish_one_skill(self, *, description: str = "Use when prose must meet the house register.") -> str:
+        skill = "writing-for-people"
+        prompt = f"Use $tidesmith:{skill} to write this message to its reader."
+        topology_path = self.plugin / "topology.json"
+        topology_path.write_text(
+            json.dumps(
+                {"schema_version": 1, "skills": {skill: {"owns": ["register"], "may_call": []}}},
+                indent=2,
+            )
+            + "\n"
+        )
+        root = self.plugin / "skills" / skill
+        (root / "agents").mkdir(parents=True)
+        (root / "references").mkdir()
+        (root / "SKILL.md").write_text(
+            "---\n"
+            f"name: {skill}\n"
+            f"description: {description}\n"
+            "---\n\n"
+            "# Writing for people\n\n"
+            "Open with the finding. Details live in "
+            "[the register reference](references/register.md).\n",
+            encoding="utf-8",
+        )
+        (root / "references" / "register.md").write_text("# Register\n\nPlain speech.\n")
+        (root / "agents" / "openai.yaml").write_text(
+            "interface:\n"
+            '  display_name: "Writing for people"\n'
+            '  short_description: "Write human-facing prose to house standards."\n'
+            f'  default_prompt: "{prompt}"\n'
+        )
+        manifest_path = self.plugin / "plugin.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"] = [prompt]
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        return skill
+
+    def test_publishing_one_skill_regenerates_registry_and_locks_skill_files(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("PyYAML is required for skill validation")
+        skill = self.publish_one_skill()
+        result = self.validate("--write-content-lock")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"| `{skill}` | register | - |", self.readme())
+        lock = json.loads((self.plugin / "content-lock.json").read_text())
+        self.assertIn(f"skills/{skill}/SKILL.md", lock["files"])
+        self.assertIn(f"skills/{skill}/agents/openai.yaml", lock["files"])
+        self.assertIn(f"skills/{skill}/references/register.md", lock["files"])
+        self.assertEqual(self.validate().returncode, 0)
+
+    def test_published_skill_description_must_start_with_the_trigger_phrase(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("PyYAML is required for skill validation")
+        self.publish_one_skill(description="Writes prose to the house register.")
+        result = self.validate("--write-content-lock")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("description trigger drift", result.stderr)
+
     def test_frontmatter_parser_accepts_crlf_and_missing_trailing_newline(self) -> None:
         try:
             import yaml  # noqa: F401

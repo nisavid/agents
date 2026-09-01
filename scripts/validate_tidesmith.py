@@ -285,9 +285,7 @@ def render_skill_registry(topology: dict) -> str:
     return "\n".join(lines)
 
 
-def validate_readme_projection(root: Path, topology: dict) -> None:
-    readme = read(root, "README.md")
-    require("## Public skills" in readme, "README projection sections drift")
+def locate_registry_span(readme: str) -> tuple[int, int]:
     require(
         readme.count(REGISTRY_START) == 1 and readme.count(REGISTRY_END) == 1,
         "README skill registry markers drift",
@@ -295,6 +293,13 @@ def validate_readme_projection(root: Path, topology: dict) -> None:
     start = readme.index(REGISTRY_START)
     end = readme.index(REGISTRY_END) + len(REGISTRY_END)
     require(start < end, "README skill registry markers drift")
+    return start, end
+
+
+def validate_readme_projection(root: Path, topology: dict) -> None:
+    readme = read(root, "README.md")
+    require("## Public skills" in readme, "README projection sections drift")
+    start, end = locate_registry_span(readme)
     require(
         readme[start:end] == render_skill_registry(topology),
         "README skill registry drift",
@@ -488,7 +493,7 @@ def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
         "Codex default prompts must be strings",
     )
     require(
-        default_prompts == [prompts[skill] for skill in topology["skills"]],
+        default_prompts == [prompts[skill] for skill in sorted(topology["skills"])],
         "Codex default prompts drift",
     )
     changelog = read(root, "CHANGELOG.md")
@@ -625,19 +630,13 @@ def inspect_contract(root: Path, *, expect_registry: bool = True) -> tuple[dict,
     if expect_registry:
         validate_readme_projection(root, topology)
     else:
-        require(
-            read(root, "README.md").count(REGISTRY_START) == 1
-            and read(root, "README.md").count(REGISTRY_END) == 1,
-            "README skill registry markers drift",
-        )
+        locate_registry_span(read(root, "README.md"))
     return topology, semantic_file_set(skill_files)
 
 
 def rendered_readme(root: Path, topology: dict) -> str:
     readme = read(root, "README.md")
-    start = readme.index(REGISTRY_START)
-    end = readme.index(REGISTRY_END) + len(REGISTRY_END)
-    require(start < end, "README skill registry markers drift")
+    start, end = locate_registry_span(readme)
     return readme[:start] + render_skill_registry(topology) + readme[end:]
 
 

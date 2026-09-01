@@ -648,6 +648,30 @@ def validate_text_portability(text: str, label: str) -> None:
         )
 
 
+def publish_generated_files(root: Path, readme: str, semantic_files: set[str]) -> None:
+    """Stage both generated files, then publish them; restore on partial failure."""
+    readme_path = root / "README.md"
+    lock_path = root / "content-lock.json"
+    original_readme = readme_path.read_bytes()
+    readme_stage = root / ".README.md.tidesmith-stage"
+    lock_stage = root / ".content-lock.json.tidesmith-stage"
+    try:
+        readme_stage.write_text(readme, encoding="utf-8")
+        readme_stage.replace(readme_path)
+        lock_stage.write_text(
+            json.dumps(content_lock_document(root, semantic_files), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        lock_stage.replace(lock_path)
+    except OSError:
+        readme_path.write_bytes(original_readme)
+        raise
+    finally:
+        for stage in (readme_stage, lock_stage):
+            if stage.exists():
+                stage.unlink()
+
+
 def usage() -> None:
     print(
         "usage: validate_tidesmith.py [--write-content-lock] [repo-root]",
@@ -672,12 +696,7 @@ def main() -> None:
             validate_text_portability(readme, "README.md")
             validate_inventory(root, semantic_files, allow_missing_content_lock=True)
             validate_portability(root)
-            (root / "README.md").write_text(readme, encoding="utf-8")
-            (root / "content-lock.json").write_text(
-                json.dumps(content_lock_document(root, semantic_files), indent=2)
-                + "\n",
-                encoding="utf-8",
-            )
+            publish_generated_files(root, readme, semantic_files)
             topology, semantic_files = inspect_contract(root)
             validate_inventory(root, semantic_files)
         else:

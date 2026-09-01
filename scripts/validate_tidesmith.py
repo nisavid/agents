@@ -301,22 +301,6 @@ def validate_readme_projection(root: Path, topology: dict) -> None:
     )
 
 
-def materialize_readme_projection(root: Path, topology: dict) -> None:
-    readme_path = root / "README.md"
-    readme = read(root, "README.md")
-    require(
-        readme.count(REGISTRY_START) == 1 and readme.count(REGISTRY_END) == 1,
-        "README skill registry markers drift",
-    )
-    start = readme.index(REGISTRY_START)
-    end = readme.index(REGISTRY_END) + len(REGISTRY_END)
-    require(start < end, "README skill registry markers drift")
-    readme_path.write_text(
-        readme[:start] + render_skill_registry(topology) + readme[end:],
-        encoding="utf-8",
-    )
-
-
 def validate_skills(root: Path, topology: dict) -> tuple[dict, set[str]]:
     skills_root = root / "skills"
     if topology["skills"]:
@@ -633,15 +617,36 @@ def validate_content_lock(root: Path, semantic_files: set[str]) -> None:
     require(files == expected["files"], "semantic content lock mismatch")
 
 
-def inspect_contract(root: Path, *, materialize: bool = False) -> set[str]:
+def inspect_contract(root: Path, *, expect_registry: bool = True) -> tuple[dict, set[str]]:
     topology = validate_topology(root)
     prompts, skill_files = validate_skills(root, topology)
     validate_manifests(root, topology, prompts)
     validate_delivery(root)
-    if materialize:
-        materialize_readme_projection(root, topology)
-    validate_readme_projection(root, topology)
-    return semantic_file_set(skill_files)
+    if expect_registry:
+        validate_readme_projection(root, topology)
+    else:
+        require(
+            read(root, "README.md").count(REGISTRY_START) == 1
+            and read(root, "README.md").count(REGISTRY_END) == 1,
+            "README skill registry markers drift",
+        )
+    return topology, semantic_file_set(skill_files)
+
+
+def rendered_readme(root: Path, topology: dict) -> str:
+    readme = read(root, "README.md")
+    start = readme.index(REGISTRY_START)
+    end = readme.index(REGISTRY_END) + len(REGISTRY_END)
+    require(start < end, "README skill registry markers drift")
+    return readme[:start] + render_skill_registry(topology) + readme[end:]
+
+
+def validate_text_portability(text: str, label: str) -> None:
+    for pattern in PORTABILITY_PATTERNS:
+        require(
+            pattern.search(text) is None,
+            f"portability or credential leak in {label}",
+        )
 
 
 def usage() -> None:
@@ -662,19 +667,24 @@ def main() -> None:
     try:
         repo_root = Path(arguments[0]) if arguments else Path.cwd()
         root = locate_root(repo_root)
-        semantic_files = inspect_contract(root, materialize=write_lock)
-        validate_inventory(
-            root, semantic_files, allow_missing_content_lock=write_lock
-        )
-        validate_portability(root)
         if write_lock:
-            lock_path = root / "content-lock.json"
-            lock_path.write_text(
+            topology, semantic_files = inspect_contract(root, expect_registry=False)
+            readme = rendered_readme(root, topology)
+            validate_text_portability(readme, "README.md")
+            validate_inventory(root, semantic_files, allow_missing_content_lock=True)
+            validate_portability(root)
+            (root / "README.md").write_text(readme, encoding="utf-8")
+            (root / "content-lock.json").write_text(
                 json.dumps(content_lock_document(root, semantic_files), indent=2)
                 + "\n",
                 encoding="utf-8",
             )
+            topology, semantic_files = inspect_contract(root)
             validate_inventory(root, semantic_files)
+        else:
+            topology, semantic_files = inspect_contract(root)
+            validate_inventory(root, semantic_files)
+            validate_portability(root)
         validate_content_lock(root, semantic_files)
     except (
         AgentPluginContractError,

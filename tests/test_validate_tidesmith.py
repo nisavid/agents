@@ -159,6 +159,20 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertTrue((self.plugin / "content-lock.json").is_file())
         self.assertEqual(self.validate().returncode, 0)
 
+    def test_failed_write_leaves_generated_files_untouched(self) -> None:
+        readme = self.readme()
+        start = readme.index(REGISTRY_START) + len(REGISTRY_START)
+        end = readme.index(REGISTRY_END)
+        stale = readme[:start] + "\nstale registry\n" + readme[end:]
+        self.write_readme(stale)
+        lock_before = (self.plugin / "content-lock.json").read_bytes()
+        (self.plugin / "NOTES.md").write_text("stray\n")
+        result = self.validate("--write-content-lock")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("component inventory drift", result.stderr)
+        self.assertEqual(self.readme(), stale)
+        self.assertEqual((self.plugin / "content-lock.json").read_bytes(), lock_before)
+
     def test_frontmatter_parser_accepts_crlf_and_missing_trailing_newline(self) -> None:
         try:
             import yaml  # noqa: F401

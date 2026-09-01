@@ -76,7 +76,7 @@ WORKFLOW_STEPS = [
     "capture-final-refresh-and-qualification-receipts",
 ]
 DISPOSITION_INVENTORY_SHA256 = (
-    "sha256:faa689ff66fb4de87a5bad218993647c78ae82c5da59a0c369cafc77056a047a"
+    "sha256:5c18a83ec2d3811fcaf4a29fabc263e920ca320c50fbf0ef0ac289964aa20992"
 )
 FRESHNESS = {
     "maximum_age_seconds": 86400,

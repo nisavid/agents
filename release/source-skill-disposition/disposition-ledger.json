@@ -4,7 +4,7 @@
     "managed_source_mutation": "not-granted",
     "release_eligibility": "not-asserted"
   },
-  "content_sha256": "sha256:637d9f1020b30dbc774d00cd2ddbd633e5593c85c4410064b4f510eef99c0d04",
+  "content_sha256": "sha256:f632a56f38741896a39de3ea27461a3b5acc034e33a5d5f2f32cb2053a402274",
   "contract": "coordinated-source-skill-disposition-ledger-v1",
   "dispositions": [
     {
@@ -253,13 +253,15 @@
       ],
       "evidence_paths": [
         "docs/superpowers/research/2026-08-26-mergecraft-statline-source-resync.md",
+        "docs/superpowers/research/2026-09-01-review-writing-cluster-reconciliation.md",
         "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md",
         "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/SKILL.md"
       ],
       "follow_up_issues": [
-        45
+        45,
+        51
       ],
-      "rationale": "The canonical duo now incorporates, corrects, supersedes, or explicitly excludes every material behavior observed at dotfiles source revision cd2071e4dd885d293325a3af063421db9579a7df. Issue #45 still owns release qualification, installation, migration, and retirement.",
+      "rationale": "The canonical duo now incorporates, corrects, supersedes, or explicitly excludes every material behavior observed at dotfiles source revision cd2071e4dd885d293325a3af063421db9579a7df, and the review-writing cluster note extends that classification to revision f7004719af092d30c9037425e71c21c0aca4c7ff. The dotfiles-only reviewing-others-prs route, absent from the initial host inventories, is dispositioned supersede-and-remove: its reviewer boundary and Comment Voice thread shape pass to the planned Mergecraft reviewing-others-prs successor and review-voice reference, with removal owned by issue 51 under install-before-remove. Issue #45 still owns release qualification, installation, migration, and retirement.",
       "skill_dispositions": [],
       "source_id": "ivan-mergecraft"
     },
@@ -295,10 +297,13 @@
         "obra-elements-of-style"
       ],
       "evidence_paths": [
-        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md"
+        "docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md",
+        "docs/superpowers/research/2026-09-01-review-writing-cluster-reconciliation.md"
       ],
-      "follow_up_issues": [],
-      "rationale": "Writing style guidance remains a distinct external owner rather than plugin equipment.",
+      "follow_up_issues": [
+        83
+      ],
+      "rationale": "The Elements of Style skill remains an external owner retained side by side. Portable writing mechanics for agent-authored prose (register, evidence-in-prose discipline, post-draft edit passes) become Provingkit equipment in the planned Tidesmith plugin, reversing the earlier position that writing guidance is not plugin equipment.",
       "skill_dispositions": [],
       "source_id": "obra-elements-of-style"
     },

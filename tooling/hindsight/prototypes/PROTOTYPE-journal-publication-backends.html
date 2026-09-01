@@ -1,0 +1,1759 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype: Hindsight journal publication backends</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f4f3ee;
+      --surface: #fffefa;
+      --ink: #17211f;
+      --muted: #52605c;
+      --line: #c7cec9;
+      --accent: #006b5e;
+      --accent-dark: #004e45;
+      --valid: #176b45;
+      --unproven: #7a5700;
+      --late: #9a351f;
+      --conflict: #7f2448;
+      --focus: #005fcc;
+      --radius: 14px;
+      --shadow: 0 12px 30px rgba(23, 33, 31, 0.08);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { background: var(--paper); }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      line-height: 1.5;
+    }
+
+    ::selection {
+      color: #ffffff;
+      background: var(--accent-dark);
+    }
+
+    button,
+    input,
+    select,
+    textarea { font: inherit; }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    button {
+      min-height: 42px;
+      padding: 0.62rem 0.9rem;
+      border: 1px solid var(--accent-dark);
+      border-radius: 10px;
+      color: #ffffff;
+      background: var(--accent);
+      cursor: pointer;
+    }
+
+    button:hover { background: var(--accent-dark); }
+
+    button.secondary {
+      color: var(--ink);
+      border-color: var(--line);
+      background: var(--surface);
+    }
+
+    button.secondary:hover { background: #e7ebe7; }
+
+    button:disabled {
+      color: #78817e;
+      border-color: #d6dbd7;
+      background: #e8ebe8;
+      cursor: not-allowed;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .masthead,
+    main {
+      width: min(1480px, calc(100% - 2rem));
+      margin: 0 auto;
+    }
+
+    .masthead {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 390px);
+      gap: 2rem;
+      align-items: end;
+      padding: 2.3rem 0 2rem;
+    }
+
+    h1,
+    h2,
+    h3,
+    p { margin-top: 0; }
+
+    h1 {
+      max-width: 18ch;
+      margin-bottom: 0.8rem;
+      font-size: clamp(2rem, 5vw, 4.3rem);
+      line-height: 0.98;
+      letter-spacing: -0.035em;
+    }
+
+    h2 {
+      margin-bottom: 0.8rem;
+      font-size: 1.35rem;
+      letter-spacing: -0.015em;
+    }
+
+    h3 {
+      margin-bottom: 0.55rem;
+      font-size: 1rem;
+    }
+
+    .question {
+      max-width: 75ch;
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 1.03rem;
+    }
+
+    .throwaway {
+      margin: 0;
+      padding: 1rem 1.1rem;
+      border: 1px solid #b9a66a;
+      border-radius: var(--radius);
+      color: #4f3f0e;
+      background: #fff8dc;
+    }
+
+    main { padding: 1.4rem 0 4rem; }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) minmax(280px, 2fr);
+      gap: 1.2rem;
+      align-items: end;
+      margin-bottom: 1.4rem;
+      padding-bottom: 1.4rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    label {
+      display: grid;
+      gap: 0.35rem;
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 650;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      padding: 0.68rem 0.72rem;
+      border: 1px solid #aeb8b2;
+      border-radius: 8px;
+      color: var(--ink);
+      background: #ffffff;
+    }
+
+    textarea {
+      min-height: 98px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.83rem;
+    }
+
+    .candidate-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--line);
+    }
+
+    .candidate-summary div {
+      min-height: 100%;
+      padding: 0.85rem 0.95rem;
+      background: var(--surface);
+    }
+
+    .candidate-summary dt {
+      margin-bottom: 0.2rem;
+      color: var(--muted);
+      font-size: 0.74rem;
+      font-weight: 750;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .candidate-summary dd {
+      margin: 0;
+      font-size: 0.9rem;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(330px, 0.85fr) minmax(520px, 1.55fr);
+      gap: 1.4rem;
+      align-items: start;
+    }
+
+    .controls,
+    .state-view {
+      min-width: 0;
+    }
+
+    .section {
+      margin-bottom: 1.35rem;
+      padding: 1.1rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.8rem;
+    }
+
+    .form-grid .wide { grid-column: 1 / -1; }
+
+    .button-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.6rem;
+    }
+
+    .button-grid button { text-align: left; }
+
+    .hint {
+      margin-bottom: 0.85rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 0.35rem;
+      overflow-x: auto;
+      padding: 0 0 0.55rem;
+      scrollbar-color: var(--accent) #e3e7e3;
+    }
+
+    .tabs button {
+      flex: 0 0 auto;
+      min-height: 36px;
+      padding: 0.48rem 0.7rem;
+      color: var(--ink);
+      border-color: var(--line);
+      background: transparent;
+      font-size: 0.8rem;
+    }
+
+    .tabs button[aria-pressed="true"] {
+      color: #ffffff;
+      border-color: var(--accent-dark);
+      background: var(--accent-dark);
+    }
+
+    .validation-error {
+      margin: 0.7rem 0 0;
+      color: var(--late);
+      font-size: 0.85rem;
+      font-weight: 700;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    .guide-copy {
+      min-height: 4.8rem;
+      margin: 0.6rem 0 0.9rem;
+      color: var(--muted);
+    }
+
+    .guide-steps {
+      display: grid;
+      gap: 0.45rem;
+    }
+
+    .guide-steps button {
+      display: grid;
+      grid-template-columns: 3rem minmax(0, 1fr);
+      gap: 0.5rem;
+      align-items: center;
+      text-align: left;
+    }
+
+    .step-number {
+      font-variant-numeric: tabular-nums;
+      font-weight: 750;
+    }
+
+    .result-strip {
+      display: grid;
+      grid-template-columns: minmax(130px, 0.35fr) minmax(0, 1.65fr);
+      overflow: hidden;
+      margin-bottom: 1rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .result-code {
+      display: grid;
+      place-items: center;
+      min-height: 118px;
+      padding: 1rem;
+      color: #ffffff;
+      background: var(--unproven);
+      font-size: 1.2rem;
+      font-weight: 800;
+      letter-spacing: 0.025em;
+    }
+
+    .result-code[data-state="VALID"] { background: var(--valid); }
+    .result-code[data-state="LATE"] { background: var(--late); }
+    .result-code[data-state="CONFLICT"] { background: var(--conflict); }
+
+    .result-detail { padding: 1rem 1.1rem; }
+    .result-detail p:last-child { margin-bottom: 0; }
+
+    .state-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      overflow: hidden;
+      margin-bottom: 1rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--line);
+    }
+
+    .state-block {
+      min-height: 150px;
+      padding: 0.85rem;
+      background: var(--surface);
+    }
+
+    .state-list {
+      display: grid;
+      grid-template-columns: minmax(105px, 0.8fr) minmax(0, 1.2fr);
+      gap: 0.32rem 0.6rem;
+      margin: 0;
+      font-size: 0.82rem;
+    }
+
+    .state-list dt { color: var(--muted); }
+    .state-list dd {
+      min-width: 0;
+      margin: 0;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    details {
+      margin-bottom: 1rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    summary {
+      padding: 0.85rem 1rem;
+      cursor: pointer;
+      font-weight: 750;
+    }
+
+    pre {
+      max-height: 520px;
+      margin: 0;
+      overflow: auto;
+      padding: 1rem;
+      border-top: 1px solid var(--line);
+      color: #d9eee9;
+      background: #12211e;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.78rem;
+      line-height: 1.55;
+      scrollbar-color: #5e8e83 #12211e;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .trace {
+      max-height: 270px;
+      overflow: auto;
+      border-top: 1px solid var(--line);
+    }
+
+    .trace ol {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .trace li {
+      display: grid;
+      grid-template-columns: 3.4rem 8.8rem minmax(0, 1fr);
+      gap: 0.7rem;
+      padding: 0.62rem 1rem;
+      border-bottom: 1px solid #e1e4e1;
+      font-size: 0.8rem;
+    }
+
+    .trace li:last-child { border-bottom: 0; }
+    .trace-index,
+    .trace-action {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .trace-index { color: var(--muted); }
+    .trace-action { font-weight: 750; }
+
+    .footnote {
+      max-width: 75ch;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    @media (max-width: 980px) {
+      .masthead,
+      .toolbar,
+      .workspace { grid-template-columns: 1fr; }
+
+      .masthead { align-items: start; }
+      .candidate-summary { grid-template-columns: 1fr; }
+      .state-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 620px) {
+      .masthead,
+      main { width: min(100% - 1rem, 1480px); }
+      .masthead { padding-top: 1.4rem; }
+      .form-grid,
+      .button-grid,
+      .state-grid { grid-template-columns: 1fr; }
+      .trace li { grid-template-columns: 2.5rem minmax(0, 1fr); }
+      .trace-message { grid-column: 2; }
+      .result-strip { grid-template-columns: 1fr; }
+      .result-code { min-height: 70px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="masthead">
+      <div>
+        <h1>Journal publication backend spike</h1>
+        <p class="question">
+          This prototype asks which concrete backend can establish
+          <code>journal_durable_completion ≤ proof_durable_completion ≤ trusted_post_proof_upper_bound &lt; approval_expiry</code>
+          with enough benefit over existing storage to justify its development, operations, debugging, and maintenance burden.
+        </p>
+      </div>
+      <p class="throwaway">
+        <strong>Throwaway, source-only model.</strong> All records, times, delays, receipts, and failures below are synthetic and live only in this browser tab. This page is not production code or durability evidence.
+      </p>
+    </div>
+  </header>
+
+  <main>
+    <section class="toolbar" aria-labelledby="candidate-heading">
+      <label id="candidate-heading" for="candidate-select">
+        Publication candidate
+        <select id="candidate-select"></select>
+      </label>
+      <dl class="candidate-summary" id="candidate-summary"></dl>
+    </section>
+
+    <div class="workspace">
+      <div class="controls">
+        <section class="section" aria-labelledby="guided-heading">
+          <h2 id="guided-heading">Guided awkward cases</h2>
+          <p class="hint">Every case dispatches the same domain events for every candidate. Switching candidates resets synthetic records but keeps the selected case.</p>
+          <div class="tabs" id="guide-tabs" aria-label="Guided scenarios"></div>
+          <p class="guide-copy" id="guide-copy"></p>
+          <div class="guide-steps" id="guide-steps"></div>
+        </section>
+
+        <section class="section" aria-labelledby="request-heading">
+          <h2 id="request-heading">Free play request</h2>
+          <div class="form-grid">
+            <label>
+              Action
+              <select id="request-action">
+                <option value="APPLY">APPLY</option>
+                <option value="ROLLBACK">ROLLBACK</option>
+              </select>
+            </label>
+            <label>
+              Approval deadline
+              <input id="request-deadline" type="number" step="0.1">
+            </label>
+            <label class="wide">
+              Idempotency key
+              <input id="request-key" type="text" spellcheck="false">
+            </label>
+            <label class="wide">
+              Approval digest
+              <input id="request-approval" type="text" spellcheck="false">
+            </label>
+            <label class="wide">
+              Exact authenticated bytes (synthetic UTF-8)
+              <textarea id="request-bytes" spellcheck="false"></textarea>
+            </label>
+            <label>
+              Modeled clock now
+              <input id="clock-now" type="number" step="0.1">
+            </label>
+            <label>
+              Clock uncertainty
+              <input id="clock-uncertainty" type="number" min="0" step="0.1">
+            </label>
+          </div>
+          <p class="hint">The model uses two synthetic time units for each journal or proof commit. These units are scenario controls, not latency measurements.</p>
+          <button id="update-request" type="button">Apply request and clock fields</button>
+          <p class="validation-error" id="request-error" role="alert" hidden></p>
+        </section>
+
+        <section class="section" aria-labelledby="actions-heading">
+          <h2 id="actions-heading">Free play actions</h2>
+          <div class="button-grid" id="free-actions"></div>
+        </section>
+      </div>
+
+      <div class="state-view">
+        <section class="result-strip" aria-labelledby="result-heading">
+          <div class="result-code" id="result-code" data-state="UNPROVEN">UNPROVEN</div>
+          <div class="result-detail">
+            <h2 id="result-heading">Current receipt result</h2>
+            <p id="result-reason"></p>
+            <p class="hint" id="result-binding"></p>
+          </div>
+        </section>
+
+        <p class="sr-only" id="result-announcement" role="status" aria-live="polite" aria-atomic="true"></p>
+
+        <section class="state-grid" id="state-grid" aria-label="Readable complete state summary"></section>
+
+        <details open>
+          <summary>Complete domain state (canonical view after every action)</summary>
+          <pre id="full-state"></pre>
+        </details>
+
+        <details open>
+          <summary>Transition trace</summary>
+          <div class="trace" id="trace"></div>
+        </details>
+
+        <p class="footnote">
+          A modeled attestation means “assume the candidate-specific storage, clock, and receipt prerequisites have been independently established.” It never upgrades an observed write, request time, pre-flush sample, or emulator result into production proof.
+        </p>
+      </div>
+    </div>
+  </main>
+
+  <!-- Pure domain module: no DOM access and no persistence. -->
+  <script>
+    "use strict";
+
+    const JournalPublicationModel = (() => {
+      const RECEIPT_STATES = Object.freeze(["VALID", "UNPROVEN", "LATE", "CONFLICT"]);
+
+      const CANDIDATES = Object.freeze({
+        files: Object.freeze({
+          id: "files",
+          name: "Plan-bound private files",
+          backendIdentity: "plan-bound-private-files/prototype-v2",
+          faultDomain: "publication host, filesystem, controller, and storage cache",
+          durableBoundary: "final file plus parent-directory sync, conditional on an attested support matrix",
+          timeContract: "No native trusted epoch bound; a separate attested clock and proof file are required.",
+          targetPostgresCoupled: false,
+          documentedGap: "The current pending-marker timestamp precedes final authenticated publication and cannot authorize this contract."
+        }),
+        postgres: Object.freeze({
+          id: "postgres",
+          name: "Existing PostgreSQL",
+          backendIdentity: "existing-target-postgresql/prototype-protocol",
+          faultDomain: "target PostgreSQL cluster, WAL path, replicas, and storage",
+          durableBoundary: "journal transaction commit with synchronous local WAL flush, then a separate proof transaction",
+          timeContract: "clock_timestamp() is causally later in the proof transaction but needs external clock attestation.",
+          targetPostgresCoupled: true,
+          documentedGap: "The publication receipt becomes unavailable when the target PostgreSQL owner is unavailable."
+        }),
+        sqlite: Object.freeze({
+          id: "sqlite",
+          name: "Dedicated SQLite",
+          backendIdentity: "dedicated-sqlite/prototype-protocol",
+          faultDomain: "publication host, SQLite VFS, database file, filesystem, and storage",
+          durableBoundary: "create-once journal transaction under an explicitly durable synchronous mode, then a proof transaction",
+          timeContract: "SQLite obtains current time from its VFS; no native rollback-resistant or issuer-bound clock is documented.",
+          targetPostgresCoupled: false,
+          documentedGap: "It improves idempotent lookup but not the host fault domain or trusted-time contract."
+        }),
+        etcd: Object.freeze({
+          id: "etcd",
+          name: "Self-hosted etcd",
+          backendIdentity: "self-hosted-etcd-v3/prototype-protocol",
+          faultDomain: "etcd voting quorum, member disks, network, and operator-managed snapshots",
+          durableBoundary: "completed KV transaction, which etcd defines as consensus-committed and permanently stored",
+          timeContract: "The revision is a logical clock; leases expire by wall-clock TTL and do not bind an approval epoch.",
+          targetPostgresCoupled: false,
+          documentedGap: "A separate trusted time owner remains necessary despite the new quorum service."
+        }),
+        spanner: Object.freeze({
+          id: "spanner",
+          name: "Google Cloud Spanner",
+          backendIdentity: "google-cloud-spanner/prototype-protocol",
+          faultDomain: "selected managed Spanner instance configuration and Google storage/replication control plane",
+          durableBoundary: "transaction committed after a voting majority stores mutations durably",
+          timeContract: "TrueTime commit timestamps align with real time, but documented sequencing assigns the timestamp before majority stable storage.",
+          targetPostgresCoupled: false,
+          documentedGap: "The commit timestamp is not yet established as the required post-durability upper bound."
+        })
+      });
+
+      const APPLY_BYTES = '{"kind":"synthetic-stopped-application-journal","schema_version":99}';
+      const ROLLBACK_BYTES = '{"kind":"synthetic-stopped-rollback-journal","schema_version":99}';
+      const ALTERNATE_BYTES = '{"kind":"synthetic-stopped-application-journal","schema_version":99,"changed":true}';
+
+      function clone(value) {
+        return JSON.parse(JSON.stringify(value));
+      }
+
+      function rightRotate(value, amount) {
+        return (value >>> amount) | (value << (32 - amount));
+      }
+
+      function sha256(text) {
+        const bytes = unescape(encodeURIComponent(String(text)));
+        const maxWord = Math.pow(2, 32);
+        const words = [];
+        const hash = [];
+        const constants = [];
+        const composite = {};
+        let prime = 0;
+
+        for (let candidate = 2; prime < 64; candidate += 1) {
+          if (!composite[candidate]) {
+            for (let multiple = candidate * candidate; multiple < 313; multiple += candidate) {
+              composite[multiple] = true;
+            }
+            hash[prime] = (Math.pow(candidate, 0.5) * maxWord) | 0;
+            constants[prime] = (Math.pow(candidate, 1 / 3) * maxWord) | 0;
+            prime += 1;
+          }
+        }
+
+        const bitLength = bytes.length * 8;
+        let padded = bytes + "\x80";
+        while ((padded.length % 64) !== 56) padded += "\x00";
+
+        for (let index = 0; index < padded.length; index += 1) {
+          words[index >> 2] |= padded.charCodeAt(index) << ((3 - index) % 4) * 8;
+        }
+        words[words.length] = Math.floor(bitLength / maxWord);
+        words[words.length] = bitLength;
+
+        for (let offset = 0; offset < words.length; offset += 16) {
+          const schedule = words.slice(offset, offset + 16);
+          const oldHash = hash.slice(0);
+
+          for (let index = 0; index < 64; index += 1) {
+            const w15 = schedule[index - 15];
+            const w2 = schedule[index - 2];
+            const a = hash[0];
+            const e = hash[4];
+            const temp1 = (
+              hash[7]
+              + (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25))
+              + ((e & hash[5]) ^ ((~e) & hash[6]))
+              + constants[index]
+              + (schedule[index] = index < 16
+                ? schedule[index]
+                : (
+                  schedule[index - 16]
+                  + (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3))
+                  + schedule[index - 7]
+                  + (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))
+                ) | 0)
+            ) | 0;
+            const temp2 = (
+              (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22))
+              + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]))
+            ) | 0;
+
+            hash.pop();
+            hash.unshift((temp1 + temp2) | 0);
+            hash[4] = (hash[4] + temp1) | 0;
+          }
+
+          for (let index = 0; index < 8; index += 1) {
+            hash[index] = (hash[index] + oldHash[index]) | 0;
+          }
+        }
+
+        let result = "";
+        for (let index = 0; index < 8; index += 1) {
+          for (let byte = 3; byte >= 0; byte -= 1) {
+            const value = (hash[index] >> (byte * 8)) & 255;
+            result += value.toString(16).padStart(2, "0");
+          }
+        }
+        return result;
+      }
+
+      function bindingFor(request) {
+        return {
+          action: request.action,
+          approval_digest: request.approvalDigest,
+          approval_deadline: request.approvalDeadline,
+          exact_byte_digest: `sha256:${sha256(request.exactBytes)}`,
+          idempotency_key: request.idempotencyKey
+        };
+      }
+
+      function recordKey(request) {
+        return request.idempotencyKey;
+      }
+
+      function receipt(state, result, reason, record = null, upperBound = null) {
+        if (!RECEIPT_STATES.includes(result)) throw new Error("invalid receipt state");
+        const binding = bindingFor(state.request);
+        return {
+          result,
+          reason,
+          ...binding,
+          backend_identity: state.profile.backendIdentity,
+          backend_fault_domain: state.profile.faultDomain,
+          claimed_trusted_post_durability_upper_bound: upperBound,
+          journal_durable_completion: record ? record.journalDurableCompletion : null,
+          proof_durable_completion: record && record.proof ? record.proof.durableCompletion : null,
+          assumptions: {
+            candidate_prerequisites_attested: state.qualification.modeledAttestation,
+            time_source_trusted: state.clock.trusted,
+            clock_rollback_detected: state.clock.rollbackDetected,
+            synthetic_model_only: true
+          }
+        };
+      }
+
+      function sameBinding(left, right) {
+        return left.action === right.action
+          && left.approval_digest === right.approval_digest
+          && left.approval_deadline === right.approval_deadline
+          && left.exact_byte_digest === right.exact_byte_digest
+          && left.idempotency_key === right.idempotency_key;
+      }
+
+      function initialState(candidateId = "files") {
+        const profile = CANDIDATES[candidateId];
+        if (!profile) throw new Error(`unknown candidate: ${candidateId}`);
+        return {
+          prototype: {
+            throwaway: true,
+            synthetic: true,
+            persistence: "none",
+            contract: "append_once(action, idempotency_key, exact_bytes, approval_deadline) -> durable_receipt",
+            receiptStates: RECEIPT_STATES.slice(),
+            commitDelayUnits: { journal: 2, proof: 2, measured: false }
+          },
+          profile: clone(profile),
+          request: {
+            action: "APPLY",
+            idempotencyKey: "apply-key-001",
+            exactBytes: APPLY_BYTES,
+            approvalDigest: `sha256:${sha256("synthetic-apply-approval")}`,
+            approvalDeadline: 100
+          },
+          clock: {
+            now: 70,
+            uncertainty: 0.5,
+            trusted: false,
+            rollbackDetected: false
+          },
+          qualification: {
+            modeledAttestation: false,
+            meaning: "No candidate-specific durability, clock, or receipt prerequisite has been assumed."
+          },
+          backend: {
+            available: true,
+            records: {}
+          },
+          process: {
+            alive: true,
+            generation: 1,
+            clientKnowledge: "known",
+            receiptObserved: false
+          },
+          targetMutation: {
+            postgresAvailable: true,
+            APPLY: { status: "not_attempted", exactByteDigest: null },
+            ROLLBACK: { status: "not_attempted", exactByteDigest: null }
+          },
+          currentResult: "UNPROVEN",
+          lastReceipt: null,
+          lastAction: "INITIALIZE",
+          trace: [{
+            index: 1,
+            action: "INITIALIZE",
+            message: `Started a clean synthetic run for ${profile.name}.`,
+            result: "UNPROVEN"
+          }]
+        };
+      }
+
+      function addTrace(state, action, message) {
+        state.lastAction = action;
+        state.trace.push({
+          index: state.trace.length + 1,
+          action,
+          message,
+          result: state.currentResult
+        });
+        return state;
+      }
+
+      function clearObservedReceipt(state) {
+        state.lastReceipt = null;
+        state.currentResult = "UNPROVEN";
+        state.process.receiptObserved = false;
+      }
+
+      function setTransientReceipt(state, result, reason, record = null, upperBound = null) {
+        state.lastReceipt = receipt(state, result, reason, record, upperBound);
+        state.currentResult = result;
+        state.process.receiptObserved = true;
+        state.process.clientKnowledge = "known";
+      }
+
+      function markClientIndeterminate(state) {
+        state.process.clientKnowledge = "indeterminate";
+        state.process.receiptObserved = false;
+        state.lastReceipt = null;
+        state.currentResult = "UNPROVEN";
+      }
+
+      function rejectWhileStopped(state, eventType, message) {
+        markClientIndeterminate(state);
+        return addTrace(state, eventType, message);
+      }
+
+      function observeStoredReceipt(state, record) {
+        state.lastReceipt = clone(record.receipt);
+        state.currentResult = record.receipt.result;
+        state.process.receiptObserved = true;
+        state.process.clientKnowledge = "known";
+      }
+
+      function effectiveBackendAvailable(state) {
+        if (state.profile.targetPostgresCoupled && !state.targetMutation.postgresAvailable) return false;
+        return state.backend.available;
+      }
+
+      function reduce(currentState, event) {
+        if (!event || typeof event.type !== "string") throw new Error("event.type is required");
+        if (event.type === "RESET") return initialState(currentState.profile.id);
+        if (event.type === "SWITCH_CANDIDATE") return initialState(event.candidateId);
+
+        const state = clone(currentState);
+
+        if (event.type === "ATTEST_PREREQUISITES") {
+          state.qualification.modeledAttestation = true;
+          state.qualification.meaning = "Candidate-specific storage, clock, and durable-receipt prerequisites are assumed for this modeled run only.";
+          state.clock.trusted = !state.clock.rollbackDetected;
+          return addTrace(state, event.type, state.clock.rollbackDetected
+            ? "Assumed storage prerequisites, but retained the detected rollback; RESET is required for a new trusted epoch."
+            : "Assumed every missing candidate-specific prerequisite; this is not observed evidence.");
+        }
+
+        if (event.type === "CLEAR_ATTESTATION") {
+          state.qualification.modeledAttestation = false;
+          state.qualification.meaning = "No candidate-specific durability, clock, or receipt prerequisite has been assumed.";
+          state.clock.trusted = false;
+          return addTrace(state, event.type, "Removed modeled qualification; later proof attempts fail closed.");
+        }
+
+        if (event.type === "SET_REQUEST") {
+          const next = event.request;
+          if (!next || !["APPLY", "ROLLBACK"].includes(next.action)) throw new Error("request action is invalid");
+          if (!next.idempotencyKey || !next.approvalDigest || !next.exactBytes) throw new Error("request binding is incomplete");
+          if (!Number.isFinite(next.approvalDeadline)) throw new Error("approval deadline is invalid");
+          if (event.clockNow !== undefined && !Number.isFinite(event.clockNow)) throw new Error("clock value is invalid");
+          if (event.clockUncertainty !== undefined && (!Number.isFinite(event.clockUncertainty) || event.clockUncertainty < 0)) {
+            throw new Error("clock uncertainty is invalid");
+          }
+          state.request = clone(next);
+          if (Number.isFinite(event.clockNow)) {
+            if (event.clockNow < state.clock.now) {
+              state.clock.rollbackDetected = true;
+              state.clock.trusted = false;
+            }
+            state.clock.now = event.clockNow;
+          }
+          if (Number.isFinite(event.clockUncertainty) && event.clockUncertainty >= 0) {
+            state.clock.uncertainty = event.clockUncertainty;
+          }
+          clearObservedReceipt(state);
+          return addTrace(state, event.type, "Updated the synthetic request and clock controls.");
+        }
+
+        if (event.type === "USE_APPLY_AUTHORITY") {
+          state.request = {
+            action: "APPLY",
+            idempotencyKey: "apply-key-001",
+            exactBytes: APPLY_BYTES,
+            approvalDigest: `sha256:${sha256("synthetic-apply-approval")}`,
+            approvalDeadline: 100
+          };
+          clearObservedReceipt(state);
+          return addTrace(state, event.type, "Selected the distinct apply approval, key, and journal bytes.");
+        }
+
+        if (event.type === "USE_ROLLBACK_AUTHORITY") {
+          state.request = {
+            action: "ROLLBACK",
+            idempotencyKey: "rollback-key-001",
+            exactBytes: ROLLBACK_BYTES,
+            approvalDigest: `sha256:${sha256("synthetic-rollback-approval")}`,
+            approvalDeadline: 100
+          };
+          clearObservedReceipt(state);
+          return addTrace(state, event.type, "Selected the distinct rollback approval, key, and journal bytes.");
+        }
+
+        if (event.type === "REUSE_APPLY_AUTHORITY_FOR_ROLLBACK") {
+          state.request.action = "ROLLBACK";
+          state.request.exactBytes = ROLLBACK_BYTES;
+          clearObservedReceipt(state);
+          return addTrace(state, event.type, "Changed the action and bytes but deliberately reused the apply key and approval.");
+        }
+
+        if (event.type === "SET_ALTERNATE_BYTES") {
+          state.request.exactBytes = ALTERNATE_BYTES;
+          clearObservedReceipt(state);
+          return addTrace(state, event.type, "Changed the exact bytes while retaining the same idempotency key.");
+        }
+
+        if (event.type === "SET_NOW") {
+          if (!Number.isFinite(event.value)) throw new Error("clock value is invalid");
+          if (event.value < state.clock.now) {
+            state.clock.rollbackDetected = true;
+            state.clock.trusted = false;
+          }
+          state.clock.now = event.value;
+          return addTrace(state, event.type, `Set modeled time to ${event.value}.`);
+        }
+
+        if (event.type === "ADVANCE_TIME") {
+          const amount = Number.isFinite(event.amount) ? event.amount : 5;
+          if (amount < 0) throw new Error("advance amount must be non-negative");
+          state.clock.now += amount;
+          return addTrace(state, event.type, `Advanced modeled time by ${amount}.`);
+        }
+
+        if (event.type === "ROLL_BACK_CLOCK") {
+          const amount = Number.isFinite(event.amount) ? event.amount : 10;
+          state.clock.now -= amount;
+          state.clock.rollbackDetected = true;
+          state.clock.trusted = false;
+          return addTrace(state, event.type, `Moved the adjustable clock backward by ${amount}; time proof is now untrusted.`);
+        }
+
+        if (event.type === "SET_UNCERTAINTY") {
+          if (!Number.isFinite(event.value) || event.value < 0) throw new Error("uncertainty is invalid");
+          state.clock.uncertainty = event.value;
+          return addTrace(state, event.type, `Set trusted-time uncertainty to ${event.value}.`);
+        }
+
+        if (event.type === "SET_TARGET_POSTGRES_AVAILABLE") {
+          state.targetMutation.postgresAvailable = Boolean(event.value);
+          const coupling = state.profile.targetPostgresCoupled
+            ? "The publication owner shares this availability boundary."
+            : "The publication owner remains independently queryable in this model.";
+          return addTrace(state, event.type, `Target PostgreSQL is ${event.value ? "available" : "unavailable"}. ${coupling}`);
+        }
+
+        if (event.type === "SET_BACKEND_AVAILABLE") {
+          state.backend.available = Boolean(event.value);
+          return addTrace(state, event.type, `Publication backend is ${event.value ? "available" : "unavailable"}.`);
+        }
+
+        if (event.type === "COMMIT_JOURNAL") {
+          if (!state.process.alive) {
+            return rejectWhileStopped(state, event.type, "No journal operation ran because the client is stopped; restart and query exact backend state.");
+          }
+          if (!effectiveBackendAvailable(state)) {
+            setTransientReceipt(state, "UNPROVEN", "The publication owner cannot be queried or committed at this boundary.");
+            return addTrace(state, event.type, "The publication backend was unavailable; no completion claim was made.");
+          }
+
+          const key = recordKey(state.request);
+          const proposedBinding = bindingFor(state.request);
+          const existing = state.backend.records[key];
+          if (existing) {
+            if (!sameBinding(existing.binding, proposedBinding)) {
+              setTransientReceipt(state, "CONFLICT", "This idempotency key already binds different action, approval, deadline, or bytes.", existing);
+              return addTrace(state, event.type, "Rejected same-key reuse with a different exact binding.");
+            }
+            observeStoredReceipt(state, existing);
+            return addTrace(state, event.type, "Returned the stored result for an exact same-key replay.");
+          }
+
+          const observedCompletion = state.clock.now + state.prototype.commitDelayUnits.journal;
+          state.clock.now = observedCompletion;
+          const durabilityQualified = state.qualification.modeledAttestation;
+          const result = observedCompletion >= state.request.approvalDeadline ? "LATE" : "UNPROVEN";
+          const reason = result === "LATE"
+            ? "The journal completion reached or crossed the fixed approval deadline."
+            : durabilityQualified
+              ? "The exact journal is modeled durable, but no durable trusted-time proof exists yet."
+              : "A commit was observed, but candidate-specific durability prerequisites are not attested.";
+          const record = {
+            binding: proposedBinding,
+            observedCommitCompletion: observedCompletion,
+            journalDurableCompletion: durabilityQualified ? observedCompletion : null,
+            durabilityQualified,
+            proof: null,
+            receipt: null
+          };
+          record.receipt = receipt(state, result, reason, record);
+          state.backend.records[key] = record;
+          state.lastReceipt = clone(record.receipt);
+          state.currentResult = result;
+          state.process.receiptObserved = true;
+          state.process.clientKnowledge = "known";
+          return addTrace(state, event.type, result === "LATE"
+            ? "Persisted a nonauthorizing late journal result."
+            : "Created the journal record; it remains nonauthorizing until proof succeeds.");
+        }
+
+        if (event.type === "COMMIT_PROOF" || event.type === "COMMIT_PROOF_LOSE_RESPONSE") {
+          const loseResponse = event.type === "COMMIT_PROOF_LOSE_RESPONSE";
+          if (!state.process.alive) {
+            return rejectWhileStopped(state, event.type, "No proof operation ran because the client is stopped; restart and query exact backend state.");
+          }
+          if (!effectiveBackendAvailable(state)) {
+            setTransientReceipt(state, "UNPROVEN", "The publication owner is unavailable; proof completion is unknown.");
+            return addTrace(state, event.type, "No proof result was trusted at this boundary.");
+          }
+
+          const key = recordKey(state.request);
+          const record = state.backend.records[key];
+          if (!record) {
+            setTransientReceipt(state, "UNPROVEN", "No journal exists for this idempotency key.");
+            return addTrace(state, event.type, "Rejected proof creation without an exact journal record.");
+          }
+          if (!sameBinding(record.binding, bindingFor(state.request))) {
+            setTransientReceipt(state, "CONFLICT", "The proof request differs from the journal's exact binding.", record);
+            return addTrace(state, event.type, "Rejected proof creation for mismatched bytes or authority.");
+          }
+          if (record.proof) {
+            if (loseResponse) {
+              state.process.alive = false;
+              markClientIndeterminate(state);
+              return addTrace(state, event.type, "Returned the append-once stored proof internally, but the response was lost before client observation.");
+            }
+            observeStoredReceipt(state, record);
+            return addTrace(state, event.type, "Returned the append-once stored proof receipt without changing time or durable state.");
+          }
+          if (record.receipt.result === "LATE") {
+            observeStoredReceipt(state, record);
+            return addTrace(state, event.type, "A late journal cannot be upgraded into post-expiry authority.");
+          }
+
+          const proofStartedAt = state.clock.now;
+          const proofCompletion = proofStartedAt + state.prototype.commitDelayUnits.proof;
+          const sampledAt = proofCompletion;
+          const candidateUpperBound = sampledAt + state.clock.uncertainty;
+          state.clock.now = proofCompletion;
+          const claimedUpperBound = state.qualification.modeledAttestation
+            && state.clock.trusted
+            && !state.clock.rollbackDetected
+            ? candidateUpperBound
+            : null;
+          const proofDurableCompletion = state.qualification.modeledAttestation
+            ? proofCompletion
+            : null;
+          const complete = record.journalDurableCompletion !== null
+            && proofDurableCompletion !== null
+            && claimedUpperBound !== null;
+          const ordered = complete
+            && record.journalDurableCompletion <= proofDurableCompletion
+            && proofDurableCompletion <= claimedUpperBound;
+          const late = (record.journalDurableCompletion !== null
+              && record.journalDurableCompletion >= state.request.approvalDeadline)
+            || proofCompletion >= state.request.approvalDeadline
+            || (claimedUpperBound !== null
+              && claimedUpperBound >= state.request.approvalDeadline);
+          const trusted = state.qualification.modeledAttestation
+            && state.clock.trusted
+            && !state.clock.rollbackDetected
+            && ordered;
+          const result = late ? "LATE" : trusted ? "VALID" : "UNPROVEN";
+          const reason = late
+            ? "The journal completion, proof completion, or trusted post-proof upper bound reached the fixed deadline."
+            : trusted
+              ? "The modeled journal completion precedes proof completion, which does not exceed the trusted post-proof upper bound before expiry."
+              : "Timing evidence is missing or inconsistent, rollback was detected, or candidate-specific prerequisites are not attested.";
+          record.proof = {
+            proofStartedAt,
+            sampledAt,
+            claimedTrustedUpperBound: claimedUpperBound,
+            durableCompletion: proofDurableCompletion,
+            trusted,
+            synthetic: true
+          };
+          record.receipt = receipt(state, result, reason, record, claimedUpperBound);
+          state.backend.records[key] = record;
+          if (loseResponse) {
+            state.process.alive = false;
+            markClientIndeterminate(state);
+            return addTrace(state, event.type, "Stored the append-once proof, but the response was lost before client observation; restart and exact query are required.");
+          }
+          observeStoredReceipt(state, record);
+          return addTrace(state, event.type, result === "VALID"
+            ? "Stored the conditional modeled receipt; exact mutation may now be admitted."
+            : "Stored a nonauthorizing proof result and failed closed.");
+        }
+
+        if (event.type === "CRASH_BEFORE_OBSERVE") {
+          state.process.alive = false;
+          markClientIndeterminate(state);
+          return addTrace(state, event.type, "The client stopped after a commit boundary and before observing a receipt; backend records were preserved.");
+        }
+
+        if (event.type === "MARK_OUTCOME_INDETERMINATE") {
+          state.process.clientKnowledge = "indeterminate";
+          state.process.receiptObserved = false;
+          state.lastReceipt = null;
+          state.currentResult = "UNPROVEN";
+          return addTrace(state, event.type, "Discarded client knowledge without changing backend records.");
+        }
+
+        if (event.type === "RESTART") {
+          state.process.alive = true;
+          state.process.generation += 1;
+          state.process.clientKnowledge = "indeterminate";
+          state.process.receiptObserved = false;
+          state.lastReceipt = null;
+          state.currentResult = "UNPROVEN";
+          return addTrace(state, event.type, "Restarted with no trusted client-side outcome; query is required.");
+        }
+
+        if (event.type === "QUERY") {
+          if (!state.process.alive) {
+            return rejectWhileStopped(state, event.type, "No query ran because the client is stopped; restart before resolving the indeterminate result.");
+          }
+          if (!effectiveBackendAvailable(state)) {
+            setTransientReceipt(state, "UNPROVEN", "The publication owner is unavailable, so the indeterminate outcome cannot be resolved.");
+            return addTrace(state, event.type, "Query failed closed because the publication owner was unavailable.");
+          }
+          const record = state.backend.records[recordKey(state.request)];
+          if (!record) {
+            setTransientReceipt(state, "UNPROVEN", "No record exists for this idempotency key.");
+            return addTrace(state, event.type, "Query found no journal or durable receipt.");
+          }
+          if (!sameBinding(record.binding, bindingFor(state.request))) {
+            setTransientReceipt(state, "CONFLICT", "The queried key exists with a different exact binding.", record);
+            return addTrace(state, event.type, "Query exposed a same-key binding conflict.");
+          }
+          state.lastReceipt = clone(record.receipt);
+          state.currentResult = record.receipt.result;
+          state.process.receiptObserved = true;
+          state.process.clientKnowledge = "known";
+          return addTrace(state, event.type, `Recovered the stored ${record.receipt.result} result by exact key and binding.`);
+        }
+
+        if (event.type === "MUTATE_TARGET") {
+          if (!state.process.alive) {
+            return rejectWhileStopped(state, event.type, "No target mutation ran because the client is stopped; restart and recover a receipt first.");
+          }
+          if (!state.targetMutation.postgresAvailable) {
+            return addTrace(state, event.type, "Target PostgreSQL is unavailable; no mutation was attempted.");
+          }
+          if (!state.lastReceipt || state.lastReceipt.result !== "VALID") {
+            return addTrace(state, event.type, "Mutation was denied because the currently authenticated receipt is not VALID.");
+          }
+          if (!sameBinding(state.lastReceipt, bindingFor(state.request))) {
+            return addTrace(state, event.type, "Mutation was denied because the receipt does not bind the current request.");
+          }
+          const slot = state.targetMutation[state.request.action];
+          const exactDigest = bindingFor(state.request).exact_byte_digest;
+          if (slot.status === "applied" && slot.exactByteDigest === exactDigest) {
+            return addTrace(state, event.type, `The exact ${state.request.action.toLowerCase()} mutation was already applied; replay changed nothing.`);
+          }
+          if (slot.status === "applied" && slot.exactByteDigest !== exactDigest) {
+            setTransientReceipt(state, "CONFLICT", "The target mutation slot already binds different exact bytes.");
+            return addTrace(state, event.type, "Exact mutation replay detected a conflicting postimage.");
+          }
+          slot.status = "applied";
+          slot.exactByteDigest = exactDigest;
+          return addTrace(state, event.type, `Admitted the later exact/idempotent ${state.request.action.toLowerCase()} mutation from a VALID receipt.`);
+        }
+
+        throw new Error(`unknown event: ${event.type}`);
+      }
+
+      return Object.freeze({
+        candidates: CANDIDATES,
+        receiptStates: RECEIPT_STATES,
+        initialState,
+        reduce,
+        sha256,
+        synthetic: Object.freeze({ APPLY_BYTES, ROLLBACK_BYTES, ALTERNATE_BYTES })
+      });
+    })();
+  </script>
+
+  <!-- Thin DOM shell. All domain transitions stay in JournalPublicationModel above. -->
+  <script>
+    "use strict";
+
+    const guides = [
+      {
+        id: "happy",
+        label: "Timely",
+        title: "Timely happy path",
+        copy: "Assume every candidate-specific prerequisite, durably commit the exact journal and proof, bind a trusted post-proof upper bound in the stored receipt, then admit the separate mutation.",
+        steps: [
+          ["Assume the required environment and time contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Durably commit the exact journal", { type: "COMMIT_JOURNAL" }],
+          ["Durably commit the causally later proof", { type: "COMMIT_PROOF" }],
+          ["Admit the later exact mutation", { type: "MUTATE_TARGET" }]
+        ]
+      },
+      {
+        id: "replay",
+        label: "Replay",
+        title: "Same key and same bytes",
+        copy: "A completed exact call returns the stored result. It does not publish another journal, extend expiry, or consume another mutation attempt.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the journal", { type: "COMMIT_JOURNAL" }],
+          ["Commit the proof", { type: "COMMIT_PROOF" }],
+          ["Replay append_once with the exact binding", { type: "COMMIT_JOURNAL" }],
+          ["Query the same stored receipt", { type: "QUERY" }],
+          ["Apply the exact mutation twice", { type: "MUTATE_TARGET" }],
+          ["Confirm the second mutation is idempotent", { type: "MUTATE_TARGET" }]
+        ]
+      },
+      {
+        id: "conflict",
+        label: "Conflict",
+        title: "Same key and different bytes",
+        copy: "The idempotency key already binds the original action, approval, deadline, and exact byte digest. Different bytes close the result as CONFLICT.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the original journal", { type: "COMMIT_JOURNAL" }],
+          ["Change only the exact bytes", { type: "SET_ALTERNATE_BYTES" }],
+          ["Try the same idempotency key again", { type: "COMMIT_JOURNAL" }]
+        ]
+      },
+      {
+        id: "lost-receipt",
+        label: "Lost receipt",
+        title: "Proof stored, response lost",
+        copy: "One atomic modeled transition stores the proof but loses its response before client observation. The stopped client remains UNPROVEN and indeterminate until restart and exact query recover the stored receipt.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the exact journal", { type: "COMMIT_JOURNAL" }],
+          ["Store proof but lose its response", { type: "COMMIT_PROOF_LOSE_RESPONSE" }],
+          ["Restart with an indeterminate outcome", { type: "RESTART" }],
+          ["Query by exact idempotency binding", { type: "QUERY" }]
+        ]
+      },
+      {
+        id: "between-commits",
+        label: "No proof",
+        title: "Crash after journal commit, before proof",
+        copy: "The durable journal survives, but it cannot authorize mutation. Before expiry a restarted client may add proof; after expiry the record remains nonauthorizing.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the exact journal", { type: "COMMIT_JOURNAL" }],
+          ["Crash before proof commit", { type: "CRASH_BEFORE_OBSERVE" }],
+          ["Restart", { type: "RESTART" }],
+          ["Query and recover UNPROVEN", { type: "QUERY" }],
+          ["Commit proof while headroom remains", { type: "COMMIT_PROOF" }],
+          ["Query the completed receipt", { type: "QUERY" }]
+        ]
+      },
+      {
+        id: "late-journal",
+        label: "Late journal",
+        title: "Journal completion reaches expiry",
+        copy: "A journal completion at or after expiry produces LATE. The record remains visible for diagnosis but never becomes authority.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Move close enough that journal completion crosses expiry", { type: "SET_NOW", value: 99 }],
+          ["Commit the late journal", { type: "COMMIT_JOURNAL" }]
+        ]
+      },
+      {
+        id: "late-proof",
+        label: "Late proof",
+        title: "Proof completion reaches expiry",
+        copy: "A proof completion or trusted post-proof bound at or after expiry produces LATE. The timely journal remains intact, and the late proof never becomes authority.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit a timely journal", { type: "COMMIT_JOURNAL" }],
+          ["Move close enough that proof completion crosses expiry", { type: "SET_NOW", value: 99 }],
+          ["Commit the late proof", { type: "COMMIT_PROOF" }]
+        ]
+      },
+      {
+        id: "clock-rollback",
+        label: "Clock rollback",
+        title: "Adjustable clock moves backward",
+        copy: "An adjustable clock that moved backward cannot support a trusted bound, even when the journal was committed while headroom remained.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the journal", { type: "COMMIT_JOURNAL" }],
+          ["Move the adjustable clock backward", { type: "ROLL_BACK_CLOCK", amount: 10 }],
+          ["Attempt proof with an untrusted clock", { type: "COMMIT_PROOF" }]
+        ]
+      },
+      {
+        id: "clock-uncertainty",
+        label: "Clock uncertainty",
+        title: "Uncertainty consumes the remaining headroom",
+        copy: "A trusted interval still fails when its upper edge reaches or crosses the fixed deadline.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the journal", { type: "COMMIT_JOURNAL" }],
+          ["Move near expiry", { type: "SET_NOW", value: 97 }],
+          ["Set uncertainty beyond the remaining headroom", { type: "SET_UNCERTAINTY", value: 4 }],
+          ["Attempt proof", { type: "COMMIT_PROOF" }]
+        ]
+      },
+      {
+        id: "recovery",
+        label: "Recovery",
+        title: "Restart and query an indeterminate result",
+        copy: "Client knowledge is disposable. Durable key lookup plus exact binding resolves an uncertain journal commit as UNPROVEN, after which timely proof can complete the chain.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the journal", { type: "COMMIT_JOURNAL" }],
+          ["Lose client knowledge of the outcome", { type: "MARK_OUTCOME_INDETERMINATE" }],
+          ["Restart", { type: "RESTART" }],
+          ["Query exact backend state", { type: "QUERY" }],
+          ["Commit proof", { type: "COMMIT_PROOF" }],
+          ["Query final state", { type: "QUERY" }]
+        ]
+      },
+      {
+        id: "authority",
+        label: "Authority",
+        title: "Distinct apply and rollback authority",
+        copy: "Rollback cannot reuse the apply key or approval. It starts a separate exact chain and later admits only the rollback mutation.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the apply journal", { type: "COMMIT_JOURNAL" }],
+          ["Commit the apply proof", { type: "COMMIT_PROOF" }],
+          ["Apply the forward mutation", { type: "MUTATE_TARGET" }],
+          ["Reuse apply authority for rollback deliberately", { type: "REUSE_APPLY_AUTHORITY_FOR_ROLLBACK" }],
+          ["Observe the cross-action key conflict", { type: "COMMIT_JOURNAL" }],
+          ["Select the distinct rollback approval and key", { type: "USE_ROLLBACK_AUTHORITY" }],
+          ["Commit the rollback journal", { type: "COMMIT_JOURNAL" }],
+          ["Commit the rollback proof", { type: "COMMIT_PROOF" }],
+          ["Apply the exact rollback mutation", { type: "MUTATE_TARGET" }]
+        ]
+      },
+      {
+        id: "target-down",
+        label: "Target down",
+        title: "Target PostgreSQL unavailable during query",
+        copy: "External publication owners remain queryable when the target is down. The existing-PostgreSQL candidate shares the failure boundary and must return UNPROVEN until that owner recovers. No candidate may mutate an unavailable target.",
+        steps: [
+          ["Assume the required contracts", { type: "ATTEST_PREREQUISITES" }],
+          ["Commit the journal", { type: "COMMIT_JOURNAL" }],
+          ["Commit the proof", { type: "COMMIT_PROOF" }],
+          ["Make target PostgreSQL unavailable", { type: "SET_TARGET_POSTGRES_AVAILABLE", value: false }],
+          ["Query the publication owner", { type: "QUERY" }],
+          ["Attempt the later target mutation", { type: "MUTATE_TARGET" }],
+          ["Restore target PostgreSQL", { type: "SET_TARGET_POSTGRES_AVAILABLE", value: true }],
+          ["Query again", { type: "QUERY" }]
+        ]
+      }
+    ];
+
+    const freeActions = [
+      ["Assume prerequisite contracts", { type: "ATTEST_PREREQUISITES" }],
+      ["Clear modeled attestation", { type: "CLEAR_ATTESTATION" }],
+      ["Commit journal", { type: "COMMIT_JOURNAL" }],
+      ["Commit proof", { type: "COMMIT_PROOF" }],
+      ["Commit proof; lose response", { type: "COMMIT_PROOF_LOSE_RESPONSE" }],
+      ["Query exact receipt", { type: "QUERY" }],
+      ["Mark outcome indeterminate", { type: "MARK_OUTCOME_INDETERMINATE" }],
+      ["Crash before observation", { type: "CRASH_BEFORE_OBSERVE" }],
+      ["Restart client", { type: "RESTART" }],
+      ["Mutate target exactly", { type: "MUTATE_TARGET" }],
+      ["Advance time by 5", { type: "ADVANCE_TIME", amount: 5 }],
+      ["Roll clock back by 10", { type: "ROLL_BACK_CLOCK", amount: 10 }],
+      ["Use alternate bytes", { type: "SET_ALTERNATE_BYTES" }],
+      ["Use apply authority", { type: "USE_APPLY_AUTHORITY" }],
+      ["Use rollback authority", { type: "USE_ROLLBACK_AUTHORITY" }],
+      ["Take target PostgreSQL down", { type: "SET_TARGET_POSTGRES_AVAILABLE", value: false }],
+      ["Restore target PostgreSQL", { type: "SET_TARGET_POSTGRES_AVAILABLE", value: true }],
+      ["Reset this candidate", { type: "RESET" }]
+    ];
+
+    const elements = {
+      candidate: document.getElementById("candidate-select"),
+      candidateSummary: document.getElementById("candidate-summary"),
+      guideTabs: document.getElementById("guide-tabs"),
+      guideCopy: document.getElementById("guide-copy"),
+      guideSteps: document.getElementById("guide-steps"),
+      freeActions: document.getElementById("free-actions"),
+      action: document.getElementById("request-action"),
+      deadline: document.getElementById("request-deadline"),
+      key: document.getElementById("request-key"),
+      approval: document.getElementById("request-approval"),
+      bytes: document.getElementById("request-bytes"),
+      now: document.getElementById("clock-now"),
+      uncertainty: document.getElementById("clock-uncertainty"),
+      updateRequest: document.getElementById("update-request"),
+      requestError: document.getElementById("request-error"),
+      resultCode: document.getElementById("result-code"),
+      resultReason: document.getElementById("result-reason"),
+      resultBinding: document.getElementById("result-binding"),
+      resultAnnouncement: document.getElementById("result-announcement"),
+      stateGrid: document.getElementById("state-grid"),
+      fullState: document.getElementById("full-state"),
+      trace: document.getElementById("trace")
+    };
+
+    let state = JournalPublicationModel.initialState("files");
+    let activeGuide = 0;
+    let completedGuideSteps = 0;
+    let validationError = "";
+    let invalidFields = [];
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function focusGuidedControl(target) {
+      if (!target) return;
+      const root = target.kind === "case" ? elements.guideTabs : elements.guideSteps;
+      const attribute = target.kind === "case" ? "data-guide" : "data-step";
+      const control = root.querySelector(`button[${attribute}="${target.index}"]`);
+      if (control) control.focus();
+    }
+
+    function clearValidation() {
+      invalidFields.forEach(field => {
+        field.removeAttribute("aria-invalid");
+        if (field.getAttribute("aria-describedby") === "request-error") {
+          field.removeAttribute("aria-describedby");
+        }
+      });
+      invalidFields = [];
+      validationError = "";
+    }
+
+    function rejectForm(issues, options = {}) {
+      clearValidation();
+      invalidFields = issues.map(issue => issue.field).filter(Boolean);
+      validationError = `Action rejected: ${issues.map(issue => issue.message).join(" ")}`;
+      invalidFields.forEach(field => {
+        field.setAttribute("aria-invalid", "true");
+        field.setAttribute("aria-describedby", "request-error");
+      });
+      render({
+        preserveForm: true,
+        focusGuide: options.focusGuide || null
+      });
+      if (invalidFields[0]) invalidFields[0].focus();
+    }
+
+    function readRequiredText(field, label, issues) {
+      const value = field.value;
+      if (value.trim() === "") {
+        issues.push({ field, message: `${label} is required.` });
+      }
+      return value;
+    }
+
+    function readRequiredFiniteNumber(field, label, issues, minimum = null) {
+      const raw = field.value.trim();
+      if (raw === "") {
+        issues.push({ field, message: `${label} is required.` });
+        return null;
+      }
+      const value = Number(raw);
+      if (!Number.isFinite(value)) {
+        issues.push({ field, message: `${label} must be finite.` });
+        return null;
+      }
+      if (minimum !== null && value < minimum) {
+        issues.push({ field, message: `${label} must be at least ${minimum}.` });
+        return null;
+      }
+      return value;
+    }
+
+    function dispatch(event, options = {}) {
+      const guideAdvance = Boolean(options.guideAdvance);
+      try {
+        state = JournalPublicationModel.reduce(state, event);
+        clearValidation();
+        if (guideAdvance) completedGuideSteps += 1;
+      } catch (error) {
+        rejectForm(
+          [{ field: null, message: error.message }],
+          { focusGuide: guideAdvance ? { kind: "step", index: completedGuideSteps } : null }
+        );
+        return;
+      }
+      render({ focusGuide: options.focusGuide || null });
+    }
+
+    function startGuide(index) {
+      activeGuide = index;
+      completedGuideSteps = 0;
+      clearValidation();
+      state = JournalPublicationModel.initialState(state.profile.id);
+      render({ focusGuide: { kind: "case", index } });
+    }
+
+    function readable(value) {
+      if (value === null || value === undefined) return "—";
+      if (typeof value === "boolean") return value ? "yes" : "no";
+      return String(value);
+    }
+
+    function stateBlock(title, pairs) {
+      const rows = pairs.map(([term, value]) => (
+        `<dt>${escapeHtml(term)}</dt><dd>${escapeHtml(readable(value))}</dd>`
+      )).join("");
+      return `<article class="state-block"><h3>${escapeHtml(title)}</h3><dl class="state-list">${rows}</dl></article>`;
+    }
+
+    function renderCandidate() {
+      const profile = state.profile;
+      elements.candidate.value = profile.id;
+      elements.candidateSummary.innerHTML = [
+        ["Durable boundary", profile.durableBoundary],
+        ["Time contract", profile.timeContract],
+        ["Gap to qualify", profile.documentedGap]
+      ].map(([term, value]) => `<div><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+    }
+
+    function renderGuide() {
+      const guide = guides[activeGuide];
+      elements.guideTabs.innerHTML = guides.map((item, index) => (
+        `<button type="button" aria-pressed="${index === activeGuide}" data-guide="${index}">${escapeHtml(item.label)}</button>`
+      )).join("");
+      elements.guideCopy.innerHTML = `<strong>${escapeHtml(guide.title)}.</strong> ${escapeHtml(guide.copy)}`;
+      elements.guideSteps.innerHTML = guide.steps.map(([label], index) => {
+        const complete = index < completedGuideSteps;
+        const current = index === completedGuideSteps;
+        return `<button type="button" class="${complete ? "secondary" : ""}" data-step="${index}" ${current ? "" : "disabled"}><span class="step-number">${complete ? "done" : index + 1}</span><span>${escapeHtml(label)}</span></button>`;
+      }).join("");
+    }
+
+    function renderForm() {
+      elements.action.value = state.request.action;
+      elements.deadline.value = state.request.approvalDeadline;
+      elements.key.value = state.request.idempotencyKey;
+      elements.approval.value = state.request.approvalDigest;
+      elements.bytes.value = state.request.exactBytes;
+      elements.now.value = state.clock.now;
+      elements.uncertainty.value = state.clock.uncertainty;
+    }
+
+    function renderValidation() {
+      elements.requestError.textContent = validationError;
+      elements.requestError.hidden = validationError === "";
+    }
+
+    function renderResult() {
+      const current = state.lastReceipt;
+      const reason = current
+        ? current.reason
+        : "No receipt is currently observed. Query durable backend state before admitting mutation.";
+      elements.resultCode.textContent = state.currentResult;
+      elements.resultCode.dataset.state = state.currentResult;
+      elements.resultReason.textContent = reason;
+      elements.resultBinding.textContent = current
+        ? `${current.action} · ${current.idempotency_key} · ${current.exact_byte_digest.slice(0, 24)}… · upper bound ${readable(current.claimed_trusted_post_durability_upper_bound)}`
+        : "The client has no authenticated result in hand.";
+      const announcement = `Result ${state.currentResult}. ${reason}`;
+      if (elements.resultAnnouncement.textContent !== announcement) {
+        elements.resultAnnouncement.textContent = announcement;
+      }
+    }
+
+    function renderState() {
+      const records = Object.values(state.backend.records);
+      const currentRecord = state.backend.records[state.request.idempotencyKey] || null;
+      elements.stateGrid.innerHTML = [
+        stateBlock("Request binding", [
+          ["action", state.request.action],
+          ["idempotency key", state.request.idempotencyKey],
+          ["approval digest", state.request.approvalDigest],
+          ["deadline", state.request.approvalDeadline],
+          ["byte digest", `sha256:${JournalPublicationModel.sha256(state.request.exactBytes)}`]
+        ]),
+        stateBlock("Clock and qualification", [
+          ["now", state.clock.now],
+          ["uncertainty", state.clock.uncertainty],
+          ["trusted", state.clock.trusted],
+          ["rollback detected", state.clock.rollbackDetected],
+          ["prerequisites attested", state.qualification.modeledAttestation]
+        ]),
+        stateBlock("Publication owner", [
+          ["candidate", state.profile.name],
+          ["backend available", state.backend.available],
+          ["effective availability", state.profile.targetPostgresCoupled && !state.targetMutation.postgresAvailable ? false : state.backend.available],
+          ["stored records", records.length],
+          ["current journal durable", currentRecord ? currentRecord.journalDurableCompletion : null]
+        ]),
+        stateBlock("Client process", [
+          ["alive", state.process.alive],
+          ["generation", state.process.generation],
+          ["knowledge", state.process.clientKnowledge],
+          ["receipt observed", state.process.receiptObserved],
+          ["last action", state.lastAction]
+        ]),
+        stateBlock("Target mutation", [
+          ["PostgreSQL available", state.targetMutation.postgresAvailable],
+          ["apply", state.targetMutation.APPLY.status],
+          ["apply digest", state.targetMutation.APPLY.exactByteDigest],
+          ["rollback", state.targetMutation.ROLLBACK.status],
+          ["rollback digest", state.targetMutation.ROLLBACK.exactByteDigest]
+        ]),
+        stateBlock("Current durable record", [
+          ["record exists", Boolean(currentRecord)],
+          ["record result", currentRecord ? currentRecord.receipt.result : null],
+          ["journal completion", currentRecord ? currentRecord.journalDurableCompletion : null],
+          ["proof completion", currentRecord && currentRecord.proof ? currentRecord.proof.durableCompletion : null],
+          ["claimed upper bound", currentRecord && currentRecord.proof ? currentRecord.proof.claimedTrustedUpperBound : null]
+        ])
+      ].join("");
+      elements.fullState.textContent = JSON.stringify(state, null, 2);
+      elements.trace.innerHTML = `<ol>${state.trace.slice().reverse().map(item => (
+        `<li><span class="trace-index">#${item.index}</span><span class="trace-action">${escapeHtml(item.action)}</span><span class="trace-message">${escapeHtml(item.message)}</span></li>`
+      )).join("")}</ol>`;
+    }
+
+    function render(options = {}) {
+      renderCandidate();
+      renderGuide();
+      if (!options.preserveForm) renderForm();
+      renderValidation();
+      renderResult();
+      renderState();
+      focusGuidedControl(options.focusGuide || null);
+    }
+
+    Object.values(JournalPublicationModel.candidates).forEach(profile => {
+      const option = document.createElement("option");
+      option.value = profile.id;
+      option.textContent = profile.name;
+      elements.candidate.append(option);
+    });
+
+    freeActions.forEach(([label, event]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      if (["CLEAR_ATTESTATION", "COMMIT_PROOF_LOSE_RESPONSE", "MARK_OUTCOME_INDETERMINATE", "CRASH_BEFORE_OBSERVE", "RESTART", "SET_ALTERNATE_BYTES", "RESET"].includes(event.type)) {
+        button.className = "secondary";
+      }
+      button.addEventListener("click", () => dispatch(event));
+      elements.freeActions.append(button);
+    });
+
+    elements.candidate.addEventListener("change", event => {
+      clearValidation();
+      state = JournalPublicationModel.reduce(state, { type: "SWITCH_CANDIDATE", candidateId: event.target.value });
+      completedGuideSteps = 0;
+      render();
+    });
+
+    elements.guideTabs.addEventListener("click", event => {
+      const button = event.target.closest("button[data-guide]");
+      if (button) startGuide(Number(button.dataset.guide));
+    });
+
+    elements.guideSteps.addEventListener("click", event => {
+      const button = event.target.closest("button[data-step]");
+      if (!button || button.disabled) return;
+      const stepIndex = Number(button.dataset.step);
+      const nextStep = stepIndex + 1;
+      const focusGuide = nextStep < guides[activeGuide].steps.length
+        ? { kind: "step", index: nextStep }
+        : { kind: "case", index: activeGuide };
+      dispatch(guides[activeGuide].steps[stepIndex][1], { guideAdvance: true, focusGuide });
+    });
+
+    elements.updateRequest.addEventListener("click", () => {
+      const issues = [];
+      const action = elements.action.value;
+      if (!["APPLY", "ROLLBACK"].includes(action)) {
+        issues.push({ field: elements.action, message: "Action is invalid." });
+      }
+      const approvalDeadline = readRequiredFiniteNumber(elements.deadline, "Approval deadline", issues);
+      const idempotencyKey = readRequiredText(elements.key, "Idempotency key", issues);
+      const approvalDigest = readRequiredText(elements.approval, "Approval digest", issues);
+      const exactBytes = readRequiredText(elements.bytes, "Exact authenticated bytes", issues);
+      const clockNow = readRequiredFiniteNumber(elements.now, "Modeled clock now", issues);
+      const clockUncertainty = readRequiredFiniteNumber(elements.uncertainty, "Clock uncertainty", issues, 0);
+      if (issues.length > 0) {
+        rejectForm(issues);
+        return;
+      }
+      dispatch({
+        type: "SET_REQUEST",
+        request: {
+          action,
+          idempotencyKey,
+          exactBytes,
+          approvalDigest,
+          approvalDeadline
+        },
+        clockNow,
+        clockUncertainty
+      });
+    });
+
+    render();
+  </script>
+</body>
+</html>

@@ -5,9 +5,12 @@ Status: publication architecture selected in
 choices and this architecture record on 2026-09-01. The complete interrupted
 publication and restart contract is recorded in
 [`journal-restart-design.md`](journal-restart-design.md) through
-[#74](https://github.com/nisavid/agents/issues/74). Compatibility, evidence,
+[#74](https://github.com/nisavid/agents/issues/74). The accepted compatibility
+contract is recorded in
+[`journal-compatibility-design.md`](journal-compatibility-design.md) through
+[#75](https://github.com/nisavid/agents/issues/75). Acceptance evidence,
 independent assessment, and final design acceptance remain open in
-[#75](https://github.com/nisavid/agents/issues/75) through
+[#76](https://github.com/nisavid/agents/issues/76) through
 [#78](https://github.com/nisavid/agents/issues/78). Implementation, deployment,
 candidate assembly, and live recovery remain separately authorized work.
 
@@ -220,8 +223,12 @@ boundaries, and stage predicates are part of this design.
 Apply `J` atomically stores the exact encrypted rollback preimage and its
 integrity bindings in the protected schema. The preimage cannot become
 authoritative without the matching `J`, and apply `J` cannot commit without the
-preimage. Rollback `J` binds that retained apply preimage rather than publishing
-a second preimage boundary.
+preimage. A `SUCCESSOR_APPLY` rollback `J` binds that retained apply preimage
+rather than publishing a second preimage boundary. A `LEGACY_COMPLETE_APPLY`
+rollback has no predecessor apply `J`; its separately approved rollback `J`
+therefore atomically ingests the exact encrypted legacy preimage and integrity
+bindings verified by the frozen legacy reader. No legacy preimage is copied into
+PostgreSQL at cutover or before that rollback `J`.
 
 ## Canonical mutation lineage
 
@@ -257,14 +264,17 @@ remain the lineage head.
 
 The controller constructs and validates the complete successor journal before
 opening the transaction. For apply, it also constructs and verifies the exact
-encrypted rollback preimage. The journal has no claimed durable timestamp.
+encrypted rollback preimage. For a `LEGACY_COMPLETE_APPLY` rollback, it instead
+verifies the exact manifest-bound encrypted legacy preimage through the frozen
+reader. The journal has no claimed durable timestamp.
 
 The protected publication interface locks the canonical mutation-lineage row.
 It requires explicit genesis or an exact head `M` with matching terminal `V`,
 then binds that lineage generation, head, and `V` into the aggregate. It creates
-the aggregate and stores the exact canonical bytes and, for apply, the bound
-encrypted preimage in the same transaction, or returns the byte-identical
-existing rows. A different binding under the stable key returns `CONFLICT`.
+the aggregate and stores the exact canonical bytes and the bound encrypted
+preimage for apply or an admitted `LEGACY_COMPLETE_APPLY` rollback in the same
+transaction, or returns the byte-identical existing rows. A different binding
+under the stable key returns `CONFLICT`.
 Concurrent creators converge through the database unique constraint; they do
 not infer absence while another creator is still committing.
 
@@ -277,10 +287,10 @@ exact query through the same protected interface.
 
 `P` starts only after `J` commit acknowledgement or exact recovery of `J` from
 the protected synchronous path. It reads the exact aggregate and journal,
-locks the canonical mutation-lineage row, requires the exact generation, head,
-and predecessor `V` bound by `J`, and inserts an immutable proof bound to their
-identities and digests. Lineage drift refuses `P` without changing the durable
-prefix.
+locks the canonical mutation-lineage row, requires the exact lineage state
+bound by `J`—genesis, or generation, head, and predecessor `V`—and inserts an
+immutable proof bound to their identities and digests. Lineage drift refuses
+`P` without changing the durable prefix.
 
 `P` revalidates the current deployment attestation and durability profile, then
 commits with `synchronous_commit=on`. Because PostgreSQL flushes WAL in order,
@@ -297,11 +307,12 @@ row written outside the protected synchronous path is not proof.
 transaction-owning adapter locks and reads that exact proof, the canonical
 mutation-lineage row, the admission-state row, the current immutable deployment
 attestation, and the named immutable clock-health envelope for the database
-host. It requires the exact lineage generation, head, and predecessor `V` bound
-by `J`; drift refuses `R` before any authority-bearing sample. After the proof
-observation, while the transaction retains those locks, the adapter samples the
-qualified host monotonic clock and submits that sample to the protected
-finalization function. The interface computes without precision truncation:
+host. It requires the exact lineage state bound by `J`—genesis, or generation,
+head, and predecessor `V`; drift refuses `R` before any authority-bearing
+sample. After the proof observation, while the transaction retains those locks,
+the adapter samples the qualified host monotonic clock and submits that sample
+to the protected finalization function. The interface computes without
+precision truncation:
 
 ```text
 elapsed = monotonic_sample - monotonic_anchor
@@ -443,24 +454,43 @@ to `VALID` while all predicates still hold. At or after expiry:
 - a missing `R` remains `QUALIFICATION_AMBIGUOUS` until protected same-key
   recovery resolves any original attempt; a newly sampled post-expiry attempt
   cannot become `VALID`;
-- an exact durable `VALID R` may proceed to `M` after expiry only while its
-  bound lineage generation, head, and predecessor `V` remain current;
+- an exact durable `VALID R` may proceed to `M` after expiry only while the
+  exact lineage state bound by its aggregate remains current—genesis, or head
+  plus predecessor `V`; legacy-predecessor eligibility is a separate admission
+  predicate and does not redefine this liveness rule;
 - `LATE` and `UNPROVEN` never admit `M`; a request-scoped `CONFLICT` cannot
   advance its mismatched request but does not freeze the correctly bound
   aggregate; and
 - `MUTATED` may only exact-replay or proceed to verification.
 
-Status, handoff, descendant planning, and recovery use these database states.
-They do not fall back to files, legacy pending markers, or process-local
-observations.
+After `J`, status, handoff, descendant planning, and recovery use these database
+states. They do not fall back to files, legacy pending markers, or process-local
+observations. The separately approved `LEGACY_COMPLETE_APPLY` admission is the
+only pre-`J` exception: the frozen compatibility reader authenticates the exact
+manifest-bound legacy chain and preimage, then `J` makes the protected
+PostgreSQL binding authoritative for all later stages.
 
 ## Rollback
 
 Rollback uses its own stable key, action, approval, journal, proof, receipt,
-mutation, and verification chain. Its approval binds the authoritative apply
-`M` and `V`, the exact rollback preimage and expected current postimage, the
-grant evidence, and the existing retry, reconciliation, cohort, and budget
-ceilings.
+mutation, and verification chain. Its predecessor variant is exactly one of:
+
+- `SUCCESSOR_APPLY`, which retains the existing rule and binds the authoritative
+  predecessor apply `M` and matching `V`; or
+- `LEGACY_COMPLETE_APPLY`, which binds an exact entry in the authenticated
+  cutover manifest, a complete chain authenticated by the frozen legacy reader,
+  the exact encrypted legacy preimage, and the explicit cutover genesis.
+
+`LEGACY_COMPLETE_APPLY` is admitted only while the target database identity,
+generation, complete selected and preserved cohort, and deterministic legacy
+postimage still equal the manifest-bound cutover state and the canonical lineage
+remains at that explicit genesis. The new successor rollback plan and approval
+bind the predecessor variant, manifest and chain digests, preimage and postimage,
+target and genesis identities, grant evidence, and existing retry,
+reconciliation, cohort, and budget ceilings. A legacy apply or rollback
+approval, or a successor apply approval, cannot authorize it. A missing,
+corrupt, unknown, excluded, incomplete, or drifted legacy predecessor requires
+separately approved remediation.
 
 A valid rollback `M` restores the exact selected preimage once, advances the
 generation, preserves all out-of-cohort rows, and leaves grant and ledger state
@@ -494,6 +524,97 @@ coordinates activation; durable mutation authority still resides only in
 PostgreSQL. A deployment that cannot provide the required signal remains
 fenced.
 
+The initial compatibility cutover specializes that same activation boundary.
+Its approved manifest binds one fenced epoch-activation proposal containing the
+reserved epoch, deployment attestation, capability digest, and one proposed
+legacy-writer fence whose services and database roles are proven mechanically
+partitioned to the target surface. A shared cross-surface writer blocks v1
+cutover. Before any external fence step, a read-only pre-fence gate
+authenticates the exact manifest, approvals, target, proposal, and bound
+deployment attestation; locks and rejects any expired, revoked, replaced, or
+scope-drifted attestation; and requires a conservative `U_prefence` strictly
+below its expiry and every other applicable validity bound. Only
+its exact short-lived, single-use invocation may reach the trusted fence
+adapter. The adapter's first effect is one synchronous PostgreSQL transaction
+that creates the protected pending fence generation and atomically removes
+login, connection, and write admission for the complete target-partitioned role
+set. Invocation consumption takes an exclusive adapter-local effect-attempt
+lock that remains held through that transaction. Before changing admission and
+again immediately before commit, the transaction locks and revalidates the
+exact consumed invocation, qualified clock envelope, deployment attestation,
+proposal, target partition, and validity bounds, with fresh conservative
+`U_fence_start` and `U_fence_commit` checks bounded through the finite
+transaction duration. Expiry, revocation, replacement, drift, or clock
+uncertainty rolls the whole transaction back without a fence effect; that abort
+still spends the invocation, so a retry requires a new pre-fence issue. The
+pending row binds the consumed invocation digest, and lost commit
+acknowledgement resolves only from that row plus the exact realized admission
+and ACL state.
+That reconnect barrier does not claim already-authorized work is stopped.
+The adapter next fences and waits out every attributed session, statement,
+transaction, prepared transaction, replication path, and background writer;
+only exact zero-live-writer evidence under unchanged ACLs establishes the
+database-side barrier. With that barrier held, it disables each exact service,
+durably compare-and-swap records each attestation, and advances the generation
+to active only after revalidating the drain, services, and ACLs. Lost
+acknowledgement at any step resolves from the pending row plus exact live state;
+an abort before the access-revocation commit changes nothing, a crash before
+drain completion creates no successor authority and requires a fresh target
+observation, and any crash after the drain leaves the database write barrier
+held. If a manifest drifts after this row reaches `FENCE_ACTIVE`, a fresh
+approved manifest uses the compatibility design's protected
+`ADOPT_ACTIVE_FENCE` compare-and-swap rather than the origin fence invocation.
+That synchronous metadata-only transaction locks the occupied fence and current
+manifest binding, revalidates the exact proposal, generation, admission, ACL,
+drain, service, attestation, clock, epoch, manifest, and genesis state, requires
+no successor authority, constructs the compatibility design's exact canonical
+`ActiveFenceManifestAdoption` body, and atomically advances the current binding
+to that body digest without changing any service, privilege, target, epoch, or
+lineage state. Exact replay returns the same body and digest only while it
+remains the current binding; a later adoption makes an old exact retry
+`SUPERSEDED_BINDING`. A stale binding, concurrent candidate, broken
+origin/adoption digest chain, or any live-state drift conflicts.
+
+Once that active, exactly queryable prerequisite and its current manifest
+binding are acknowledged or
+recovered, one
+transaction on the exact continuity session locks the fence; revalidates the
+exact held artifact bytes, current origin-or-adopted manifest binding, manifest,
+target snapshot, proposal, and capability preimage; locks and revalidates the
+exact deployment attestation; then samples
+the manifest-bound qualified monotonic clock and derives the conservative
+`U_cutover`. It requires the attestation to remain current and unrevoked and
+`U_cutover` to be strictly below its expiry and every manifest and approval
+validity bound, installs the session-local witness,
+stores the manifest, creates canonical lineage genesis, and makes the reserved
+epoch active. The fence and evidence descriptors remain held through
+synchronous durable commit. An abort leaves the proposal and legacy writers
+fenced and creates no active epoch, manifest, or genesis; it never automatically
+restores a service or role. No separate cutover transaction may activate any
+subset of those three authority facts.
+
+Manifest and exact-exclusion authorization reuse the existing authenticated
+operator-approval boundary and its immutable, domain-separated approval
+records. The compatibility design fixes their canonical bytes, digest
+subjects, authenticated principal and receipt bindings, and protected
+cutover-admission verifier. A content digest is not authentication, and these
+records add no signing key or separate cryptographic authority.
+
+Compatibility activation also binds the pre-existing protected monotonic
+legacy-writer fence generation named by the admission state. Every successor
+`J`, `P`, `R`, and `M` locks and revalidates that generation plus live
+service-disable, login/connection/write-admission, database-role ACL, and
+zero-live-writer drain evidence, including the exact drain-observation
+generation, and binds all of their digests into its aggregate or stage
+identity. Restored admission, a write regrant, a newly live writer path, or
+evidence drift refuses the stage. This record authorizes no writer re-enable.
+Any future fence-removal design must first synchronously fence the publication
+epoch and advance the fence generation under those same locks before it can
+consider returning a service or role. A fence race after `R` thus prevents
+`M`, and a crash after that guard leaves successor mutation fenced. Legacy
+reactivation and non-genesis successor recutover require a separately accepted
+transition design and approval.
+
 `M` requires both the unfenced current epoch and proof of the live capability.
 It rejects every aggregate whose epoch differs from the active value, every
 restored admission row for which the new adapter lacks the secret preimage, and
@@ -515,14 +636,15 @@ record after permanent primary-disk loss.
 
 ## Legacy cutover
 
-These are the accepted compatibility constraints on the architecture. Issue
-[#75](https://github.com/nisavid/agents/issues/75) owns the complete successor
-format, reader, versioning, and transition contract.
+These are the accepted compatibility constraints on the architecture. The
+[journal compatibility design](journal-compatibility-design.md) records the
+complete successor format, reader, versioning, manifest, and transition
+contract accepted in [#75](https://github.com/nisavid/agents/issues/75).
 
 Historical schemas, canonical bytes, and readers remain unchanged. In
-particular, legacy `applied_at` retains its historical pending-marker meaning;
-it is never reinterpreted as journal durability, proof durability, receipt
-durability, mutation time, or commit time.
+particular, the legacy pending marker contains only `kind` and
+`schema_version`; its presence is never reinterpreted as journal durability,
+proof durability, receipt durability, mutation time, or commit time.
 
 Cutover handles each legacy prefix explicitly:
 
@@ -530,8 +652,8 @@ Cutover handles each legacy prefix explicitly:
 | --- | --- |
 | Complete application or rollback chain | Preserve and inspect under its original schema and semantics. |
 | Pending marker or journal exists, target mutation absent | Freeze as nonauthorizing. A new successor plan and approval are required. |
-| Target mutation already applied, receipts incomplete | Permit exact `already_applied` verification and nonauthorizing evidence closure only. Do not perform another state-changing continuation or manufacture successor stages. |
-| Rollback is desired | Require a new, separately approved successor rollback publication. |
+| Target mutation already applied, receipts incomplete | Permit exact `already_applied` verification and nonauthorizing evidence closure only. The closure is remediation evidence, not a `LEGACY_COMPLETE_APPLY` predecessor; do not perform another state-changing continuation or manufacture successor stages. |
+| Rollback of a complete legacy application is desired | Require a new, separately approved `LEGACY_COMPLETE_APPLY` successor rollback publication. The frozen reader, authenticated manifest, exact current cutover state, explicit genesis, and exact encrypted preimage must all reverify before `J`. |
 
 No migration or backfill creates `P`, `R`, `M`, or `V` for historical work.
 Legacy files never become a compatibility authority for successor mutation.
@@ -542,8 +664,13 @@ The publication schema is owned by a dedicated role. Runtime roles receive
 only narrow protected interfaces:
 
 - the admission role alone can author or revoke deployment attestations and
-  clock envelopes, fence an incarnation, and activate a publication epoch from
-  the required external deployment signal and new live capability;
+  clock envelopes, fence an incarnation, invoke the compatibility design's
+  metadata-only protected `ADOPT_ACTIVE_FENCE` compare-and-swap before any
+  successor authority exists, and activate a publication epoch from the
+  required external deployment signal and new live capability. It cannot use
+  adoption to change services, privileges, target data, stages, lineage,
+  epoch, manifest, or genesis state, and no other runtime role receives that
+  interface;
 - the publication role can advance and query `J`, `P`, and `R` and lock and read
   the lineage row only to bind `J` and revalidate that binding at `P` and `R`,
   but cannot update the lineage or mutate target state;
@@ -618,8 +745,8 @@ outcomes falsifiable:
 - a sibling `M` racing a loser's `P` or `R` makes the loser fail its
   transaction-local lineage check, so no later pre-`M` authority is appended
   after drift;
-- each `M` receipt proves the prior lineage head, consumed predecessor `V`, and
-  atomic new lineage head;
+- each `M` receipt proves the prior lineage state—genesis, or head plus consumed
+  predecessor `V`—and atomic new lineage head;
 - lost `M` acknowledgement recovers the exact postimage and never repeats the
   mutation;
 - a successor aggregate cannot execute `M` before the immediately preceding
@@ -635,7 +762,17 @@ outcomes falsifiable:
 - a restored `ACTIVE` admission row cannot satisfy `M` because the new adapter
   lacks both the bound capability preimage and its session-local witness;
 - rollback cannot reuse apply authority and restores the selected preimage
-  exactly once; and
+  exactly once;
+- `SUCCESSOR_APPLY` rollback continues to require the exact predecessor apply
+  `M` and matching `V`, while `LEGACY_COMPLETE_APPLY` admits only a complete
+  manifest-bound legacy chain at exact cutover generation and genesis;
+- an incomplete-receipt `already_applied` closure, pending marker, corrupt or
+  unknown legacy artifact, current-state drift, or unavailable legacy preimage
+  never admits rollback;
+- a legacy-predecessor rollback `J` atomically ingests its exact verified
+  encrypted preimage, with no cutover-time byte capsule and no legacy `M` or `V`
+  backfill;
+- no legacy apply or rollback approval can authorize a successor rollback; and
 - every historical schema retains byte-identical parsing and timestamp
   semantics.
 
@@ -700,8 +837,8 @@ publication and restart behavior is selected in
 [durable journal restart design](journal-restart-design.md). The remaining
 design map owns:
 
-- [#75](https://github.com/nisavid/agents/issues/75): historical format,
-  reader, and transition compatibility;
+- the accepted [#75 compatibility record](journal-compatibility-design.md):
+  historical format, reader, manifest, and transition compatibility;
 - [#76](https://github.com/nisavid/agents/issues/76): falsifiable design and
   implementation evidence obligations;
 - [#77](https://github.com/nisavid/agents/issues/77): independent assessment

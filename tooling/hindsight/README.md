@@ -30,6 +30,9 @@ Reusable Hindsight control-plane code, local-stack tooling, agent skills, policy
 - [Durable journal restart](docs/journal-restart-design.md) for automatic safe
   recovery, interruption resolution, verification, rollback, and preimage
   retention across every authoritative publication prefix.
+- [Journal compatibility and cutover](docs/journal-compatibility-design.md) for
+  frozen historical readers, exact legacy dispositions, authenticated cutover
+  manifests, and the narrow legacy-predecessor rollback bridge.
 
 ## Harness authority
 

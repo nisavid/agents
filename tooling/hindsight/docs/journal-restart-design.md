@@ -5,11 +5,13 @@ Status: interrupted publication and restart behavior selected in
 safe advancement, match-only authoritative verification, and explicit
 retirement of rollback preimages on 2026-09-01. The publication architecture
 selected in [#73](https://github.com/nisavid/agents/issues/73) remains fixed.
-Compatibility, acceptance evidence, independent assessment, and final design
-acceptance remain open in [#75](https://github.com/nisavid/agents/issues/75)
-through [#78](https://github.com/nisavid/agents/issues/78). Implementation,
-deployment, candidate assembly, and live recovery remain separately authorized
-work.
+The accepted compatibility contract is recorded in
+[`journal-compatibility-design.md`](journal-compatibility-design.md) through
+[#75](https://github.com/nisavid/agents/issues/75). Acceptance evidence,
+independent assessment, and final design acceptance remain open in
+[#76](https://github.com/nisavid/agents/issues/76) through
+[#78](https://github.com/nisavid/agents/issues/78). Implementation, deployment,
+candidate assembly, and live recovery remain separately authorized work.
 
 ## Decision
 
@@ -72,6 +74,13 @@ aggregates with the stable key selected in #73:
 ```text
 (operation_identity, action, plan_digest, publication_epoch)
 ```
+
+A rollback additionally binds exactly one predecessor variant.
+`SUCCESSOR_APPLY` names an authoritative successor apply `M` with matching `V`
+and retains the ordinary restart contract. `LEGACY_COMPLETE_APPLY` names a
+complete application chain admitted by the accepted
+[journal compatibility design](journal-compatibility-design.md); it never
+creates or assumes a synthetic predecessor `M` or `V`.
 
 The durable prefix is the longest exact, binding-consistent chain present in
 the protected schema:
@@ -155,7 +164,11 @@ partially overlapping, merging, and disjoint cohorts all share the lineage.
 This deliberately conservative serialization avoids any need to infer overlap.
 
 Before creating `J`, recovery locks the lineage row and binds explicit genesis
-or the exact current head `M` and its matching `V`. If the head is unverified,
+or the exact current head `M` and its matching `V`. A
+`LEGACY_COMPLETE_APPLY` rollback may bind genesis only when the frozen legacy
+reader, authenticated cutover manifest, complete legacy application chain,
+exact current cutover generation and postimage, and exact encrypted preimage all
+reverify. If a non-genesis head is unverified,
 recovery reports `PREDECESSOR_VERIFICATION_PENDING` and may make a bounded
 evidence-only verification attempt for that predecessor. A match permits the
 lineage gate to be reevaluated; `UNABLE_TO_VERIFY` leaves it pending for a later
@@ -163,11 +176,20 @@ pass. A terminal mismatch reports `PREDECESSOR_VERIFICATION_MISMATCH` and
 requires separately approved remediation.
 
 Every pre-`M` authority-bearing `J`, `P`, and `R` transaction locks that same
-row and requires its generation, head, and predecessor `V` to equal the values
-bound by `J`. At `M`, recovery repeats the check, then atomically mutates the
-target, writes `M`, and advances the lineage head. If another aggregate advanced
-first, the next attempted `P`, `R`, or `M` reports `LINEAGE_HEAD_DRIFT`. It never
-substitutes the new head or reuses the old plan and approval. Consequently, two
+row and requires its generation and exact bound state—genesis, or head and
+predecessor `V`—to equal the values bound by `J`. For a compatibility-activated
+epoch, `J`, `P`, `R`, and `M` also lock the admission and legacy-writer fence
+rows and revalidate the exact bound fence generation and live service-disable
+evidence, login/connection/write-admission, database-role ACL, and
+zero-live-writer drain
+evidence, including the exact drain-observation generation. Restored admission,
+a write regrant, a newly live writer path, or evidence drift refuses the stage.
+At `M`, recovery repeats every check, then atomically mutates the target, writes
+`M`, and advances the lineage head. If
+another aggregate advanced first, the next attempted `P`, `R`, or `M` reports
+`LINEAGE_HEAD_DRIFT`. If the fence changed, the stage refuses without consuming
+old authority. It never substitutes the new head or reuses the old plan and
+approval. Consequently, two
 aggregates may bind one verified head, but only the first exact `M` can win.
 
 Recovery is bounded. Lock or transaction-resolution timeout leaves the exact
@@ -187,7 +209,7 @@ session, and session-local witness still satisfy #73.
 | `ABSENT` | Revalidate the approval, complete binding, target generation, exact selected and preserved cohorts, preparation evidence, and canonical lineage gate; create the exact `J` only from genesis or an exactly verified head. | Refuse. No new durable authority may begin; require a separately approved replacement aggregate. | Preserve preparation evidence only; require a new epoch and separately approved aggregate. |
 | `JOURNALED` | Exact-replay `J`, then create `P`. | Preserve and query `J`; it cannot newly gain mutation authority. | Preserve and query; require a new epoch and separately approved aggregate. |
 | `PROVEN` | Exact-replay `JP`, then make one protected `R` attempt with a fresh post-proof monotonic sample. | Resolve only an original `R` attempt. If no such transaction can commit and no durable `R` exists, record `UNPROVEN`. Never take a fresh sample. | Resolve an original attempt for evidence only. Even a recovered `VALID R` remains fenced from `M`. |
-| `VALID` | Automatically perform exact `M` only while the bound lineage generation, head, and predecessor `V` remain current. | Same; expiry does not revoke a durable timely receipt, but it does not override the lineage gate. | Preserve `R`, refuse `M`, and require a new epoch and separately approved replacement aggregate. |
+| `VALID` | Automatically perform exact `M` only while the bound lineage generation and exact genesis or head-plus-`V` state remain current. | Same; expiry does not revoke a durable timely receipt, but it does not override the lineage gate. | Preserve `R`, refuse `M`, and require a new epoch and separately approved replacement aggregate. |
 | `LATE` | Preserve as terminal and nonauthorizing. | Preserve as terminal and nonauthorizing. | Preserve unchanged. |
 | `MUTATED` | Never repeat `M`; resolve its receipt and automatically attempt evidence-only verification. | Same. | Never repeat `M`; a fresh evidence-only verifier may still verify it. |
 | `VERIFIED` | Return exact terminal replay and status. | Return exact terminal replay and status. | Preserve as terminal historical evidence. |
@@ -243,9 +265,20 @@ observation. A replacement requires a new plan digest or publication epoch as
 appropriate, separate approval, and a distinct aggregate linked to the old
 one.
 
-Rollback preparation additionally revalidates the authoritative apply `M` and
-matching `V`, the retained exact preimage, and the expected current apply
-postimage. Without all of them, rollback cannot begin.
+`SUCCESSOR_APPLY` rollback preparation additionally revalidates the
+authoritative apply `M` and matching `V`, the retained exact preimage, and the
+expected current apply postimage. That rule is unchanged.
+
+`LEGACY_COMPLETE_APPLY` rollback preparation instead revalidates the exact
+authenticated cutover-manifest entry, complete legacy application chain through
+the frozen read-only decoder, exact target database and cutover generation,
+complete current postimage and selected and preserved cohorts, explicit lineage
+genesis, and the exact decryptable encrypted legacy preimage. Its new successor
+plan and approval bind every one of those facts. A legacy approval cannot be
+reused. A pending marker, corrupt, unknown, excluded, or incomplete chain,
+receipt-incomplete `already_applied` closure, missing preimage, current-state
+drift, or non-genesis lineage permits remediation only and cannot begin
+rollback.
 
 ## Transaction ambiguity and lost acknowledgements
 
@@ -368,8 +401,9 @@ Apply and rollback use the same restart matrix after their distinct admission
 requirements are satisfied. They never share an approval, aggregate, `R`, `M`,
 or `V`.
 
-Rollback may create `J` only when the referenced apply aggregate has exact
-authoritative `M` and matching `V`, and its separately approved binding covers:
+For predecessor variant `SUCCESSOR_APPLY`, rollback may create `J` only when the
+referenced apply aggregate has exact authoritative `M` and matching `V`. Its
+separately approved binding covers:
 
 - the exact apply aggregate and `M` and `V` digests;
 - the exact encrypted rollback preimage and integrity bindings;
@@ -379,6 +413,17 @@ authoritative `M` and matching `V`, and its separately approved binding covers:
   ceilings; and
 - the rollback plan, approval, database, and publication epoch.
 
+That successor-predecessor rule is unchanged. For predecessor variant
+`LEGACY_COMPLETE_APPLY`, rollback may create `J` only from the exact admissible
+legacy state defined above. Its separately approved binding additionally covers
+the predecessor variant; authenticated manifest entry and complete legacy-chain
+digests; exact frozen-reader version; target database, cutover generation and
+explicit genesis; deterministic current legacy postimage; and exact encrypted
+preimage, ciphertext, decryption, and integrity bindings. The rollback `J`
+atomically ingests that verified encrypted preimage into the protected schema.
+No compatibility scan, manifest creation, or receipt-incomplete closure stores
+legacy bytes in PostgreSQL or creates predecessor `M` or `V`.
+
 Rollback `M` uses serializable compare-and-swap semantics to restore the exact
 selected preimage once and advance generation once. It preserves grants, prior
 publication evidence, failed and completed rows, and every out-of-cohort row.
@@ -386,10 +431,12 @@ Intervening drift refuses the transaction; rollback never overwrites the drift
 or expands its cohort. A committed rollback `M` is never repeated and reaches
 terminal completion only through its own matching `V`.
 
-An apply `M` without matching `V`, an apply verification mismatch, unavailable
-preimage, or unexpected current postimage cannot authorize ordinary rollback.
-Those states require diagnosis and, if desired, a separately approved
-remediation design.
+A successor apply `M` without matching `V`, an apply verification mismatch,
+unavailable preimage, or unexpected current postimage cannot authorize ordinary
+rollback. A legacy predecessor that fails any complete-chain, manifest,
+generation, genesis, preimage, or current-postimage check likewise cannot
+authorize rollback. Those states require diagnosis and, if desired, a
+separately approved remediation design.
 
 ## Preimage retention and permanent retirement
 
@@ -397,6 +444,10 @@ The apply `J` transaction atomically stores the exact encrypted rollback
 preimage with its action, aggregate, target, generation, cohort, ciphertext,
 and integrity bindings. `J` cannot commit without that protected preimage
 record, and the preimage cannot become authoritative without the matching `J`.
+For `LEGACY_COMPLETE_APPLY`, the separately approved rollback `J` is the first
+successor authority boundary and atomically stores the exact encrypted preimage
+authenticated from the complete legacy chain. There is no cutover-time legacy
+byte capsule.
 Under the PostgreSQL publication architecture, that database record is
 authoritative for the bindings and continued availability of the ciphertext. A
 private-file copy may be an export or backup, but its presence or loss cannot
@@ -444,8 +495,9 @@ turn prior evidence into new authority.
 
 Historical formats keep their original meaning. This successor restart
 contract does not backfill `P`, `R`, `M`, or `V` into a legacy chain or promote
-a historical file into PostgreSQL authority. Issue #75 owns the complete
-format, reader, and transition compatibility design.
+a historical file into PostgreSQL authority. The accepted
+[journal compatibility design](journal-compatibility-design.md) owns the
+complete format, frozen-reader, manifest, and transition contract.
 
 ## Observable recovery report
 
@@ -454,6 +506,8 @@ information to distinguish the product state without interpretation from
 ambient artifacts:
 
 - action and stable aggregate key;
+- rollback predecessor variant and, for `LEGACY_COMPLETE_APPLY`, authenticated
+  manifest-entry and frozen-reader contract digests;
 - aggregate and stage-binding digests;
 - longest exact durable prefix;
 - unresolved stage and ambiguity disposition, if any;
@@ -507,8 +561,8 @@ and rollback:
   yielding, respectively, successor admission, bounded
   `PREDECESSOR_VERIFICATION_PENDING`, and remediation-only
   `PREDECESSOR_VERIFICATION_MISMATCH`;
-- every `M` receipt proving its canonical lineage key, prior head and
-  predecessor `V`, and atomic successor head;
+- every `M` receipt proving its canonical lineage key, prior lineage
+  state—genesis, or head plus predecessor `V`—and atomic successor head;
 - admission replacement or revocation racing with `P`, `R`, and `M`;
 - ambiguous `M` with eventual commit, eventual abort, and bounded resolution
   timeout;
@@ -520,6 +574,17 @@ and rollback:
   rollback compare-and-swap drift;
 - rollback interruption at every stage producing exactly one restoration and
   one generation advance;
+- `SUCCESSOR_APPLY` rollback retaining the exact predecessor `M` and matching
+  `V` requirement;
+- `LEGACY_COMPLETE_APPLY` admitting only an authenticated manifest entry,
+  complete frozen-reader-verified chain, exact cutover generation and postimage,
+  explicit genesis, exact preimage, and new successor rollback approval;
+- pending, unknown, corrupt, excluded, incomplete, receipt-closure-only,
+  drifted, non-genesis, or preimage-unavailable legacy predecessors refusing
+  before `J` and permitting remediation only;
+- legacy-predecessor `J` atomically ingesting the exact verified encrypted
+  preimage without cutover byte capsules, approval reuse, or synthetic legacy
+  `M` or `V`;
 - missing, corrupted, and explicitly retired rollback preimages;
 - replacement aggregates retaining every predecessor prefix and limit without
   inheriting its mutation authority.
@@ -539,8 +604,8 @@ provider call, rollback, preimage retirement, or live recovery action.
 
 The remaining design map owns:
 
-- [#75](https://github.com/nisavid/agents/issues/75): historical format,
-  reader, and transition compatibility;
+- the accepted [#75 compatibility record](journal-compatibility-design.md):
+  historical format, frozen-reader, manifest, and transition compatibility;
 - [#76](https://github.com/nisavid/agents/issues/76): falsifiable design and
   implementation evidence obligations;
 - [#77](https://github.com/nisavid/agents/issues/77): independent assessment

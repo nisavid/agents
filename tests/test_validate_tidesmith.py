@@ -159,6 +159,22 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertTrue((self.plugin / "content-lock.json").is_file())
         self.assertEqual(self.validate().returncode, 0)
 
+    def test_frontmatter_parser_accepts_crlf_and_missing_trailing_newline(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("PyYAML is required for the strict frontmatter loader")
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import validate_tidesmith as module
+
+        crlf = "---\r\nname: writing-for-people\r\ndescription: Use when x.\r\n---\r\nBody\r\n"
+        bare = "---\nname: writing-for-people\ndescription: Use when x.\n---\nBody"
+        for content in (crlf, bare):
+            frontmatter = module.load_skill_frontmatter(content, "writing-for-people")
+            self.assertEqual(frontmatter["name"], "writing-for-people")
+        with self.assertRaises(module.ContractError):
+            module.load_skill_frontmatter("---\nname: x\ndescription: Use when x.\n---", "x")
+
     def test_rejects_unknown_flag(self) -> None:
         result = self.validate("--unknown")
         self.assertEqual(result.returncode, 2)

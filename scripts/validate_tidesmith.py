@@ -154,37 +154,65 @@ def load_json(root: Path, relative: str, field: str) -> dict:
     return value
 
 
+def decoded_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from decoded_strings(key)
+            yield from decoded_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from decoded_strings(item)
+
+
+def validate_decoded_portability(value, field: str) -> None:
+    for text in decoded_strings(value):
+        for pattern in PORTABILITY_PATTERNS:
+            require(
+                pattern.search(text) is None,
+                f"portability or credential leak in {field}",
+            )
+
+
 def load_yaml_mapping(content: str, field: str) -> dict:
-    if yaml is not None:
-        value = yaml.safe_load(content)
-        require(isinstance(value, dict), f"{field} must be a mapping")
-        return value
-    mapping: dict = {}
-    current: dict | None = None
-    for line in content.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line.startswith(" "):
-            key, separator, rest = line.partition(":")
-            require(separator == ":", f"{field} has an invalid line: {line}")
-            if rest.strip():
-                mapping[key.strip()] = rest.strip().strip('"')
-                current = None
-            else:
-                current = {}
-                mapping[key.strip()] = current
-            continue
-        require(current is not None, f"{field} has an indented orphan line")
-        key, separator, rest = line.strip().partition(":")
-        require(separator == ":", f"{field} has an invalid nested line: {line}")
-        current[key.strip()] = rest.strip().strip('"')
-    return mapping
+    require(yaml is not None, "PyYAML is required to validate discovery metadata")
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def construct_unique_mapping(loader, node, deep=False):
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as error:
+                raise ContractError(f"{field} keys must be scalar values") from error
+            require(not duplicate, f"{field} contains duplicate key: {key}")
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    UniqueKeyLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        construct_unique_mapping,
+    )
+    try:
+        documents = list(yaml.load_all(content, Loader=UniqueKeyLoader))
+    except yaml.YAMLError as error:
+        raise ContractError(f"{field} contains invalid YAML: {error}") from error
+    require(len(documents) == 1, f"{field} must contain exactly one YAML document")
+    document = documents[0]
+    require(isinstance(document, dict), f"{field} must contain a mapping")
+    validate_decoded_portability(document, field)
+    return document
 
 
 def load_skill_frontmatter(content: str, skill: str) -> dict:
-    match = re.match(r"\A---\n(.*?)\n---\n", content, re.DOTALL)
-    require(match is not None, f"{skill} frontmatter is missing")
-    return load_yaml_mapping(match.group(1), f"{skill} frontmatter")
+    match = re.match(r"\A---\r?\n(?P<yaml>.*?)\r?\n---(?:\r?\n|\Z)", content, re.DOTALL)
+    require(match is not None, f"{skill} must have opening and closing frontmatter")
+    require(content[match.end() :].strip(), f"{skill} must have a skill body")
+    return load_yaml_mapping(match.group("yaml"), f"{skill} frontmatter")
 
 
 def validate_topology(root: Path) -> dict:

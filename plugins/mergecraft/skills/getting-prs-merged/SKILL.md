@@ -85,8 +85,9 @@ verify the active login, then reread ID/URL, PR, head, author, body, and
 timestamp. Possible-mutation timeout is ambiguous: do not retry. It cannot
 edit PR text, feedback, CI, or merge.
 When the diff is already clean and CodeRabbit approval is the only remaining
-branch-protection gate, request approval (`@coderabbit-ai approve pls`) rather
-than another review.
+branch-protection gate, request approval with the documented top-level command
+`@coderabbitai approve` rather than another review; CodeRabbit submits that
+approval only when the repository enables `reviews.request_changes_workflow`.
 
 ## Stop conditions
 

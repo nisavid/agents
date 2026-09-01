@@ -2,9 +2,12 @@
 
 Status: publication architecture selected in
 [#73](https://github.com/nisavid/agents/issues/73). Ivan approved these product
-choices and this architecture record on 2026-09-01. Restart, compatibility,
-evidence, independent assessment, and final design acceptance remain open in
-[#74](https://github.com/nisavid/agents/issues/74) through
+choices and this architecture record on 2026-09-01. The complete interrupted
+publication and restart contract is recorded in
+[`journal-restart-design.md`](journal-restart-design.md) through
+[#74](https://github.com/nisavid/agents/issues/74). Compatibility, evidence,
+independent assessment, and final design acceptance remain open in
+[#75](https://github.com/nisavid/agents/issues/75) through
 [#78](https://github.com/nisavid/agents/issues/78). Implementation, deployment,
 candidate assembly, and live recovery remain separately authorized work.
 
@@ -52,9 +55,9 @@ for a later proof of each proof while retaining an exact durable record that a
 mutation can consume.
 
 This record fixes the architecture and the constraints already decided while
-selecting it. The later design tickets amend this document with their complete
-restart, compatibility, and acceptance contracts; they do not silently revise
-the invariant or replace PostgreSQL as the selected publication owner.
+selecting it. Companion design records supply the complete restart,
+compatibility, and acceptance contracts; they do not silently revise the
+invariant or replace PostgreSQL as the selected publication owner.
 
 ## Scope and failure model
 
@@ -92,24 +95,34 @@ conservative forward-error model is unsupported.
 
 A protected admission-state row names the current immutable deployment
 attestation and clock envelope, the active publication epoch, and whether that
-epoch is active or fenced. Every stage transaction locks that state and its
-exact deployment attestation through commit, rejects an absent, expired,
-fenced, or mismatched state at its decisive observation, and rechecks its
-required live PostgreSQL settings. `R` also locks the named clock envelope.
-Attestation or clock-envelope replacement and revocation take a conflicting
-lock, so they order either before the stage observation or after the stage
-commit. Revocation fences the affected epoch; it never edits historical
-evidence in place.
+epoch is active or fenced. Every authority-bearing `J`, `P`, `R`, or `M`
+transaction locks that state and its exact deployment attestation through
+commit, rejects an absent, expired, fenced, or mismatched state at its decisive
+observation, and rechecks its required live PostgreSQL settings. `R` also locks
+the named clock envelope. Attestation or clock-envelope replacement and
+revocation take a conflicting lock, so they order either before the stage
+observation or after the stage commit. Revocation fences the affected epoch; it
+never edits historical evidence in place.
 
-Each stage records the exact admission generation and deployment-attestation
-digest it used. `R` additionally records the exact clock-envelope digest and
-monotonic sample used to derive `U`. A later ordinary evidence expiry does not
-rewrite that historical fact, while a later revocation fences the epoch before
-an unconsumed `R` can reach `M`. This keeps admission current through `P` and
-`R` instead of treating a startup check as permanent authority. Issue #76 owns
-the evidence used to qualify the admission controller, clock model, and each
-supported profile; it does not transfer attestation authorship to an ordinary
-runtime role.
+Verification after exact `M` is a separate evidence-only boundary. It locks the
+exact aggregate, `M`, target rows, and terminal verification slot and
+authenticates the target database identity, but it does not require the old
+publication epoch, deployment attestation, incarnation capability, or
+activation-bound session to remain live. It may therefore run after expiry or
+fencing without reviving any mutation authority. Its role cannot create or
+consume `R`, execute `M`, alter the target, or activate an epoch.
+
+Each authority-bearing stage records the exact admission generation and
+deployment-attestation digest it used. `R` additionally records the exact
+clock-envelope digest and monotonic sample used to derive `U`. Verification
+evidence instead binds the exact `M`, target database identity, observed
+generation, cohort, and postimage, and stable verification-attempt identity. A
+later ordinary evidence expiry does not rewrite a historical fact, while a
+later revocation fences the epoch before an unconsumed `R` can reach `M`. This
+keeps admission current through `P` and `R` instead of treating a startup check
+as permanent authority. Issue #76 owns the evidence used to qualify the
+admission controller, clock model, and each supported profile; it does not
+transfer attestation authorship to an ordinary runtime role.
 
 The initial profile admits exactly one transaction-owning adapter instance. It
 starts mutation-fenced, opens a dedicated database continuity session, and
@@ -181,32 +194,43 @@ conflict under the old key. A content digest alone is not a stable request key:
 changed bytes or other bindings within one request must conflict rather than
 silently create an unrelated publication.
 
-Each later stage stores a stage-binding digest that extends the aggregate
-binding with every predecessor-stage digest and the exact admission generation
-and deployment-attestation digest used by that transaction. `R` additionally
-binds the clock-envelope digest, monotonic sample, error terms, and `U`; `M`
-additionally binds the active admission state and incarnation-capability digest
-it consumed. A stage from another retry, action, database, epoch, approval,
-journal, attestation, clock, or incarnation chain cannot be mixed into the
-aggregate.
+Each authority-bearing later stage stores a stage-binding digest that extends
+the aggregate binding with every predecessor-stage digest and the exact
+admission generation and deployment-attestation digest used by that
+transaction. `R` additionally binds the clock-envelope digest, monotonic
+sample, error terms, and `U`; `M` additionally binds the active admission state
+and incarnation-capability digest it consumed. A stage from another retry,
+action, database, epoch, approval, journal, attestation, clock, or incarnation
+chain cannot be mixed into the aggregate.
 
-The logical relations are an aggregate row plus immutable `J`, `P`, `R`, `M`,
-and `V` rows. Exact SQL names may follow repository conventions, but the unique
-keys, foreign keys, append-only rules, and stage predicates are part of this
-design.
+The logical relations are an aggregate row plus immutable `J`, `P`, `R`, and
+`M` rows, a terminal verification slot, immutable verification observations,
+and successful `V` rows. An exact `MATCH` fills the terminal slot with `V`; an
+exact `MISMATCH` fills it with a terminal mismatch observation. Database
+constraints prevent both outcomes for one aggregate. Exact SQL names may
+follow repository conventions, but the unique keys, foreign keys, append-only
+rules, and stage predicates are part of this design.
+
+Apply `J` atomically stores the exact encrypted rollback preimage and its
+integrity bindings in the protected schema. The preimage cannot become
+authoritative without the matching `J`, and apply `J` cannot commit without the
+preimage. Rollback `J` binds that retained apply preimage rather than publishing
+a second preimage boundary.
 
 ## Inline publication protocol
 
 ### 1. Journal transaction (`J`)
 
 The controller constructs and validates the complete successor journal before
-opening the transaction. The journal has no claimed durable timestamp.
+opening the transaction. For apply, it also constructs and verifies the exact
+encrypted rollback preimage. The journal has no claimed durable timestamp.
 
 The protected publication interface creates the aggregate and stores the exact
-canonical bytes once, or returns the byte-identical existing row. A different
-binding under the stable key returns `CONFLICT`. Concurrent creators converge
-through the database unique constraint; they do not infer absence while
-another creator is still committing.
+canonical bytes and, for apply, the bound encrypted preimage in the same
+transaction, or returns the byte-identical existing rows. A different binding
+under the stable key returns `CONFLICT`. Concurrent creators converge through
+the database unique constraint; they do not infer absence while another creator
+is still committing.
 
 The transaction sets `synchronous_commit=on` and verifies the admitted
 durability profile. Its success means the local server acknowledged WAL flush
@@ -274,7 +298,8 @@ the commit completed but the acknowledgement was lost, an exact query recovers
 Only an exact immutable `VALID R` admits mutation. `M` runs at serializable
 isolation and, in one transaction:
 
-1. locks the aggregate and exact `R`;
+1. locks the aggregate, exact `R`, and protected target-publication lineage for
+   the database and mutation domain, shared by every overlapping cohort;
 2. requires the aggregate's epoch to equal the unfenced active publication
    epoch in the current admission state and locks that state through commit;
 3. requires `M` to be running on the exact activation-bound PostgreSQL session,
@@ -284,7 +309,9 @@ isolation and, in one transaction:
    deployment-attestation and clock-envelope digests, and the strict
    `U < approval_expiry` predicate
    rather than trusting a status label;
-5. checks the expected generation and exact selected and preserved cohort;
+5. checks the expected generation and exact selected and preserved cohort and
+   refuses to overtake an earlier `M` on the covered target whose terminal
+   verification slot is empty or contains mismatch;
 6. selects the logical mutation timestamp inside the transaction;
 7. performs the target compare-and-swap mutation; and
 8. inserts the authoritative immutable mutation receipt with the consumed
@@ -302,16 +329,34 @@ retry cannot apply the mutation twice.
 ### 5. Verification transaction (`V`)
 
 Verification reads the authoritative `M`, independently derives the expected
-postimage, verifies the exact live generation and cohort state, and appends an
-immutable `V`. `V` is authoritative for completed verification. A file export
-can be regenerated from `J` through `V`; losing an export never changes
-authority or requires another mutation.
+postimage, and compares the exact live generation, cohort, and postimage while
+holding the aggregate, covered target rows, protected target-publication
+lineage, and terminal verification locks. The protected interface serializes
+every verification attempt for the exact `M` and records one immutable outcome
+with `synchronous_commit=on`:
+
+- `MATCH` fills the previously empty terminal slot and appends authoritative
+  `V`;
+- `MISMATCH` fills the previously empty terminal slot with a terminal mismatch
+  observation and permanently forbids `V`; or
+- `UNABLE_TO_VERIFY` appends a nonterminal observation and leaves the terminal
+  slot empty for a later exact attempt.
+
+The first conclusive outcome committed under the aggregate and target-lineage
+locks is terminal. Concurrent attempts cannot commit both `V` and mismatch. A
+same-attempt replay returns its exact observation; a later attempt after a
+terminal outcome returns that outcome without rereading it as a new decision.
+`V` remains authoritative only for completed successful verification. A file
+export can be regenerated from `J` through `V`; losing an export never changes
+authority or requires another mutation. Because `M` and conclusive verification
+share the target-lineage lock, another Hindsight aggregate cannot mutate the
+covered target between them.
 
 ## State and recovery
 
 These are the minimum recovery constraints implied by the selected
-architecture. Issue [#74](https://github.com/nisavid/agents/issues/74) owns the
-complete state-by-state apply and rollback restart matrix.
+architecture. The complete state-by-state apply and rollback behavior is fixed
+by the [durable journal restart design](journal-restart-design.md).
 
 The aggregate's durable stages are monotonic:
 
@@ -319,7 +364,8 @@ The aggregate's durable stages are monotonic:
 ABSENT -> JOURNALED -> PROVEN -> VALID -> MUTATED -> VERIFIED
                               \-> LATE
 
-binding mismatch at any stage -> CONFLICT
+binding mismatch on any request -> CONFLICT for that request
+                                   existing aggregate prefix unchanged
 ```
 
 Absence of a visible `R` at expiry is not immediately terminal. A pre-expiry
@@ -328,8 +374,8 @@ protected same-key recovery boundary proves that no such transaction can
 commit, the derived state is `QUALIFICATION_AMBIGUOUS`, which never authorizes
 mutation. `UNPROVEN` becomes terminal only after that ambiguity is resolved and
 no durable `VALID R` exists. Read-only status may report the ambiguity; it must
-not collapse absence into `UNPROVEN` prematurely. Issue #74 owns the exact
-waiting, timeout, and recovery procedure.
+not collapse absence into `UNPROVEN` prematurely. The restart design fixes the
+exact waiting, timeout, and recovery procedure.
 
 Before expiry, exact recovery may advance `JOURNALED` to `PROVEN` and `PROVEN`
 to `VALID` while all predicates still hold. At or after expiry:
@@ -341,7 +387,9 @@ to `VALID` while all predicates still hold. At or after expiry:
   recovery resolves any original attempt; a newly sampled post-expiry attempt
   cannot become `VALID`;
 - an exact durable `VALID R` may proceed to `M` after expiry;
-- `LATE`, `UNPROVEN`, and `CONFLICT` never admit `M`; and
+- `LATE` and `UNPROVEN` never admit `M`; a request-scoped `CONFLICT` cannot
+  advance its mismatched request but does not freeze the correctly bound
+  aggregate; and
 - `MUTATED` may only exact-replay or proceed to verification.
 
 Status, handoff, descendant planning, and recovery use these database states.
@@ -393,9 +441,9 @@ It rejects every aggregate whose epoch differs from the active value, every
 restored admission row for which the new adapter lacks the secret preimage, and
 every call while the deployment is fenced. These checks are required even when
 the restored aggregate, `J`, `P`, `R`, and old admission row are internally
-consistent. Issue #74 owns the exact recovery and operator handoff matrix; it
-cannot relax this initial fail-closed continuity boundary without a separately
-accepted, rollback-resistant incarnation-witness design.
+consistent. The restart design fixes the exact recovery and operator handoff
+matrix; it cannot relax this initial fail-closed continuity boundary without a
+separately accepted, rollback-resistant incarnation-witness design.
 
 A prior-epoch `R` with no corresponding durable `M` in the restored timeline
 therefore cannot authorize a new mutation. Existing `M` and `V` rows remain
@@ -442,7 +490,9 @@ only narrow protected interfaces:
   mutate target state;
 - the mutation role can consume an exact `VALID R` through the protected `M`
   interface, but cannot insert, update, delete, or forge prior stages;
-- verification can append `V` only for the exact immutable `M`; and
+- the evidence-only verification role can append an observation or `V` only
+  for the exact immutable `M`, and cannot perform any authority-bearing stage;
+  and
 - no runtime role can update or delete completed stages or bypass the stable
   conflict key.
 
@@ -465,7 +515,10 @@ signing key or separate cryptographic authority.
 The initial protocol has no garbage collection. Aggregates and `J`, `P`, `R`,
 `M`, and `V` rows remain append-only and are retained unconditionally. Any
 backup, retention, archival, or deletion rule requires a separately accepted
-design; implementation must not infer a safe collection horizon.
+design; implementation must not infer a safe collection horizon. The encrypted
+rollback preimage remains durably retained until verified rollback or a
+separately approved permanent retirement under the
+[restart contract](journal-restart-design.md).
 
 ## Acceptance evidence
 
@@ -496,6 +549,8 @@ outcomes falsifiable:
   mutation;
 - lost `M` acknowledgement recovers the exact postimage and never repeats the
   mutation;
+- a successor aggregate cannot execute `M` before the immediately preceding
+  mutation on the covered target reaches matching `V`;
 - deleted exports reconstruct from database authority;
 - caller or worker crash with an intact adapter capability and database session
   permits exact recovery;
@@ -566,11 +621,12 @@ defects do not affect this disposition: the prototype conflict receipt mixes
 attempted-binding provenance with existing-record timing, and its committed
 report still calls the artifacts uncommitted.
 
-This record resolves the architecture question only. The remaining design map
-owns:
+This record resolves the architecture question. The exhaustive interrupted
+publication and restart behavior is selected in
+[#74](https://github.com/nisavid/agents/issues/74) and recorded in the
+[durable journal restart design](journal-restart-design.md). The remaining
+design map owns:
 
-- [#74](https://github.com/nisavid/agents/issues/74): exhaustive interrupted
-  publication and restart behavior;
 - [#75](https://github.com/nisavid/agents/issues/75): historical format,
   reader, and transition compatibility;
 - [#76](https://github.com/nisavid/agents/issues/76): falsifiable design and

@@ -26,8 +26,10 @@ Reusable Hindsight control-plane code, local-stack tooling, agent skills, policy
   design.
 - [Durable journal publication](docs/journal-publication-design.md) for the
   selected PostgreSQL publication-owner architecture and the constraints that
-  its still-open restart, compatibility, evidence, and acceptance work must
-  preserve.
+  its compatibility, evidence, and acceptance work must preserve.
+- [Durable journal restart](docs/journal-restart-design.md) for automatic safe
+  recovery, interruption resolution, verification, rollback, and preimage
+  retention across every authoritative publication prefix.
 
 ## Harness authority
 

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "files": {
+    ".claude-plugin/plugin.json": "aef2ff309748d013d12dda4b709f528da8ed340e8998fcd2f476604b44920b4b",
+    "CHANGELOG.md": "bdfe7d8378ae6fe36e66d985ba56d8d96fe58e98cbd23066946d772f5246f1a4",
+    "LICENSE": "68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+    "README.md": "ccd095089c6f4fe15aa346e558c9df05f343e5c7558a81433b1081705c056f26",
+    "evals/delivery.json": "3926df63cef6bd46edda5ddcfe0992b04a0b7be6156e6bae48cc7cad4e01a9c7",
+    "plugin.json": "9cd6a11d49562c14c8238149969a642d221f068743674adf15312588f63c403e",
+    "topology.json": "c0f27fb12056a2212a807c91acafbe767f68c53c5b8af13d4d20706bddd8c14b"
+  }
+}

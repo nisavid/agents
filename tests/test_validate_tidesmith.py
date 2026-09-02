@@ -289,6 +289,16 @@ class ValidateTidesmithTests(unittest.TestCase):
         result = self.validate("--write-content-lock")
         self.assertIn("grader answer leaked into fixture", result.stderr)
 
+    def test_fixture_rejects_markdown_wrapped_grader_labels(self) -> None:
+        skill = self.publish_one_skill()
+        for number, line in ((4, "- **Expected output:** a two-line reply."), (5, "> **Grader:** check the opening.")):
+            fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / f"case-{number}.md"
+            original = fixture.read_text()
+            fixture.write_text(original + "\n" + line + "\n")
+            result = self.validate("--write-content-lock")
+            self.assertIn("grader answer leaked into fixture", result.stderr, line)
+            fixture.write_text(original)
+
     def test_published_skill_rejects_unreferenced_fixture(self) -> None:
         skill = self.publish_one_skill()
         (self.plugin / "skills" / skill / "evals" / "fixtures" / "orphan.md").write_text("# Orphan\n")

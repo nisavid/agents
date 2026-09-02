@@ -48,6 +48,12 @@ PORTABILITY_PATTERNS = (
     re.compile(r"\bapi[\s_-]*key\b", re.IGNORECASE),
     re.compile(r"\bauthorization\s*:\s*bearer\b", re.IGNORECASE),
 )
+GRADER_LEAK_PATTERNS = (
+    re.compile(r"\bexpected_output\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:[-*#>]+\s*)?expectations?\s*:", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*(?:[-*#>]+\s*)?pass\s+if\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"\bgrader\b", re.IGNORECASE),
+)
 BASE_FILES = {
     ".claude-plugin/plugin.json",
     "CHANGELOG.md",
@@ -663,9 +669,9 @@ def validate_evals(
             require(name not in names, f"duplicate Tidesmith eval name: {name}")
             names.add(name)
             observed_ids.append(eval_id)
-            for marker in ("expected_output", "expectations", "pass if"):
+            for pattern in GRADER_LEAK_PATTERNS:
                 require(
-                    marker not in fixture.lower(),
+                    pattern.search(fixture) is None,
                     f"grader answer leaked into fixture: {fixture_relative.name}",
                 )
             executor_payload = build_executor_payload(

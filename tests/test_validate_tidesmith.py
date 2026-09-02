@@ -14,7 +14,15 @@ VALIDATOR = REPO_ROOT / "scripts" / "validate_tidesmith.py"
 REGISTRY_START = "<!-- BEGIN GENERATED SKILL REGISTRY -->"
 REGISTRY_END = "<!-- END GENERATED SKILL REGISTRY -->"
 
+try:
+    import yaml  # noqa: F401
 
+    PYYAML_AVAILABLE = True
+except ModuleNotFoundError:
+    PYYAML_AVAILABLE = False
+
+
+@unittest.skipUnless(PYYAML_AVAILABLE, "PyYAML is required to run the Tidesmith validator")
 class ValidateTidesmithTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -270,6 +278,15 @@ class ValidateTidesmithTests(unittest.TestCase):
         fixture.write_text(fixture.read_text() + "\nPass if the message is short.\n")
         result = self.validate("--write-content-lock")
         self.assertIn("grader answer leaked into fixture", result.stderr)
+
+    def test_fixture_prose_may_mention_expectations_as_a_word(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-1.md"
+        fixture.write_text(
+            fixture.read_text() + "\nThe reader's expectations were set by last week's note.\n"
+        )
+        result = self.validate("--write-content-lock")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_published_skill_rejects_unreferenced_fixture(self) -> None:
         try:

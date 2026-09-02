@@ -3,11 +3,23 @@
   "algorithm": "sha256",
   "files": {
     ".claude-plugin/plugin.json": "aef2ff309748d013d12dda4b709f528da8ed340e8998fcd2f476604b44920b4b",
-    "CHANGELOG.md": "bdfe7d8378ae6fe36e66d985ba56d8d96fe58e98cbd23066946d772f5246f1a4",
+    "CHANGELOG.md": "29f754581882b909f2fd66b2e90432db1daa28a44f2601a9b89aecdc1bdd675b",
     "LICENSE": "68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
-    "README.md": "ccd095089c6f4fe15aa346e558c9df05f343e5c7558a81433b1081705c056f26",
+    "README.md": "78675a99709a04d27e5c8913ec0ef054a327c28027f6d6c4fd3f05d6e5daa064",
     "evals/delivery.json": "3926df63cef6bd46edda5ddcfe0992b04a0b7be6156e6bae48cc7cad4e01a9c7",
-    "plugin.json": "9cd6a11d49562c14c8238149969a642d221f068743674adf15312588f63c403e",
-    "topology.json": "c0f27fb12056a2212a807c91acafbe767f68c53c5b8af13d4d20706bddd8c14b"
+    "plugin.json": "a97c7850a7b37882df0f7f4f04286c09496994224b14909613241cf40052cee8",
+    "skills/writing-for-people/SKILL.md": "5abfa704566abeccbeb0c3414f8178f65a8a7fc21d3b24e8601740cead0836a5",
+    "skills/writing-for-people/agents/openai.yaml": "a88fd74733cd79d4b749b4df4cc4c4dd47ff6ea6ece2a67ee916ab84f9911194",
+    "skills/writing-for-people/evals/evals.json": "7f8b753bd82ae0195896fa3b5780d4e2f0824ff2c07ee5f90b2371011cec83c9",
+    "skills/writing-for-people/evals/fixtures/edit-pass-on-finished-draft.md": "a8e529c86318395f532865620ad5319de5c3f398f6dcb4ff4249f68d3978fa12",
+    "skills/writing-for-people/evals/fixtures/export-delay-for-non-expert.md": "85146056f254233cf15b9b9729f4f179a2920d12f3edf61a6d80cc8e8cea2568",
+    "skills/writing-for-people/evals/fixtures/review-reply-reviewer-partly-right.md": "df50d1877cb61311eb6dc431ef54d08806625d7fdf707dd57bd6de64eb496b73",
+    "skills/writing-for-people/evals/fixtures/status-message-with-unverified-outcomes.md": "e9f381e3fba66ee17f092caa59580a26ac3e67d90309e9529eb6daf2811ecfa0",
+    "skills/writing-for-people/evals/fixtures/stopping-point-report-partial-migration.md": "83b82fa06c41f63ab91bf5226b8885e39bb5fa1175b4f0d2fca23dcb2db4c793",
+    "skills/writing-for-people/evals/fixtures/three-review-comments-one-pr.md": "e983ff4fdd0edcd71da9e973ced7dc8b49832e2191b0be3c267490982db75b37",
+    "skills/writing-for-people/evals/fixtures/under-grounded-release-note.md": "da712244d918c75b5ece33dd0e36b76637de5baa34ef8f48aad491936c06b634",
+    "skills/writing-for-people/references/edit-pass.md": "93268aa6cfda549339e780b6ebe7aefa602a7ed9ea50858d976a7808cbfc0066",
+    "skills/writing-for-people/references/evidence-in-prose.md": "c59d898b26d1fa9cc8db72cb290e5d6af6a834f68bec6a42a5699892c1b2e7da",
+    "topology.json": "37b35752e39fde9e4753f0bf59562e0e26207d465b89026e0d58adf2de0543b5"
   }
 }

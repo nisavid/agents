@@ -50,11 +50,11 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Tidesmith contract validation passed\n")
 
-    def test_committed_lock_matches_semantic_files(self) -> None:
+    def test_committed_lock_covers_base_and_skill_files(self) -> None:
         lock = json.loads((self.plugin / "content-lock.json").read_text())
         self.assertEqual(set(lock), {"schema_version", "algorithm", "files"})
-        self.assertEqual(
-            set(lock["files"]),
+        files = set(lock["files"])
+        self.assertTrue(
             {
                 ".claude-plugin/plugin.json",
                 "CHANGELOG.md",
@@ -63,17 +63,22 @@ class ValidateTidesmithTests(unittest.TestCase):
                 "evals/delivery.json",
                 "plugin.json",
                 "topology.json",
-            },
+                "skills/writing-for-people/SKILL.md",
+                "skills/writing-for-people/agents/openai.yaml",
+                "skills/writing-for-people/evals/evals.json",
+            }
+            <= files
         )
+        self.assertNotIn("content-lock.json", files)
 
-    def test_publishes_no_skill_yet(self) -> None:
+    def test_publishes_writing_for_people(self) -> None:
         topology = json.loads((self.plugin / "topology.json").read_text())
-        self.assertEqual(topology, {"schema_version": 1, "skills": {}})
-        self.assertFalse((self.plugin / "skills").exists())
+        self.assertEqual(set(topology["skills"]), {"writing-for-people"})
+        self.assertTrue((self.plugin / "skills" / "writing-for-people" / "SKILL.md").is_file())
         manifest = json.loads((self.plugin / "plugin.json").read_text())
-        self.assertEqual(
-            manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"], []
-        )
+        prompts = manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("$tidesmith:writing-for-people", prompts[0])
 
     def test_rejects_claude_projection_drift(self) -> None:
         path = self.plugin / ".claude-plugin" / "plugin.json"
@@ -96,16 +101,10 @@ class ValidateTidesmithTests(unittest.TestCase):
 
     def test_rejects_skill_declared_without_skill_directory(self) -> None:
         path = self.plugin / "topology.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "skills": {"writing-for-people": {"owns": ["register"], "may_call": []}},
-                }
-            )
-            + "\n"
-        )
-        self.assert_rejected("skills directory is missing")
+        topology = json.loads(path.read_text())
+        topology["skills"]["explaining-to-readers"] = {"owns": ["register"], "may_call": []}
+        path.write_text(json.dumps(topology) + "\n")
+        self.assert_rejected("direct-child skill inventory drift")
 
     def test_rejects_stale_skill_registry(self) -> None:
         readme = self.readme()
@@ -174,16 +173,12 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertEqual((self.plugin / "content-lock.json").read_bytes(), lock_before)
 
     def publish_one_skill(self, *, description: str = "Use when prose must meet the house register.") -> str:
-        skill = "writing-for-people"
-        prompt = f"Use $tidesmith:{skill} to write this message to its reader."
+        skill = "explaining-to-readers"
+        prompt = f"Use $tidesmith:{skill} to explain this to its reader."
         topology_path = self.plugin / "topology.json"
-        topology_path.write_text(
-            json.dumps(
-                {"schema_version": 1, "skills": {skill: {"owns": ["register"], "may_call": []}}},
-                indent=2,
-            )
-            + "\n"
-        )
+        topology = json.loads(topology_path.read_text())
+        topology["skills"][skill] = {"owns": ["register"], "may_call": []}
+        topology_path.write_text(json.dumps(topology, indent=2) + "\n")
         root = self.plugin / "skills" / skill
         (root / "agents").mkdir(parents=True)
         (root / "references").mkdir()
@@ -206,7 +201,8 @@ class ValidateTidesmithTests(unittest.TestCase):
         )
         manifest_path = self.plugin / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
-        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"] = [prompt]
+        prompts = manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"]
+        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"] = [prompt, *prompts]
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
         (root / "evals" / "fixtures").mkdir(parents=True)
         evals = []

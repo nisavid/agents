@@ -14,6 +14,10 @@ VALIDATOR = REPO_ROOT / "scripts" / "validate_tidesmith.py"
 REGISTRY_START = "<!-- BEGIN GENERATED SKILL REGISTRY -->"
 REGISTRY_END = "<!-- END GENERATED SKILL REGISTRY -->"
 
+# PyYAML is a test dependency, as for the sibling validator suites: a missing
+# module fails this module loudly instead of skipping every contract check.
+import yaml  # noqa: E402,F401
+
 
 class ValidateTidesmithTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -50,11 +54,11 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Tidesmith contract validation passed\n")
 
-    def test_committed_lock_matches_semantic_files(self) -> None:
+    def test_committed_lock_covers_base_and_skill_files(self) -> None:
         lock = json.loads((self.plugin / "content-lock.json").read_text())
         self.assertEqual(set(lock), {"schema_version", "algorithm", "files"})
-        self.assertEqual(
-            set(lock["files"]),
+        files = set(lock["files"])
+        self.assertTrue(
             {
                 ".claude-plugin/plugin.json",
                 "CHANGELOG.md",
@@ -63,17 +67,22 @@ class ValidateTidesmithTests(unittest.TestCase):
                 "evals/delivery.json",
                 "plugin.json",
                 "topology.json",
-            },
+                "skills/writing-for-people/SKILL.md",
+                "skills/writing-for-people/agents/openai.yaml",
+                "skills/writing-for-people/evals/evals.json",
+            }
+            <= files
         )
+        self.assertNotIn("content-lock.json", files)
 
-    def test_publishes_no_skill_yet(self) -> None:
+    def test_publishes_writing_for_people(self) -> None:
         topology = json.loads((self.plugin / "topology.json").read_text())
-        self.assertEqual(topology, {"schema_version": 1, "skills": {}})
-        self.assertFalse((self.plugin / "skills").exists())
+        self.assertEqual(set(topology["skills"]), {"writing-for-people"})
+        self.assertTrue((self.plugin / "skills" / "writing-for-people" / "SKILL.md").is_file())
         manifest = json.loads((self.plugin / "plugin.json").read_text())
-        self.assertEqual(
-            manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"], []
-        )
+        prompts = manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("$tidesmith:writing-for-people", prompts[0])
 
     def test_rejects_claude_projection_drift(self) -> None:
         path = self.plugin / ".claude-plugin" / "plugin.json"
@@ -96,16 +105,10 @@ class ValidateTidesmithTests(unittest.TestCase):
 
     def test_rejects_skill_declared_without_skill_directory(self) -> None:
         path = self.plugin / "topology.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "skills": {"writing-for-people": {"owns": ["register"], "may_call": []}},
-                }
-            )
-            + "\n"
-        )
-        self.assert_rejected("skills directory is missing")
+        topology = json.loads(path.read_text())
+        topology["skills"]["explaining-to-readers"] = {"owns": ["register"], "may_call": []}
+        path.write_text(json.dumps(topology) + "\n")
+        self.assert_rejected("direct-child skill inventory drift")
 
     def test_rejects_stale_skill_registry(self) -> None:
         readme = self.readme()
@@ -174,16 +177,12 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertEqual((self.plugin / "content-lock.json").read_bytes(), lock_before)
 
     def publish_one_skill(self, *, description: str = "Use when prose must meet the house register.") -> str:
-        skill = "writing-for-people"
-        prompt = f"Use $tidesmith:{skill} to write this message to its reader."
+        skill = "explaining-to-readers"
+        prompt = f"Use $tidesmith:{skill} to explain this to its reader."
         topology_path = self.plugin / "topology.json"
-        topology_path.write_text(
-            json.dumps(
-                {"schema_version": 1, "skills": {skill: {"owns": ["register"], "may_call": []}}},
-                indent=2,
-            )
-            + "\n"
-        )
+        topology = json.loads(topology_path.read_text())
+        topology["skills"][skill] = {"owns": ["register"], "may_call": []}
+        topology_path.write_text(json.dumps(topology, indent=2) + "\n")
         root = self.plugin / "skills" / skill
         (root / "agents").mkdir(parents=True)
         (root / "references").mkdir()
@@ -206,15 +205,36 @@ class ValidateTidesmithTests(unittest.TestCase):
         )
         manifest_path = self.plugin / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
-        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"] = [prompt]
+        prompts = manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"]
+        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"] = [prompt, *prompts]
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        (root / "evals" / "fixtures").mkdir(parents=True)
+        evals = []
+        for number in range(1, 6):
+            fixture = f"case-{number}.md"
+            (root / "evals" / "fixtures" / fixture).write_text(
+                f"# Case {number}\n\nA reader needs a short status message; facts: item {number} is done.\n"
+            )
+            evals.append(
+                {
+                    "id": number,
+                    "name": f"case-{number}",
+                    "prompt": "Using the fixture, write the message. Do not use tools.",
+                    "fixture_paths": [f"evals/fixtures/{fixture}"],
+                    "expected_output": "A plain message that opens with the outcome.",
+                    "expectations": [
+                        {"id": "opens-with-outcome", "text": "Opens with the outcome.", "severity": "quality"},
+                        {"id": "no-invention", "text": "States only fixture facts.", "severity": "safety"},
+                        {"id": "no-tells", "text": "No mic-drop closer.", "severity": "quality"},
+                    ],
+                }
+            )
+        (root / "evals" / "evals.json").write_text(
+            json.dumps({"skill_name": skill, "evals": evals}, indent=2) + "\n"
+        )
         return skill
 
     def test_publishing_one_skill_regenerates_registry_and_locks_skill_files(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         skill = self.publish_one_skill()
         result = self.validate("--write-content-lock")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -223,23 +243,75 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertIn(f"skills/{skill}/SKILL.md", lock["files"])
         self.assertIn(f"skills/{skill}/agents/openai.yaml", lock["files"])
         self.assertIn(f"skills/{skill}/references/register.md", lock["files"])
+        self.assertIn(f"skills/{skill}/evals/evals.json", lock["files"])
+        self.assertIn(f"skills/{skill}/evals/fixtures/case-1.md", lock["files"])
         self.assertEqual(self.validate().returncode, 0)
 
+    def test_published_skill_requires_three_expectations_per_eval(self) -> None:
+        skill = self.publish_one_skill()
+        path = self.plugin / "skills" / skill / "evals" / "evals.json"
+        document = json.loads(path.read_text())
+        document["evals"][0]["expectations"].pop()
+        path.write_text(json.dumps(document) + "\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("expectations must contain three objects", result.stderr)
+
+    def test_published_skill_rejects_grader_answer_in_fixture(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-1.md"
+        fixture.write_text(fixture.read_text() + "\nPass if the message is short.\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("grader answer leaked into fixture", result.stderr)
+
+    def test_fixture_prose_may_mention_expectations_as_a_word(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-1.md"
+        fixture.write_text(
+            fixture.read_text() + "\nThe reader's expectations were set by last week's note.\n"
+        )
+        result = self.validate("--write-content-lock")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fixture_prose_may_mention_grader_and_expected_output_as_words(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-2.md"
+        fixture.write_text(
+            fixture.read_text()
+            + "\nThe grader reviewed the draft last week and asked about the expected_output field.\n"
+        )
+        result = self.validate("--write-content-lock")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fixture_rejects_labeled_grader_instruction(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-3.md"
+        fixture.write_text(fixture.read_text() + "\nExpected output: a two-line reply.\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("grader answer leaked into fixture", result.stderr)
+
+    def test_fixture_rejects_markdown_wrapped_grader_labels(self) -> None:
+        skill = self.publish_one_skill()
+        for number, line in ((4, "- **Expected output:** a two-line reply."), (5, "> **Grader:** check the opening.")):
+            fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / f"case-{number}.md"
+            original = fixture.read_text()
+            fixture.write_text(original + "\n" + line + "\n")
+            result = self.validate("--write-content-lock")
+            self.assertIn("grader answer leaked into fixture", result.stderr, line)
+            fixture.write_text(original)
+
+    def test_published_skill_rejects_unreferenced_fixture(self) -> None:
+        skill = self.publish_one_skill()
+        (self.plugin / "skills" / skill / "evals" / "fixtures" / "orphan.md").write_text("# Orphan\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("fixture drift", result.stderr)
+
     def test_published_skill_description_must_start_with_the_trigger_phrase(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         self.publish_one_skill(description="Writes prose to the house register.")
         result = self.validate("--write-content-lock")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("description trigger drift", result.stderr)
 
     def test_frontmatter_parser_accepts_crlf_and_missing_trailing_newline(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for the strict frontmatter loader")
         scripts_dir = str(REPO_ROOT / "scripts")
         sys.path.insert(0, scripts_dir)
         self.addCleanup(lambda: sys.path.remove(scripts_dir))

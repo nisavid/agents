@@ -29,7 +29,9 @@
           "Writing"
         ],
         "websiteURL": "https://github.com/nisavid/agents/tree/main/plugins/tidesmith",
-        "defaultPrompt": []
+        "defaultPrompt": [
+          "Use $tidesmith:writing-for-people to ground the draft in what was actually run, decided, and asked, then draft or edit this human-facing text so it opens on the point, makes one graded ask, claims only what the brief supports, and passes the edit checklist before sending."
+        ]
       }
     }
   }

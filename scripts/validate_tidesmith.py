@@ -48,6 +48,13 @@ PORTABILITY_PATTERNS = (
     re.compile(r"\bapi[\s_-]*key\b", re.IGNORECASE),
     re.compile(r"\bauthorization\s*:\s*bearer\b", re.IGNORECASE),
 )
+LEAK_LABEL_PREFIX = r"^\s*(?:[-*#>]+\s*)*(?:[*_`~]+\s*)?"
+GRADER_LEAK_PATTERNS = (
+    re.compile(LEAK_LABEL_PREFIX + r"expected[_ ]output\s*[*_`~]*\s*:", re.IGNORECASE | re.MULTILINE),
+    re.compile(LEAK_LABEL_PREFIX + r"expectations?\s*[*_`~]*\s*:", re.IGNORECASE | re.MULTILINE),
+    re.compile(LEAK_LABEL_PREFIX + r"pass\s+if\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(LEAK_LABEL_PREFIX + r"grader(?:\s+\w+)*\s*[*_`~]*\s*:", re.IGNORECASE | re.MULTILINE),
+)
 BASE_FILES = {
     ".claude-plugin/plugin.json",
     "CHANGELOG.md",
@@ -143,6 +150,46 @@ def read_bytes(root: Path, relative: str | Path) -> bytes:
 
 def read(root: Path, relative: str | Path) -> str:
     return read_bytes(root, relative).decode("utf-8")
+
+
+def regular_directory(root: Path, relative: str | Path) -> Path:
+    relative = safe_relative_path(Path(relative).as_posix(), "directory")
+    current = root
+    for part in relative.parts:
+        current /= part
+        require(
+            not current.is_symlink(),
+            f"directory path must not contain symlinks: {relative}",
+        )
+    resolved = current.resolve(strict=True)
+    require(
+        resolved.is_relative_to(root.resolve(strict=True)) and resolved.is_dir(),
+        f"missing regular directory: {relative}",
+    )
+    return resolved
+
+
+def build_executor_payload(
+    *, prompt: str, fixture: str, candidate_bundle: dict[str, str]
+) -> dict:
+    """Build the isolated input available to the executor."""
+    return {"prompt": prompt, "fixture": fixture, "candidate_bundle": candidate_bundle}
+
+
+def build_grader_payload(
+    *,
+    executor_payload: dict,
+    response: str,
+    expected_output: str,
+    expectations: list[dict],
+) -> dict:
+    """Build grading input only after the executor has returned a response."""
+    return {
+        **executor_payload,
+        "response": response,
+        "expected_output": expected_output,
+        "expectations": expectations,
+    }
 
 
 def load_json(root: Path, relative: str, field: str) -> dict:
@@ -306,7 +353,7 @@ def validate_readme_projection(root: Path, topology: dict) -> None:
     )
 
 
-def validate_skills(root: Path, topology: dict) -> tuple[dict, set[str]]:
+def validate_skills(root: Path, topology: dict) -> tuple[dict, dict, set[str]]:
     skills_root = root / "skills"
     if topology["skills"]:
         require(
@@ -325,10 +372,12 @@ def validate_skills(root: Path, topology: dict) -> tuple[dict, set[str]]:
             "skills directory must not exist while the topology publishes no skill",
         )
     prompts: dict[str, str] = {}
+    bodies: dict[str, str] = {}
     semantic_files: set[str] = set()
     for skill in topology["skills"]:
         skill_path = f"skills/{skill}/SKILL.md"
         content = read(root, skill_path)
+        bodies[skill] = content
         semantic_files.add(skill_path)
         frontmatter = load_skill_frontmatter(content, skill)
         require(
@@ -382,7 +431,7 @@ def validate_skills(root: Path, topology: dict) -> tuple[dict, set[str]]:
                 f"](../{target}/SKILL.md)" in content,
                 f"topology call is not projected in skill body: {skill} -> {target}",
             )
-    return prompts, semantic_files
+    return prompts, bodies, semantic_files
 
 
 def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
@@ -504,7 +553,7 @@ def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
     )
 
 
-def validate_delivery(root: Path) -> None:
+def validate_delivery(root: Path) -> dict:
     delivery = load_json(root, "evals/delivery.json", "eval delivery contract")
     require(
         set(delivery) == {"schema_version", "executor", "grader"},
@@ -526,6 +575,128 @@ def validate_delivery(root: Path) -> None:
         and isinstance(grader.get("inputs"), list),
         "eval grader contract drift",
     )
+    return delivery
+
+
+def validate_evals(
+    root: Path,
+    topology: dict,
+    bodies: dict,
+    delivery: dict,
+    semantic_files: set[str],
+) -> set[str]:
+    names: set[str] = set()
+    for skill in topology["skills"]:
+        eval_path = f"skills/{skill}/evals/evals.json"
+        document = load_json(root, eval_path, f"{skill} evals")
+        semantic_files.add(eval_path)
+        require(set(document) == {"skill_name", "evals"}, f"{skill} eval manifest keys drift")
+        require(document["skill_name"] == skill, f"{skill} eval skill name drift")
+        evals = document["evals"]
+        require(isinstance(evals, list), f"{skill} evals must be a list")
+        require(len(evals) >= 5, f"{skill} requires at least five behavior evals")
+        references = sorted(
+            path for path in semantic_files if path.startswith(f"skills/{skill}/references/")
+        )
+        candidate_bundle = {f"skills/{skill}/SKILL.md": bodies[skill]}
+        candidate_bundle.update({path: read(root, path) for path in references})
+        referenced_fixtures: set[str] = set()
+        observed_ids: list[int] = []
+        for position, item in enumerate(evals, start=1):
+            require(isinstance(item, dict), f"{skill} eval item {position} must be an object")
+            require(
+                set(item)
+                == {"id", "name", "prompt", "fixture_paths", "expected_output", "expectations"},
+                f"{skill} eval item {position} shape drift",
+            )
+            eval_id = require_integer(item["id"], f"{skill} eval item {position} id must be an integer")
+            name = require_nonempty_string(
+                item["name"], f"{skill} eval item {position} name must be a nonempty string"
+            )
+            prompt = require_nonempty_string(
+                item["prompt"], f"{skill} eval item {position} prompt must be a nonempty string"
+            )
+            paths = item["fixture_paths"]
+            require(
+                isinstance(paths, list)
+                and len(paths) == 1
+                and all(isinstance(path, str) and bool(path) for path in paths),
+                f"{skill} eval item {position} fixture_paths must contain one string",
+            )
+            fixture_relative = safe_relative_path(paths[0], f"{skill} eval item {position} fixture")
+            require(
+                len(fixture_relative.parts) == 3
+                and fixture_relative.parts[:2] == ("evals", "fixtures")
+                and fixture_relative.suffix == ".md",
+                f"{skill} eval item {position} fixture must be a direct Markdown fixture",
+            )
+            fixture_path = (Path("skills") / skill / fixture_relative).as_posix()
+            fixture = read(root, fixture_path)
+            semantic_files.add(fixture_path)
+            referenced_fixtures.add(fixture_relative.name)
+            expected_output = require_nonempty_string(
+                item["expected_output"],
+                f"{skill} eval item {position} expected_output must be a nonempty string",
+            )
+            expectations = item["expectations"]
+            require(
+                isinstance(expectations, list) and len(expectations) == 3,
+                f"{skill} eval item {position} expectations must contain three objects",
+            )
+            expectation_ids: set[str] = set()
+            for expectation_position, expectation in enumerate(expectations, start=1):
+                require(
+                    isinstance(expectation, dict)
+                    and set(expectation) == {"id", "text", "severity"},
+                    f"{skill} eval item {position} expectation {expectation_position} shape drift",
+                )
+                expectation_id = require_nonempty_string(
+                    expectation["id"],
+                    f"{skill} eval item {position} expectation {expectation_position} id drift",
+                )
+                require_nonempty_string(
+                    expectation["text"],
+                    f"{skill} eval item {position} expectation {expectation_position} text drift",
+                )
+                require(
+                    expectation["severity"] in {"quality", "safety"},
+                    f"{skill} eval item {position} expectation {expectation_position} severity drift",
+                )
+                require(
+                    expectation_id not in expectation_ids,
+                    f"{skill} eval expectations contain duplicate ids: {name}",
+                )
+                expectation_ids.add(expectation_id)
+            require(name not in names, f"duplicate Tidesmith eval name: {name}")
+            names.add(name)
+            observed_ids.append(eval_id)
+            for pattern in GRADER_LEAK_PATTERNS:
+                require(
+                    pattern.search(fixture) is None,
+                    f"grader answer leaked into fixture: {fixture_relative.name}",
+                )
+            executor_payload = build_executor_payload(
+                prompt=prompt, fixture=fixture, candidate_bundle=candidate_bundle
+            )
+            grader_payload = build_grader_payload(
+                executor_payload=executor_payload,
+                response="candidate response",
+                expected_output=expected_output,
+                expectations=expectations,
+            )
+            require(
+                list(executor_payload) == delivery["executor"]["inputs"],
+                f"executor payload isolation drift: {name}",
+            )
+            require(
+                list(grader_payload) == delivery["grader"]["inputs"],
+                f"grader payload isolation drift: {name}",
+            )
+        require(observed_ids == list(range(1, len(evals) + 1)), f"{skill} eval ids drift")
+        fixture_dir = regular_directory(root, f"skills/{skill}/evals/fixtures")
+        actual_fixtures = {path.name for path in fixture_dir.iterdir() if path.is_file()}
+        require(actual_fixtures == referenced_fixtures, f"{skill} fixture drift")
+    return semantic_files
 
 
 def validate_inventory(
@@ -624,9 +795,10 @@ def validate_content_lock(root: Path, semantic_files: set[str]) -> None:
 
 def inspect_contract(root: Path, *, expect_registry: bool = True) -> tuple[dict, set[str]]:
     topology = validate_topology(root)
-    prompts, skill_files = validate_skills(root, topology)
+    prompts, bodies, skill_files = validate_skills(root, topology)
     validate_manifests(root, topology, prompts)
-    validate_delivery(root)
+    delivery = validate_delivery(root)
+    skill_files = validate_evals(root, topology, bodies, delivery, skill_files)
     if expect_registry:
         validate_readme_projection(root, topology)
     else:

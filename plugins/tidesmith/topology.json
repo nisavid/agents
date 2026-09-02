@@ -1,4 +1,13 @@
 {
   "schema_version": 1,
-  "skills": {}
+  "skills": {
+    "writing-for-people": {
+      "owns": [
+        "human-facing-register",
+        "evidence-in-prose",
+        "post-draft-edit-pass"
+      ],
+      "may_call": []
+    }
+  }
 }

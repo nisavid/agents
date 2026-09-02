@@ -22,7 +22,9 @@ package boundaries.
 ## Public skills
 
 <!-- BEGIN GENERATED SKILL REGISTRY -->
-No public skill is published yet. The planned initial roster is the generic human-facing writing skill and the adversarial draft-pass skill.
+| Skill | Owns | Calls |
+| --- | --- | --- |
+| `writing-for-people` | human-facing-register, evidence-in-prose, post-draft-edit-pass | - |
 <!-- END GENERATED SKILL REGISTRY -->
 
 ## Adapter boundary

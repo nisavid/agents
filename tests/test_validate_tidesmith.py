@@ -14,15 +14,11 @@ VALIDATOR = REPO_ROOT / "scripts" / "validate_tidesmith.py"
 REGISTRY_START = "<!-- BEGIN GENERATED SKILL REGISTRY -->"
 REGISTRY_END = "<!-- END GENERATED SKILL REGISTRY -->"
 
-try:
-    import yaml  # noqa: F401
-
-    PYYAML_AVAILABLE = True
-except ModuleNotFoundError:
-    PYYAML_AVAILABLE = False
+# PyYAML is a test dependency, as for the sibling validator suites: a missing
+# module fails this module loudly instead of skipping every contract check.
+import yaml  # noqa: E402,F401
 
 
-@unittest.skipUnless(PYYAML_AVAILABLE, "PyYAML is required to run the Tidesmith validator")
 class ValidateTidesmithTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -239,10 +235,6 @@ class ValidateTidesmithTests(unittest.TestCase):
         return skill
 
     def test_publishing_one_skill_regenerates_registry_and_locks_skill_files(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         skill = self.publish_one_skill()
         result = self.validate("--write-content-lock")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -256,10 +248,6 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertEqual(self.validate().returncode, 0)
 
     def test_published_skill_requires_three_expectations_per_eval(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         skill = self.publish_one_skill()
         path = self.plugin / "skills" / skill / "evals" / "evals.json"
         document = json.loads(path.read_text())
@@ -269,10 +257,6 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertIn("expectations must contain three objects", result.stderr)
 
     def test_published_skill_rejects_grader_answer_in_fixture(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         skill = self.publish_one_skill()
         fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-1.md"
         fixture.write_text(fixture.read_text() + "\nPass if the message is short.\n")
@@ -288,31 +272,36 @@ class ValidateTidesmithTests(unittest.TestCase):
         result = self.validate("--write-content-lock")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_fixture_prose_may_mention_grader_and_expected_output_as_words(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-2.md"
+        fixture.write_text(
+            fixture.read_text()
+            + "\nThe grader reviewed the draft last week and asked about the expected_output field.\n"
+        )
+        result = self.validate("--write-content-lock")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fixture_rejects_labeled_grader_instruction(self) -> None:
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-3.md"
+        fixture.write_text(fixture.read_text() + "\nExpected output: a two-line reply.\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("grader answer leaked into fixture", result.stderr)
+
     def test_published_skill_rejects_unreferenced_fixture(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         skill = self.publish_one_skill()
         (self.plugin / "skills" / skill / "evals" / "fixtures" / "orphan.md").write_text("# Orphan\n")
         result = self.validate("--write-content-lock")
         self.assertIn("fixture drift", result.stderr)
 
     def test_published_skill_description_must_start_with_the_trigger_phrase(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for skill validation")
         self.publish_one_skill(description="Writes prose to the house register.")
         result = self.validate("--write-content-lock")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("description trigger drift", result.stderr)
 
     def test_frontmatter_parser_accepts_crlf_and_missing_trailing_newline(self) -> None:
-        try:
-            import yaml  # noqa: F401
-        except ModuleNotFoundError:
-            self.skipTest("PyYAML is required for the strict frontmatter loader")
         scripts_dir = str(REPO_ROOT / "scripts")
         sys.path.insert(0, scripts_dir)
         self.addCleanup(lambda: sys.path.remove(scripts_dir))

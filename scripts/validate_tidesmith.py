@@ -49,10 +49,10 @@ PORTABILITY_PATTERNS = (
     re.compile(r"\bauthorization\s*:\s*bearer\b", re.IGNORECASE),
 )
 GRADER_LEAK_PATTERNS = (
-    re.compile(r"\bexpected_output\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:[-*#>]+\s*)?expected[_ ]output\s*:", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\s*(?:[-*#>]+\s*)?expectations?\s*:", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\s*(?:[-*#>]+\s*)?pass\s+if\b", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"\bgrader\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:[-*#>]+\s*)?grader(?:\s+\w+)*\s*:", re.IGNORECASE | re.MULTILINE),
 )
 BASE_FILES = {
     ".claude-plugin/plugin.json",

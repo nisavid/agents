@@ -208,6 +208,30 @@ class ValidateTidesmithTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text())
         manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"] = [prompt]
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        (root / "evals" / "fixtures").mkdir(parents=True)
+        evals = []
+        for number in range(1, 6):
+            fixture = f"case-{number}.md"
+            (root / "evals" / "fixtures" / fixture).write_text(
+                f"# Case {number}\n\nA reader needs a short status message; facts: item {number} is done.\n"
+            )
+            evals.append(
+                {
+                    "id": number,
+                    "name": f"case-{number}",
+                    "prompt": "Using the fixture, write the message. Do not use tools.",
+                    "fixture_paths": [f"evals/fixtures/{fixture}"],
+                    "expected_output": "A plain message that opens with the outcome.",
+                    "expectations": [
+                        {"id": "opens-with-outcome", "text": "Opens with the outcome.", "severity": "quality"},
+                        {"id": "no-invention", "text": "States only fixture facts.", "severity": "safety"},
+                        {"id": "no-tells", "text": "No mic-drop closer.", "severity": "quality"},
+                    ],
+                }
+            )
+        (root / "evals" / "evals.json").write_text(
+            json.dumps({"skill_name": skill, "evals": evals}, indent=2) + "\n"
+        )
         return skill
 
     def test_publishing_one_skill_regenerates_registry_and_locks_skill_files(self) -> None:
@@ -223,7 +247,43 @@ class ValidateTidesmithTests(unittest.TestCase):
         self.assertIn(f"skills/{skill}/SKILL.md", lock["files"])
         self.assertIn(f"skills/{skill}/agents/openai.yaml", lock["files"])
         self.assertIn(f"skills/{skill}/references/register.md", lock["files"])
+        self.assertIn(f"skills/{skill}/evals/evals.json", lock["files"])
+        self.assertIn(f"skills/{skill}/evals/fixtures/case-1.md", lock["files"])
         self.assertEqual(self.validate().returncode, 0)
+
+    def test_published_skill_requires_three_expectations_per_eval(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("PyYAML is required for skill validation")
+        skill = self.publish_one_skill()
+        path = self.plugin / "skills" / skill / "evals" / "evals.json"
+        document = json.loads(path.read_text())
+        document["evals"][0]["expectations"].pop()
+        path.write_text(json.dumps(document) + "\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("expectations must contain three objects", result.stderr)
+
+    def test_published_skill_rejects_grader_answer_in_fixture(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("PyYAML is required for skill validation")
+        skill = self.publish_one_skill()
+        fixture = self.plugin / "skills" / skill / "evals" / "fixtures" / "case-1.md"
+        fixture.write_text(fixture.read_text() + "\nPass if the message is short.\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("grader answer leaked into fixture", result.stderr)
+
+    def test_published_skill_rejects_unreferenced_fixture(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("PyYAML is required for skill validation")
+        skill = self.publish_one_skill()
+        (self.plugin / "skills" / skill / "evals" / "fixtures" / "orphan.md").write_text("# Orphan\n")
+        result = self.validate("--write-content-lock")
+        self.assertIn("fixture drift", result.stderr)
 
     def test_published_skill_description_must_start_with_the_trigger_phrase(self) -> None:
         try:

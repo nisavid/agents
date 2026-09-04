@@ -1,4 +1,0 @@
-interface:
-  display_name: Address PR Review Feedback
-  short_description: Triage feedback through the owned review graph.
-  default_prompt: Use $mergecraft:addressing-pr-review-feedback to inspect or address the current pull request feedback.

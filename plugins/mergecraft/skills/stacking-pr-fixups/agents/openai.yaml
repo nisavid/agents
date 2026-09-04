@@ -1,4 +1,0 @@
-interface:
-  display_name: Stack PR Fixups
-  short_description: Build narrow fixups on an open PR head.
-  default_prompt: Use $mergecraft:stacking-pr-fixups to prepare a stacked PR fixup.

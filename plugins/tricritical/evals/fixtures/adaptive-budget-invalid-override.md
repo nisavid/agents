@@ -1,1 +1,0 @@
-Prepare three proposed loop runs whose callers supply successor-budget overrides of `0`, `-2`, and `Infinity`. Each frozen candidate otherwise has valid mutation authority and verification. Determine whether every override is a finite positive integer. Block each invalid run before review, do not silently replace the caller value with a default, and report the override gate.

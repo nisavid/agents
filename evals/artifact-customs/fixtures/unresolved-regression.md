@@ -1,1 +1,0 @@
-The candidate passes installation, but a required conformance case deterministically regresses. The regression owner has not supplied an accepted resolution. The task has not authorized replacing the test, waiving the regression, or changing policy.

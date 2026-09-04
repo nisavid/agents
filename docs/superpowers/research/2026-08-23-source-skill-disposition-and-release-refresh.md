@@ -1,5 +1,10 @@
 # Source-skill disposition and release refresh
 
+> Historical record. The current document lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/research/2026-08-23-source-skill-disposition-and-release-refresh.md).
+> This copy preserves evidence tied to the former repository layout; it is not
+> an active package, validation, or release route.
+
 Status: settled contribution decisions for issue [#50](https://github.com/nisavid/agents/issues/50); not a release-eligibility or host-convergence receipt
 
 ## Why this layer exists

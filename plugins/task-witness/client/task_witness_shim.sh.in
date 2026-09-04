@@ -1,2 +1,0 @@
-#!/bin/sh
-exec /usr/bin/env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC @TASK_WITNESS_PYTHON@ -B -I -S -X disable-remote-debug @TASK_WITNESS_CLIENT@ "$@"

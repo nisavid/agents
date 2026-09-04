@@ -1,5 +1,10 @@
 # Task Witness TW4 Migration And Qualification Design
 
+> Historical copy. The current specification lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/specs/2026-08-12-task-witness-tw4-migration-and-qualification-design.md).
+> This copy preserves prior links and evidence; it is not an active package,
+> validation, or release route.
+
 Status: approved written specification; product choices accepted 2026-08-12,
 written-spec approval granted 2026-08-14.
 

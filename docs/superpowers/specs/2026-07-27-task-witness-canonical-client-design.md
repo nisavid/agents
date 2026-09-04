@@ -1,5 +1,10 @@
 # Task Witness Canonical Client And Deployment Design
 
+> Historical copy. The current specification lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md).
+> This copy preserves prior links and evidence; it is not an active package,
+> validation, or release route.
+
 **Status:** Approved implementation contract; independent specification review
 clean; operator approved 2026-07-27
 

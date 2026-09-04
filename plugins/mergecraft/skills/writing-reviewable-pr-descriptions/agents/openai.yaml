@@ -1,4 +1,0 @@
-interface:
-  display_name: Write Reviewable PR Descriptions
-  short_description: Validate exact, navigable PR title and body candidates.
-  default_prompt: Use $mergecraft:writing-reviewable-pr-descriptions to prepare and validate the exact PR title and body without forge mutation.

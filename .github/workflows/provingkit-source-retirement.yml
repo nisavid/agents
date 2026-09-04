@@ -1,0 +1,35 @@
+name: Provingkit source retirement
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: provingkit-source-retirement-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  validate:
+    name: Validate retired Provingkit routes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate the fresh-clone retirement boundary
+        run: |
+          python -m unittest tests.test_validate_provingkit_retirement
+          python scripts/validate_provingkit_retirement.py .

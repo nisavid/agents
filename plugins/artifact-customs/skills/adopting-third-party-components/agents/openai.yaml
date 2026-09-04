@@ -1,4 +1,0 @@
-interface:
-  display_name: "Adopt Third-Party Components"
-  short_description: "Establish an explicit component trust boundary"
-  default_prompt: "Use $artifact-customs:adopting-third-party-components to assess and adopt this exact third-party component under an explicitly authorized durable policy."

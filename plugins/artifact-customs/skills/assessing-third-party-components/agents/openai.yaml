@@ -1,4 +1,0 @@
-interface:
-  display_name: "Assess Third-Party Components"
-  short_description: "Clear exact external components without mutation"
-  default_prompt: "Use $artifact-customs:assessing-third-party-components to assess this exact third-party component under a read-only clearance boundary."

@@ -1,1 +1,0 @@
-Run the loop on immutable candidate `sha256:decision1`. Adjudication finds no accepted edits but returns `needs operator decision` for whether the public API may change. Declared verification is authorized and succeeds. Surface the unresolved product decision and owner before any clean terminal; do not revise or reinterpret the decision.

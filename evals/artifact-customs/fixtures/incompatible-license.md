@@ -1,1 +1,0 @@
-The candidate's authoritative license metadata is AGPL-3.0-only. The repository policy permits only permissive licenses for this dependency class. The source and artifact otherwise match, but no license exception was granted.

@@ -1,5 +1,10 @@
 # Source-skill lineage and drift
 
+> Historical record. The current document lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/research/2026-08-18-source-skill-lineage-and-drift.md).
+> This copy preserves evidence tied to the former repository layout; it is not
+> an active package, validation, or release route.
+
 Status: evidence snapshot for issue [#49](https://github.com/nisavid/agents/issues/49); no contribution disposition is decided here
 
 Research inventory observed at: 2026-08-18T06:07:48Z

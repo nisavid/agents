@@ -1,5 +1,10 @@
 # Review-Writing Cluster Reconciliation Evidence
 
+> Historical record. The current document lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/research/2026-09-01-review-writing-cluster-reconciliation.md).
+> This copy preserves evidence tied to the former repository layout; it is not
+> an active package, validation, or release route.
+
 ## Purpose
 
 This note records the source disposition for the Mergecraft writer and feedback

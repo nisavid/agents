@@ -6,11 +6,13 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
+from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 import errno
 import base64
 import fcntl
 import functools
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -20,6 +22,7 @@ import re
 import signal
 import shlex
 import shutil
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -28,10 +31,19 @@ import time
 from typing import Any
 
 from .canonical import canonical_bytes, digest, strict_json_loads
+from .data_identity_rebind import (
+    DataIdentityRebindError,
+    create_rebind_plan,
+    database_continuity_projection,
+    verify_rebind_backup_artifact,
+    verify_rebind_evidence,
+    verify_rebind_plan,
+)
 
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,126}\Z")
+PROFILE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,126}\Z")
 ENVIRONMENT_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}\Z")
 DAILY_AT = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z")
@@ -51,12 +63,22 @@ SENSITIVE_HEADER = re.compile(
 )
 SERVICE_MANAGER_COMMAND_TIMEOUT_SECONDS = 360
 SYSTEMD_STOP_TIMEOUT_SECONDS = 330
+LAUNCHD_EXIT_TIMEOUT_SECONDS = 330
+LAUNCHD_SERVICE_START_TIMEOUT_SECONDS = 10.0
+LAUNCHD_SERVICE_START_POLL_SECONDS = 0.1
+MANAGED_HINDSIGHT_API_VERSION = "0.9.2"
 RESOLVER_ENVIRONMENT_BINDINGS = frozenset(
     {
         "HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV",
         "HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV",
         "HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV",
     }
+)
+NON_SECRET_POLICY_MARKER_ENVIRONMENTS = frozenset(
+    {"HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"}
+)
+PROVIDER_POLICY_MARKER = re.compile(
+    r"provider-policy:[a-z0-9][a-z0-9._-]{0,126}\Z"
 )
 AUTHORIZED_CREDENTIAL_ENVIRONMENTS = frozenset(
     {
@@ -67,6 +89,15 @@ AUTHORIZED_CREDENTIAL_ENVIRONMENTS = frozenset(
     }
 )
 LOCATOR = re.compile(r"[a-z][a-z0-9+.-]{1,31}://[^\s\x00]+\Z")
+
+
+def _validated_fleet_profiles(raw: str, error_message: str) -> tuple[str, ...]:
+    profiles = tuple(raw.split(","))
+    if any(
+        PROFILE_IDENTIFIER.fullmatch(profile) is None for profile in profiles
+    ) or len(profiles) != len(set(profiles)):
+        raise PortableInstallError(error_message)
+    return profiles
 
 
 def _signal_process_group(process_group: int, signal_number: int) -> None:
@@ -108,6 +139,50 @@ def _signal_process_group(process_group: int, signal_number: int) -> None:
 
 class PortableInstallError(ValueError):
     """A portable lifecycle contract was invalid or could not be completed."""
+
+
+def _data_root_identity_digest(
+    path: Path,
+    metadata: Any,
+    *,
+    platform: str,
+) -> str:
+    resolved_path = str(path.resolve(strict=True))
+    if platform != "launchd":
+        return digest(
+            {
+                "path": resolved_path,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+            }
+        )
+    birthtime = getattr(metadata, "st_birthtime", None)
+    if type(birthtime) not in {int, float}:
+        raise PortableInstallError("launchd data root birth time is unavailable")
+    try:
+        with localcontext(Context(prec=64, rounding=ROUND_HALF_EVEN)):
+            exact_birthtime = Decimal(repr(birthtime))
+            birthtime_nanoseconds = (
+                exact_birthtime * Decimal(1_000_000_000)
+            ).to_integral_value(rounding=ROUND_HALF_EVEN)
+    except (InvalidOperation, ValueError) as error:
+        raise PortableInstallError(
+            "launchd data root birth time is unavailable"
+        ) from error
+    if not exact_birthtime.is_finite() or exact_birthtime < 0:
+        raise PortableInstallError("launchd data root birth time is unavailable")
+    return digest(
+        {
+            "schema_version": 2,
+            "path": resolved_path,
+            "inode": metadata.st_ino,
+            "birthtime_ns": format(birthtime_nanoseconds, "f"),
+        }
+    )
+
+
+class _ImmutableArtifactExistsError(PortableInstallError):
+    """An immutable controller artifact already occupies its planned path."""
 
 
 class _ManagedServiceCommandError(PortableInstallError):
@@ -263,11 +338,28 @@ def _environment(value: Any, label: str) -> tuple[tuple[str, str], ...]:
             raise PortableInstallError(
                 f"{label} PATH must contain only protected system directories"
             )
-        if SECRET_NAME.search(name) and name not in RESOLVER_ENVIRONMENT_BINDINGS:
+        text = _text(raw, f"{label} value", maximum=8192)
+        if (
+            name == "HINDSIGHT_EMBED_API_VERSION"
+            and text != MANAGED_HINDSIGHT_API_VERSION
+        ):
+            raise PortableInstallError(
+                f"{label} HINDSIGHT_EMBED_API_VERSION must equal "
+                f"{MANAGED_HINDSIGHT_API_VERSION}"
+            )
+        secret_named = SECRET_NAME.search(name) is not None
+        protected_marker = (
+            name in NON_SECRET_POLICY_MARKER_ENVIRONMENTS
+            and PROVIDER_POLICY_MARKER.fullmatch(text) is not None
+        )
+        if (
+            secret_named
+            and name not in RESOLVER_ENVIRONMENT_BINDINGS
+            and not protected_marker
+        ):
             raise PortableInstallError(
                 f"credential environment {name} must use a protected locator"
             )
-        text = _text(raw, f"{label} value", maximum=8192)
         if text.startswith("release://"):
             _entrypoint(text.removeprefix("release://"), f"{label} release path")
         result.append((name, text))
@@ -797,6 +889,33 @@ def _snapshot_regular_file(path: Path, label: str) -> bytes:
             os.close(descriptor)
 
 
+def _managed_profile_api_version(path: Path, label: str) -> str | None:
+    """Read the profile override using hindsight-embed's effective precedence."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PortableInstallError(f"{label} is unavailable") from error
+    try:
+        text = _snapshot_regular_file(path, label).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise PortableInstallError(f"{label} is not valid UTF-8") from error
+    version: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "HINDSIGHT_EMBED_API_VERSION":
+            version = value.strip()
+    return version
+
+
 def _regular_file(
     path: Path, label: str, *, executable: bool = False
 ) -> os.stat_result:
@@ -872,9 +991,23 @@ def _protected_executable_bytes(path: Path, label: str, expected_digest: str) ->
     if path.is_symlink():
         raise PortableInstallError(f"{label} must not be a symlink")
     try:
-        resolved = path.resolve(strict=True)
-        current = Path(resolved.anchor)
+        current = Path(path.anchor)
         allowed_owners = {0, os.geteuid()}
+        for part in path.parts[1:-1]:
+            current /= part
+            metadata = current.lstat()
+            sticky_root = metadata.st_uid == 0 and metadata.st_mode & stat.S_ISVTX
+            if current.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                raise PortableInstallError(f"{label} ancestry is not protected")
+            if metadata.st_uid not in allowed_owners or (
+                metadata.st_mode & 0o022 and not sticky_root
+            ):
+                raise PortableInstallError(f"{label} ancestry is not protected")
+            _reject_extended_acl(current, f"{label} ancestry")
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise PortableInstallError(f"{label} path is not canonical")
+        current = Path(resolved.anchor)
         for part in resolved.parts[1:-1]:
             current /= part
             metadata = current.lstat()
@@ -1220,7 +1353,219 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     _atomic_write(path, canonical_bytes(value) + b"\n", 0o600)
 
 
-def _fsync_directory(path: Path) -> None:
+@dataclass(frozen=True)
+class _AnchoredExchangeEntry:
+    directory_descriptor: int
+    name: str
+
+
+def _atomic_exchange(
+    first: _AnchoredExchangeEntry,
+    second: _AnchoredExchangeEntry,
+) -> None:
+    if first.directory_descriptor != second.directory_descriptor:
+        raise PortableInstallError("atomic exchange entries have different parents")
+    library = ctypes.CDLL(None, use_errno=True)
+    first_raw = os.fsencode(first.name)
+    second_raw = os.fsencode(second.name)
+    if sys.platform == "darwin":
+        exchange = library.renameatx_np
+        exchange.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        exchange.restype = ctypes.c_int
+        result = exchange(
+            first.directory_descriptor,
+            first_raw,
+            second.directory_descriptor,
+            second_raw,
+            0x00000002,
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            exchange = library.renameat2
+        except AttributeError as error:
+            raise PortableInstallError(
+                "atomic installer-state exchange is unavailable"
+            ) from error
+        exchange.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        exchange.restype = ctypes.c_int
+        result = exchange(
+            first.directory_descriptor,
+            first_raw,
+            second.directory_descriptor,
+            second_raw,
+            0x00000002,
+        )
+    else:
+        raise PortableInstallError("atomic installer-state exchange is unavailable")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), first.name)
+
+
+def _create_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Create one immutable private JSON artifact and fail on path reuse."""
+    _mkdir_private(path.parent)
+    content = canonical_bytes(value) + b"\n"
+    parent_descriptor = -1
+    descriptor = -1
+    parent_identity: tuple[int, int] | None = None
+    created_inode: tuple[int, int] | None = None
+    created_identity: tuple[int, ...] | None = None
+
+    def entry_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_uid,
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_nlink,
+        )
+
+    def parent_entry_is_current() -> bool:
+        if parent_identity is None or parent_descriptor < 0:
+            return False
+        try:
+            anchored = os.fstat(parent_descriptor)
+            observed = path.parent.lstat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(anchored.st_mode)
+            and stat.S_ISDIR(observed.st_mode)
+            and anchored.st_uid == os.geteuid()
+            and observed.st_uid == os.geteuid()
+            and not anchored.st_mode & 0o077
+            and not observed.st_mode & 0o077
+            and (anchored.st_dev, anchored.st_ino) == parent_identity
+            and (observed.st_dev, observed.st_ino) == parent_identity
+        )
+
+    def verify_created_entry() -> None:
+        if (
+            created_identity is None
+            or descriptor < 0
+            or parent_descriptor < 0
+            or not parent_entry_is_current()
+        ):
+            raise OSError(errno.EIO, "created artifact identity is unavailable")
+        before = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        handle_metadata = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            entry_identity(before) != created_identity
+            or entry_identity(handle_metadata) != created_identity
+            or entry_identity(after) != created_identity
+            or b"".join(chunks) != content
+            or created_identity[-3:] != (os.geteuid(), 0o600, 1)
+        ):
+            raise OSError(errno.EBUSY, "immutable artifact entry changed")
+
+    try:
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent_metadata = os.fstat(parent_descriptor)
+        parent_observed = path.parent.lstat()
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.geteuid()
+            or parent_metadata.st_mode & 0o077
+            or (parent_observed.st_dev, parent_observed.st_ino) != parent_identity
+        ):
+            raise OSError(errno.EBUSY, "immutable artifact parent changed")
+        descriptor = os.open(
+            path.name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        created_metadata = os.fstat(descriptor)
+        created_inode = (created_metadata.st_dev, created_metadata.st_ino)
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short write")
+            offset += written
+        os.fsync(descriptor)
+        created_identity = entry_identity(os.fstat(descriptor))
+        verify_created_entry()
+        _fsync_directory(parent_descriptor)
+        verify_created_entry()
+    except FileExistsError:
+        raise _ImmutableArtifactExistsError(
+            f"immutable artifact already exists: {path}"
+        ) from None
+    except (OSError, PortableInstallError) as error:
+        if (
+            created_inode is not None
+            and parent_descriptor >= 0
+            and parent_entry_is_current()
+        ):
+            try:
+                observed = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (observed.st_dev, observed.st_ino) == created_inode:
+                    os.unlink(path.name, dir_fd=parent_descriptor)
+                    _fsync_directory(parent_descriptor)
+            except (OSError, PortableInstallError):
+                pass
+        raise PortableInstallError(
+            f"cannot create immutable artifact: {path}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _fsync_directory(path: Path | int) -> None:
+    if isinstance(path, int):
+        os.fsync(path)
+        return
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(descriptor)
@@ -1378,13 +1723,140 @@ if not isinstance(current, dict):
     raise SystemExit("installation state is invalid")
 identity = {key: current.get(key) for key in ("version", "release_digest", "release_path")}
 transaction = state.get("transaction")
-selected = current
-if transaction is None:
+authority_mode = bool(
+    sys.argv[1:] and sys.argv[1] == "--hindsight-hook-authority"
+)
+if authority_mode:
+    sys.argv.pop(1)
+    authority_path = root / "hook-authority.json"
+    protected(authority_path, 0o500)
+    if owned.get(str(authority_path)) != hashlib.sha256(
+        authority_path.read_bytes()
+    ).hexdigest():
+        raise SystemExit("hook authority digest mismatch")
+    selected = json.loads(authority_path.read_text(encoding="utf-8"))
+    allowed = {
+        "plan",
+        "apply",
+        "status",
+        "verify",
+        "rollback",
+        "disable",
+        "reconcile",
+    }
+    authority_arguments = sys.argv[1:]
+    command_index = 0
+    if authority_arguments[:1] == ["--state-dir"]:
+        config_path = root / "managed-config.json"
+        descriptor = -1
+        try:
+            observed = config_path.lstat()
+            descriptor = os.open(
+                config_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (observed.st_dev, observed.st_ino)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o777 != 0o500
+                or metadata.st_nlink != 1
+                or metadata.st_size > 1024 * 1024
+            ):
+                raise ValueError
+            try:
+                reject_acl(config_path)
+            except SystemExit as error:
+                raise ValueError from error
+            chunks = bytearray()
+            while len(chunks) <= 1024 * 1024:
+                chunk = os.read(
+                    descriptor,
+                    min(65536, 1024 * 1024 + 1 - len(chunks)),
+                )
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            if len(chunks) > 1024 * 1024:
+                raise ValueError
+            after = config_path.lstat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_uid,
+                after.st_mode,
+                after.st_nlink,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_uid,
+                metadata.st_mode,
+                metadata.st_nlink,
+            ):
+                raise ValueError
+            config_bytes = bytes(chunks)
+            config_digest = hashlib.sha256(config_bytes).hexdigest()
+            if (
+                owned.get(str(config_path)) != config_digest
+                or state.get("config_file_digest") != config_digest
+            ):
+                raise ValueError
+
+            def strict_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError
+                    result[key] = value
+                return result
+
+            managed_config = json.loads(
+                config_bytes,
+                object_pairs_hook=strict_object,
+            )
+            if not isinstance(managed_config, dict):
+                raise ValueError
+            state_root = managed_config.get("state_root")
+            if (
+                not isinstance(state_root, str)
+                or "\x00" in state_root
+                or not Path(state_root).is_absolute()
+                or ".." in Path(state_root).parts
+            ):
+                raise ValueError
+            expected_state_dir = str(Path(state_root) / "memory")
+        except (OSError, UnicodeError, ValueError):
+            raise SystemExit("managed config binding is invalid") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (
+            len(authority_arguments) < 2
+            or authority_arguments[1] != expected_state_dir
+        ):
+            raise SystemExit("hook authority state directory is invalid")
+        command_index = 2
+    if (
+        len(authority_arguments) < command_index + 2
+        or authority_arguments[command_index] != "harness-config"
+        or authority_arguments[command_index + 1] not in allowed
+    ):
+        raise SystemExit("hook authority permits only harness configuration commands")
+elif transaction is None:
+    selected = current
     protected(root / "active.json", 0o600)
     active = json.loads((root / "active.json").read_text(encoding="utf-8"))
     if active != identity:
         raise SystemExit("installation state is not launchable")
 else:
+    selected = current
     lifecycle_commands = {"install", "upgrade", "verify", "rollback", "uninstall"}
     if not sys.argv[1:] or sys.argv[1] not in lifecycle_commands:
         raise SystemExit("installation permits only lifecycle recovery commands")
@@ -1586,10 +2058,11 @@ def sha256_fd(descriptor):
 
 def protected_resolver(path, expected_digest):
     allowed_owners = {0, os.geteuid()}
-    if path.is_symlink():
+    if not path.is_absolute():
         raise ValueError("unsafe resolver executable")
-    path = path.resolve(strict=True)
     protected_ancestry(path.parent, allow_root_symlinks=False)
+    if path.is_symlink() or path.resolve(strict=True) != path:
+        raise ValueError("unsafe resolver executable")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         metadata = os.fstat(descriptor)
@@ -1866,15 +2339,33 @@ try:
         os.close(inventory_fd)
 except (OSError, ValueError):
     raise SystemExit("managed inventory binding is invalid") from None
-release = (root / active["release_path"]).resolve(strict=True)
-if root.resolve() not in release.parents:
-    raise SystemExit("active release is outside the installation root")
 relative = PurePosixPath(spec["entrypoint"])
 if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
     raise SystemExit("managed entrypoint is invalid")
+launch_release = current
+authority_path = root / "hook-authority.json"
+try:
+    authority, authority_digest = snapshot_json(authority_path, 0o500)
+except (OSError, UnicodeDecodeError, ValueError):
+    raise SystemExit("hook authority binding is invalid") from None
+if (
+    state.get("owned_install_files", {}).get(str(authority_path))
+    != authority_digest
+    or state.get("releases", {}).get(authority.get("release_digest"))
+    != authority
+):
+    raise SystemExit("hook authority binding is invalid")
+legacy_runtime = (
+    current.get("release_digest") != authority.get("release_digest")
+)
+if relative.as_posix() == "bin/hindsight-hook-authority-supervisor":
+    launch_release = authority
+release = (root / launch_release["release_path"]).resolve(strict=True)
+if root.resolve() not in release.parents:
+    raise SystemExit("managed release is outside the installation root")
 target = release.joinpath(*relative.parts)
 metadata = target.lstat()
-entry_matches = [item for item in current.get("manifest", {}).get("files", []) if item.get("path") == relative.as_posix()]
+entry_matches = [item for item in launch_release.get("manifest", {}).get("files", []) if item.get("path") == relative.as_posix()]
 expected_mode = 0o500 if len(entry_matches) == 1 and entry_matches[0].get("executable") else 0o400
 try:
     protected(release, 0o500, directory=True)
@@ -1888,9 +2379,11 @@ except (OSError, ValueError):
 if len(entry_matches) != 1 or sha256(target) != entry_matches[0].get("sha256"):
     raise SystemExit("managed entrypoint digest mismatch")
 resolver = config["credential_resolver"]
-resolver_path = root / "credential-resolver"
 try:
-    resolver_path = protected_resolver(resolver_path, resolver["sha256"])
+    resolver_path = protected_resolver(
+        Path(resolver["path"]),
+        resolver["sha256"],
+    )
 except (OSError, ValueError):
     raise SystemExit("credential resolver is not protected") from None
 credentials = spec.get("credentials", [])
@@ -1916,6 +2409,14 @@ if credentials:
     values = response["values"]
 environment = {name: os.environ[name] for name in ("TMPDIR", "LANG", "LC_ALL") if name in os.environ}
 for name, value in spec.get("environment", {}).items():
+    if (
+        legacy_runtime
+        and name == "HINDSIGHT_API_HTTP_EXTENSION"
+        and value
+        == "hindsight_memory_control_plane.migration_generation_extension:"
+        "MigrationGenerationHttpExtension"
+    ):
+        continue
     if value.startswith("release://"):
         relative_value = PurePosixPath(value.removeprefix("release://"))
         if relative_value.is_absolute() or any(part in {"", ".", ".."} for part in relative_value.parts):
@@ -1926,14 +2427,31 @@ environment.update(values)
 environment.update(account_environment)
 environment["HINDSIGHT_MEMORY_INVENTORY"] = str(inventory_path)
 environment["HINDSIGHT_EMBED_UVX_EXECUTABLE"] = config["uvx_executable"]
+if relative.as_posix() == "bin/hindsight-hook-authority-supervisor":
+    controller_entries = [
+        item
+        for item in launch_release.get("manifest", {}).get("files", [])
+        if item.get("path") == "bin/hindsight-memory"
+        and item.get("executable")
+    ]
+    if len(controller_entries) != 1:
+        raise SystemExit("hook authority controller binding is invalid")
+    environment["HINDSIGHT_HOOK_AUTHORITY_RELEASE_DIGEST"] = launch_release[
+        "release_digest"
+    ]
+    environment["HINDSIGHT_HOOK_AUTHORITY_CONTROLLER_SHA256"] = (
+        controller_entries[0]["sha256"]
+    )
 try:
+    npx_alias = Path(state["npx_alias"])
     npx_directory = str(
         protected_external_executable(
-            Path(state["npx_alias"]), Path(config["npx_executable"])
+            npx_alias, Path(config["npx_executable"])
         )
     )
 except (KeyError, TypeError):
     raise SystemExit("managed npx binding is not protected") from None
+environment["HINDSIGHT_EMBED_NPX_EXECUTABLE"] = str(npx_alias)
 path_entries = environment.get("PATH", "/usr/bin:/bin").split(":")
 environment["PATH"] = ":".join(
     [npx_directory, *(entry for entry in path_entries if entry != npx_directory)]
@@ -2037,6 +2555,72 @@ class PortableInstallationManager:
             raise PortableInstallError(
                 "systemd-user service_root is not searched by the user manager"
             )
+
+    def _preflight_managed_profile_api_versions(self) -> None:
+        binding = self._component_desired_state_binding()
+        if binding is None:
+            return
+        _root, profiles, _daemon_state, _ui_state = binding
+        try:
+            account = pwd.getpwuid(os.geteuid())
+        except KeyError as error:
+            raise PortableInstallError(
+                "managed account identity is unavailable"
+            ) from error
+        home = Path(account.pw_dir)
+        if not home.is_absolute() or ".." in home.parts:
+            raise PortableInstallError("managed account home is invalid")
+        for profile in profiles:
+            version = _managed_profile_api_version(
+                home / ".hindsight" / "profiles" / f"{profile}.env",
+                f"managed profile {profile}",
+            )
+            if version not in {None, "", MANAGED_HINDSIGHT_API_VERSION}:
+                raise PortableInstallError(
+                    "managed profile API version differs"
+                )
+
+    def _disable_harness_authority_for_rollback(self) -> None:
+        bindings: set[tuple[str, str]] = set()
+        surfaces = (
+            *self.config.services,
+            *self.config.timers,
+            *self.config.health_checks,
+        )
+        unbound = 0
+        for surface in surfaces:
+            environment = dict(surface.environment)
+            reconciler = environment.get(
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILER"
+            )
+            reconcile_config = environment.get(
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG"
+            )
+            if reconciler is None and reconcile_config is None:
+                unbound += 1
+                continue
+            if reconciler is None or reconcile_config is None:
+                raise PortableInstallError(
+                    "harness rollback authority binding is incomplete"
+                )
+            bindings.add((reconciler, reconcile_config))
+        if not bindings:
+            return
+        if len(bindings) != 1 or unbound:
+            raise PortableInstallError(
+                "harness rollback authority binding is inconsistent"
+            )
+        reconciler_raw, config_raw = next(iter(bindings))
+        reconciler = _protected_executable_path(
+            Path(reconciler_raw),
+            "harness rollback authority reconciler",
+        )
+        config = Path(config_raw)
+        if not config.is_absolute():
+            raise PortableInstallError(
+                "harness rollback authority config must be absolute"
+            )
+        self._command_runner((str(reconciler), "disable", str(config)))
 
     @property
     def _state_path(self) -> Path:
@@ -2146,6 +2730,22 @@ class PortableInstallationManager:
     def _launchd_loaded_manifest(
         self, label: str, expected: Path, *, require_running: bool = False
     ) -> Path | None:
+        loaded, output = self._launchd_job_snapshot(label, expected)
+        if (
+            loaded is not None
+            and require_running
+            and output is not None
+            and re.search(r"^\s*state = running\s*$", output, re.MULTILINE)
+            is None
+        ):
+            raise PortableInstallError(f"managed launchd job is not active: {label}")
+        return loaded
+
+    def _launchd_job_snapshot(
+        self,
+        label: str,
+        expected: Path,
+    ) -> tuple[Path | None, str | None]:
         domain = f"gui/{os.getuid()}"
         try:
             output = self._command_runner(
@@ -2153,10 +2753,10 @@ class PortableInstallationManager:
             )
         except _ManagedServiceCommandError as error:
             if error.returncode in {3, 113}:
-                return None
+                return None, None
             raise
         if output is None:
-            return expected
+            return expected, None
         match = re.search(r"^\s*path = (.+?)\s*$", output, re.MULTILINE)
         if match is None:
             raise PortableInstallError("launchd loaded plist identity is unavailable")
@@ -2170,12 +2770,7 @@ class PortableInstallationManager:
             ) from error
         if loaded_identity != expected_identity:
             raise PortableInstallError("launchd loaded plist is not owned")
-        if (
-            require_running
-            and re.search(r"^\s*state = running\s*$", output, re.MULTILINE) is None
-        ):
-            raise PortableInstallError(f"managed launchd job is not active: {label}")
-        return loaded
+        return loaded, output
 
     def _assert_systemd_fragment(
         self, unit: str, expected: Path, *, absent_ok: bool = False
@@ -2216,19 +2811,241 @@ class PortableInstallationManager:
         if output is not None and output.strip() != status:
             raise PortableInstallError(f"systemd unit is not {status}: {unit}")
 
+    def _systemd_unit_active(self, unit: str) -> bool:
+        try:
+            output = self._command_runner(
+                ("/usr/bin/systemctl", "--user", "is-active", unit)
+            )
+        except _ManagedServiceCommandError as error:
+            if error.returncode in {3, 4}:
+                return False
+            raise
+        return output is None or output.strip() == "active"
+
+    def _systemd_unit_enabled(self, unit: str) -> bool:
+        try:
+            output = self._command_runner(
+                ("/usr/bin/systemctl", "--user", "is-enabled", unit)
+            )
+        except _ManagedServiceCommandError as error:
+            if error.returncode in {1, 3, 4}:
+                return False
+            raise
+        return output is None or output.strip() == "enabled"
+
+    def _launchd_job_running(self, label: str, expected: Path) -> bool:
+        loaded, output = self._launchd_job_snapshot(label, expected)
+        if loaded is None:
+            return False
+        if output is None:
+            return True
+        return (
+            re.search(
+                r"^\s*state = running\s*$",
+                output,
+                re.MULTILINE,
+            )
+            is not None
+        )
+
+    def _wait_for_launchd_job_running(self, label: str, expected: Path) -> Path:
+        deadline = time.monotonic() + LAUNCHD_SERVICE_START_TIMEOUT_SECONDS
+        while True:
+            loaded, output = self._launchd_job_snapshot(label, expected)
+            if loaded is None:
+                raise PortableInstallError(
+                    f"managed launchd job is absent: {label}"
+                )
+            if output is None or re.search(
+                r"^\s*state = running\s*$",
+                output,
+                re.MULTILINE,
+            ):
+                return loaded
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PortableInstallError(
+                    f"managed launchd job is not active: {label}"
+                )
+            time.sleep(min(LAUNCHD_SERVICE_START_POLL_SECONDS, remaining))
+
+    def _service_manager_status(self) -> dict[str, dict[str, str]]:
+        services: dict[str, str] = {}
+        timers: dict[str, str] = {}
+        if self.config.platform == "launchd":
+            for item in self.config.services:
+                manifest = self.config.service_root / f"{item.label}.plist"
+                services[item.service_id] = (
+                    "running"
+                    if self._launchd_job_running(item.label, manifest)
+                    else "stopped"
+                )
+            for item in self.config.timers:
+                manifest = self.config.service_root / f"{item.label}.plist"
+                timers[item.timer_id] = (
+                    "running"
+                    if self._launchd_loaded_manifest(item.label, manifest) is not None
+                    else "stopped"
+                )
+        else:
+            for item in self.config.services:
+                unit = f"{item.label}.service"
+                self._assert_systemd_fragment(
+                    unit, self.config.service_root / unit
+                )
+                services[item.service_id] = (
+                    "running" if self._systemd_unit_active(unit) else "stopped"
+                )
+            for item in self.config.timers:
+                unit = f"{item.label}.timer"
+                self._assert_systemd_fragment(
+                    unit, self.config.service_root / unit
+                )
+                timers[item.timer_id] = (
+                    "running" if self._systemd_unit_active(unit) else "stopped"
+                )
+        return {"services": services, "timers": timers}
+
+    def _service_manager_prestate(self) -> dict[str, Any]:
+        if self.config.platform == "launchd":
+            return self._service_manager_status()
+        units: dict[str, dict[str, bool]] = {}
+        for service in self.config.services:
+            unit = f"{service.label}.service"
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            units[unit] = {
+                "active": self._systemd_unit_active(unit),
+                "enabled": self._systemd_unit_enabled(unit),
+            }
+        for timer in self.config.timers:
+            unit = f"{timer.label}.timer"
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            units[unit] = {
+                "active": self._systemd_unit_active(unit),
+                "enabled": self._systemd_unit_enabled(unit),
+            }
+        return {"systemd_units": units}
+
+    def _component_desired_state_binding(
+        self,
+    ) -> tuple[Path, tuple[str, ...], str, str] | None:
+        bindings: set[tuple[Path, tuple[str, ...], str, str]] = set()
+        required = {
+            "HINDSIGHT_EMBED_STATE_DIR",
+            "HINDSIGHT_EMBED_FLEET_PROFILES",
+            "HINDSIGHT_EMBED_AUTOSTART_DAEMON",
+            "HINDSIGHT_EMBED_AUTOSTART_UI",
+        }
+        relevant = required | {"HINDSIGHT_EMBED_DESIRED_STATE_DIR"}
+        consumers = (
+            *self.config.services,
+            *self.config.timers,
+            *self.config.health_checks,
+        )
+        for consumer in consumers:
+            environment = dict(consumer.environment)
+            present = relevant & set(environment)
+            if not present:
+                continue
+            if not required <= set(environment):
+                raise PortableInstallError(
+                    "managed stack desired-state binding is incomplete"
+                )
+            profiles = _validated_fleet_profiles(
+                environment["HINDSIGHT_EMBED_FLEET_PROFILES"],
+                "managed stack fleet profile binding is invalid",
+            )
+            daemon_state = environment["HINDSIGHT_EMBED_AUTOSTART_DAEMON"]
+            ui_state = environment["HINDSIGHT_EMBED_AUTOSTART_UI"]
+            if daemon_state not in {"true", "false"} or ui_state not in {
+                "true",
+                "false",
+            }:
+                raise PortableInstallError(
+                    "managed stack autostart binding is invalid"
+                )
+            if daemon_state == "false" and ui_state == "true":
+                raise PortableInstallError(
+                    "managed stack UI cannot autostart without its API"
+                )
+            root = Path(
+                environment.get(
+                    "HINDSIGHT_EMBED_DESIRED_STATE_DIR",
+                    str(Path(environment["HINDSIGHT_EMBED_STATE_DIR"]) / "desired"),
+                )
+            )
+            if not root.is_absolute() or ".." in root.parts:
+                raise PortableInstallError(
+                    "managed stack desired-state path is invalid"
+                )
+            bindings.add((root, profiles, daemon_state, ui_state))
+        if len(bindings) > 1:
+            raise PortableInstallError(
+                "managed stack desired-state bindings disagree"
+            )
+        return next(iter(bindings)) if bindings else None
+
+    def _reset_component_desired_state(self) -> dict[Path, bytes | None]:
+        binding = self._component_desired_state_binding()
+        if binding is None:
+            return {}
+        root, profiles, daemon_autostart, ui_autostart = binding
+        _mkdir_private(root)
+        preimage: dict[Path, bytes | None] = {}
+        try:
+            for profile in profiles:
+                profile_root = root / "profiles" / profile
+                _mkdir_private(profile_root)
+                for component, autostart in (
+                    ("daemon", daemon_autostart),
+                    ("ui", ui_autostart),
+                ):
+                    path = profile_root / component
+                    if path.exists() or path.is_symlink():
+                        _verify_owned_file(
+                            path, "component desired-state file", mode=0o600
+                        )
+                        current = path.read_bytes()
+                        if current not in {b"running\n", b"stopped\n"}:
+                            raise PortableInstallError(
+                                "component desired-state file is invalid"
+                            )
+                        preimage[path] = current
+                    else:
+                        preimage[path] = None
+                    desired = b"running\n" if autostart == "true" else b"stopped\n"
+                    _atomic_write(path, desired, 0o600)
+        except BaseException:
+            self._restore_component_desired_state(preimage)
+            raise
+        return preimage
+
+    def _restore_component_desired_state(
+        self, preimage: Mapping[Path, bytes | None]
+    ) -> None:
+        for path, content in preimage.items():
+            if content is None:
+                if not path.exists() and not path.is_symlink():
+                    continue
+                _verify_owned_file(
+                    path, "component desired-state file", mode=0o600
+                )
+                path.unlink()
+                _fsync_directory(path.parent)
+            else:
+                _atomic_write(path, content, 0o600)
+
     def _verify_service_manager(self) -> None:
         if self.config.platform == "launchd":
             for item in self.config.services:
                 manifest = self.config.service_root / f"{item.label}.plist"
-                if (
-                    self._launchd_loaded_manifest(
-                        item.label, manifest, require_running=True
-                    )
-                    is None
-                ):
-                    raise PortableInstallError(
-                        f"managed launchd job is absent: {item.label}"
-                    )
+                self._wait_for_launchd_job_running(item.label, manifest)
             for item in self.config.timers:
                 manifest = self.config.service_root / f"{item.label}.plist"
                 if self._launchd_loaded_manifest(item.label, manifest) is None:
@@ -2416,7 +3233,7 @@ class PortableInstallationManager:
         *,
         replacing_loaded_job: bool,
     ) -> None:
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + LAUNCHD_EXIT_TIMEOUT_SECONDS
         while True:
             try:
                 self._command_runner(
@@ -2496,6 +3313,13 @@ class PortableInstallationManager:
                 return False
             time.sleep(min(0.5, remaining))
 
+    def _validate_credential_resolver_binding(self) -> None:
+        _protected_executable_bytes(
+            self.config.credential_resolver.path,
+            "credential resolver",
+            self.config.credential_resolver.sha256,
+        )
+
     def _validate_external_bindings(self) -> BindingSnapshot:
         inventory_snapshot = _snapshot_regular_file(
             self.config.inventory_path, "inventory"
@@ -2512,11 +3336,7 @@ class PortableInstallationManager:
         zsh_executable = _protected_executable_path(
             self.config.zsh_executable, "Zsh executable"
         )
-        _protected_executable_bytes(
-            self.config.credential_resolver.path,
-            "credential resolver",
-            self.config.credential_resolver.sha256,
-        )
+        self._validate_credential_resolver_binding()
         effective_config = self.config.to_dict()
         effective_config.update(
             {
@@ -2607,12 +3427,10 @@ class PortableInstallationManager:
             raise PortableInstallError("data root is unavailable") from error
         if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
             raise PortableInstallError("data root identity is invalid")
-        return digest(
-            {
-                "path": str(path.resolve(strict=True)),
-                "device": metadata.st_dev,
-                "inode": metadata.st_ino,
-            }
+        return _data_root_identity_digest(
+            path,
+            metadata,
+            platform=self.config.platform,
         )
 
     def _plan_release_record(self, source: Path, version: str) -> dict[str, Any]:
@@ -2634,7 +3452,11 @@ class PortableInstallationManager:
         destination = self.config.install_root / str(release["release_path"])
         _copy_release(source, destination, release["manifest"], temporary=temporary)
 
-    def _launcher_payloads(self, snapshot: BindingSnapshot) -> dict[Path, bytes]:
+    def _launcher_payloads(
+        self,
+        snapshot: BindingSnapshot,
+        release: Mapping[str, Any],
+    ) -> dict[Path, bytes]:
         python = _validated_python_runtime(self.config.python_executable)
         wrapper = (
             "#!/bin/sh\nexec "
@@ -2643,10 +3465,22 @@ class PortableInstallationManager:
             + shlex.quote(str(self.config.install_root / "wrapper.py"))
             + ' "$@"\n'
         ).encode()
+        authority_wrapper = (
+            "#!/bin/sh\nexec "
+            + shlex.quote(str(python))
+            + " -I "
+            + shlex.quote(str(self.config.install_root / "wrapper.py"))
+            + ' --hindsight-hook-authority "$@"\n'
+        ).encode()
+        authority = canonical_bytes(release)
         return {
             self.config.install_root / "launcher.py": SERVICE_LAUNCHER.encode(),
             self.config.install_root / "wrapper.py": WRAPPER.encode(),
             self.config.install_root / "bin" / "hindsight-memory": wrapper,
+            self.config.install_root
+            / "bin"
+            / "hindsight-memory-hook-authority": authority_wrapper,
+            self.config.install_root / "hook-authority.json": authority,
             self.config.install_root / "managed-config.json": snapshot.config_bytes,
             self.config.install_root
             / "managed-inventory.json": snapshot.inventory_bytes,
@@ -2728,6 +3562,7 @@ class PortableInstallationManager:
                 "KeepAlive": keep_alive,
                 "WorkingDirectory": str(self.config.state_root),
                 "ProcessType": "Background",
+                "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT_SECONDS,
             }
             rendered[self.config.service_root / f"{service.label}.plist"] = (
                 plistlib.dumps(payload, sort_keys=True)
@@ -2867,7 +3702,12 @@ class PortableInstallationManager:
             else:
                 _atomic_write(path, content, 0o600, private_parent=False)
 
-    def _activate_services(self) -> None:
+    def _activate_services(
+        self,
+        *,
+        retry_bootstrap_after_stop: bool = False,
+    ) -> None:
+        self._preflight_managed_profile_api_versions()
         if self.config.platform == "launchd":
             domain = f"gui/{os.getuid()}"
             self._preflight_service_manager(absent_ok=True)
@@ -2887,7 +3727,9 @@ class PortableInstallationManager:
                 self._bootstrap_launchd(
                     domain,
                     plist,
-                    replacing_loaded_job=replacing_loaded_job,
+                    replacing_loaded_job=(
+                        replacing_loaded_job or retry_bootstrap_after_stop
+                    ),
                 )
                 self._command_runner(
                     ("/bin/launchctl", "kickstart", "-k", f"{domain}/{item.label}")
@@ -2930,6 +3772,81 @@ class PortableInstallationManager:
                 )
                 self._command_runner(
                     ("/usr/bin/systemctl", "--user", "restart", f"{timer.label}.timer")
+                )
+
+    def _start_services_idempotently(self) -> None:
+        self._preflight_managed_profile_api_versions()
+        self._preflight_service_manager(absent_ok=True)
+        if self.config.platform == "launchd":
+            domain = f"gui/{os.getuid()}"
+            candidates = (
+                *((item, True) for item in self.config.services),
+                *((item, False) for item in self.config.timers),
+            )
+            for item, require_running in candidates:
+                plist = self.config.service_root / f"{item.label}.plist"
+                loaded, output = self._launchd_job_snapshot(item.label, plist)
+                running = loaded is not None and (
+                    not require_running
+                    or output is None
+                    or re.search(
+                        r"^\s*state = running\s*$",
+                        output,
+                        re.MULTILINE,
+                    )
+                    is not None
+                )
+                if running:
+                    continue
+                if loaded is None:
+                    self._bootstrap_launchd(
+                        domain,
+                        plist,
+                        replacing_loaded_job=False,
+                    )
+                self._command_runner(
+                    (
+                        "/bin/launchctl",
+                        "kickstart",
+                        "-k",
+                        f"{domain}/{item.label}",
+                    )
+                )
+            return
+
+        self._command_runner(("/usr/bin/systemctl", "--user", "daemon-reload"))
+        for service in self.config.services:
+            unit = f"{service.label}.service"
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            if not self._systemd_unit_enabled(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "enable", unit)
+                )
+            if not self._systemd_unit_active(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "start", unit)
+                )
+        for timer in self.config.timers:
+            companion = f"{timer.label}.service"
+            unit = f"{timer.label}.timer"
+            self._assert_systemd_fragment(
+                companion,
+                self.config.service_root / companion,
+            )
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            if not self._systemd_unit_enabled(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "enable", unit)
+                )
+            if not self._systemd_unit_active(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "start", unit)
                 )
 
     def _deactivate_services(self, *, absent_ok: bool = False) -> None:
@@ -3013,6 +3930,89 @@ class PortableInstallationManager:
                     )
                 )
             self._command_runner(("/usr/bin/systemctl", "--user", "daemon-reload"))
+
+    def _restore_service_manager_prestate(
+        self,
+        prior: Mapping[str, Any],
+    ) -> None:
+        if self.config.platform == "systemd-user":
+            for unit, state in prior["systemd_units"].items():
+                self._assert_systemd_fragment(
+                    unit,
+                    self.config.service_root / unit,
+                )
+                self._command_runner(
+                    (
+                        "/usr/bin/systemctl",
+                        "--user",
+                        "enable" if state["enabled"] else "disable",
+                        unit,
+                    )
+                )
+                self._command_runner(
+                    (
+                        "/usr/bin/systemctl",
+                        "--user",
+                        "start" if state["active"] else "stop",
+                        unit,
+                    )
+                )
+            self._command_runner(
+                ("/usr/bin/systemctl", "--user", "daemon-reload")
+            )
+            if self._service_manager_prestate() != prior:
+                raise PortableInstallError(
+                    "service manager prestate restoration failed"
+                )
+            return
+        domain = f"gui/{os.getuid()}"
+        candidates = (
+            *((item, prior["services"][item.service_id])
+              for item in self.config.services),
+            *((item, prior["timers"][item.timer_id])
+              for item in self.config.timers),
+        )
+        for item, expected_status in candidates:
+            plist = self.config.service_root / f"{item.label}.plist"
+            loaded = self._launchd_loaded_manifest(item.label, plist) is not None
+            if expected_status == "running":
+                if not loaded:
+                    self._bootstrap_launchd(
+                        domain,
+                        plist,
+                        replacing_loaded_job=False,
+                    )
+                self._command_runner(
+                    (
+                        "/bin/launchctl",
+                        "kickstart",
+                        "-k",
+                        f"{domain}/{item.label}",
+                    )
+                )
+                continue
+            if expected_status != "stopped":
+                raise PortableInstallError(
+                    "service manager prestate is invalid"
+                )
+            if not loaded:
+                continue
+            try:
+                self._command_runner(
+                    (
+                        "/bin/launchctl",
+                        "bootout",
+                        f"{domain}/{item.label}",
+                    )
+                )
+            except _ManagedServiceCommandError as error:
+                if error.returncode not in {3, 113}:
+                    raise
+        observed = self._service_manager_status()
+        if observed != prior:
+            raise PortableInstallError(
+                "service manager prestate restoration failed"
+            )
 
     def _health(self, release: Mapping[str, Any]) -> bool:
         runner = self._health_runner or self._default_health_runner
@@ -3161,7 +4161,7 @@ class PortableInstallationManager:
         self._recover_binding_migration()
         return migrated
 
-    def _load_state(self) -> dict[str, Any] | None:
+    def _require_no_pending_rebind_stages(self) -> None:
         if self.config.install_root.exists() or self.config.install_root.is_symlink():
             _safe_directory(
                 self.config.install_root,
@@ -3169,6 +4169,20 @@ class PortableInstallationManager:
                 create=False,
                 private_final=True,
             )
+            stage_prefix = f".{self._state_path.name}.rebind."
+            pending_stages = sorted(
+                path
+                for path in self.config.install_root.iterdir()
+                if path.name.startswith(stage_prefix)
+            )
+            if pending_stages:
+                raise PortableInstallError(
+                    "data-identity rebind has unresolved installer-state "
+                    f"exchange stage: {pending_stages[0]}"
+                )
+
+    def _load_state(self) -> dict[str, Any] | None:
+        self._require_no_pending_rebind_stages()
         if not self._state_path.exists():
             return None
         self._recover_binding_migration()
@@ -3202,6 +4216,8 @@ class PortableInstallationManager:
                 "launcher.py",
                 "wrapper.py",
                 "bin/hindsight-memory",
+                "bin/hindsight-memory-hook-authority",
+                "hook-authority.json",
                 "managed-config.json",
                 "managed-inventory.json",
                 "credential-resolver",
@@ -3365,6 +4381,7 @@ class PortableInstallationManager:
             raise PortableInstallError("release staging rollback failed") from error
 
     def _recover_pending_locked(self) -> None:
+        self._require_no_pending_rebind_stages()
         if (
             self._transaction_path.exists()
             and self._uninstall_transaction_path.exists()
@@ -3374,30 +4391,41 @@ class PortableInstallationManager:
         if not self._transaction_path.exists():
             return
         journal = _read_json(self._transaction_path, "installation transaction")
+        journal_keys = {
+            "schema_version",
+            "consumer_id",
+            "operation",
+            "candidate",
+            "candidate_install_paths",
+            "candidate_manifest_paths",
+            "prior_state",
+            "active_preimage",
+            "manifest_preimage",
+            "install_preimage",
+            "release_preexisting",
+            "release_staging_path",
+        }
+        legacy_journal = (
+            type(journal.get("schema_version")) is int
+            and journal.get("schema_version") == 2
+            and set(journal) == journal_keys
+        )
+        stopped_rebind_journal = (
+            type(journal.get("schema_version")) is int
+            and journal.get("schema_version") == 3
+            and set(journal) == journal_keys | {"restore_prior_services"}
+            and journal.get("operation") == "upgrade"
+            and journal.get("restore_prior_services") is False
+        )
         if (
-            set(journal)
-            != {
-                "schema_version",
-                "consumer_id",
-                "operation",
-                "candidate",
-                "candidate_install_paths",
-                "candidate_manifest_paths",
-                "prior_state",
-                "active_preimage",
-                "manifest_preimage",
-                "install_preimage",
-                "release_preexisting",
-                "release_staging_path",
-            }
-            or type(journal.get("schema_version")) is not int
-            or journal.get("schema_version") != 2
+            not (legacy_journal or stopped_rebind_journal)
             or journal.get("consumer_id") != self.config.consumer_id
             or journal.get("operation") not in {"install", "upgrade", "rollback"}
             or not isinstance(journal.get("candidate"), Mapping)
             or not isinstance(journal.get("release_preexisting"), bool)
         ):
             raise PortableInstallError("installation transaction identity is invalid")
+        restore_prior_services = journal.get("restore_prior_services", True)
         current_state = self._load_state()
         candidate = journal["candidate"]
         candidate_root = _release_record_root(self.config.install_root, candidate)
@@ -3633,11 +4661,17 @@ class PortableInstallationManager:
             self._remove_release_record(candidate)
         if prior_manager is None:
             raise PortableInstallError("installation transaction prestate is invalid")
-        prior_manager._activate_services()
-        prior_manager._verify_service_manager()
-        if not prior_manager._health(prior["current"]):
-            raise PortableInstallError(
-                "interrupted installation recovery health check failed"
+        if restore_prior_services:
+            prior_manager._activate_services(retry_bootstrap_after_stop=True)
+            prior_manager._verify_service_manager()
+            if not prior_manager._health(prior["current"]):
+                raise PortableInstallError(
+                    "interrupted installation recovery health check failed"
+                )
+        else:
+            self._require_launchd_services_absent_for_rebind_upgrade(
+                prior_manager,
+                wait_for_absence=True,
             )
         prior_manager._verify_installed_locked(prior)
         self._clear_transaction()
@@ -3677,7 +4711,9 @@ class PortableInstallationManager:
         *,
         operation: str,
         expected_current_binding_generation_digest: str | None = None,
+        verified_rebind_plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._preflight_managed_profile_api_versions()
         self._validate_external_bindings()
         with self._lock():
             self._recover_pending_locked()
@@ -3706,6 +4742,7 @@ class PortableInstallationManager:
                 raise PortableInstallError("upgrade requires an existing installation")
             external_bindings = self._validate_external_bindings()
             data_identity = self._prepare_data_identity(initial=prior is None)
+            restore_prior_services = True
             if prior is not None:
                 self._verify_installed_locked(prior)
                 installed_manager = self._installed_manager(prior)
@@ -3717,12 +4754,30 @@ class PortableInstallationManager:
                     )
                 if data_identity != prior["data_identity_digest"]:
                     raise PortableInstallError("data identity changed")
-                installed_manager._preflight_service_manager()
                 self._preflight_added_service_manager(installed_manager.config)
-                installed_manager._verify_service_manager()
-                if not installed_manager._health(prior["current"]):
-                    raise PortableInstallError("health verification failed")
+                if verified_rebind_plan is None:
+                    installed_manager._preflight_service_manager()
+                    installed_manager._verify_service_manager()
+                    if not installed_manager._health(prior["current"]):
+                        raise PortableInstallError("health verification failed")
+                else:
+                    if operation != "upgrade":
+                        raise PortableInstallError(
+                            "verified rebind handoff is valid only for upgrade"
+                        )
+                    self._validate_verified_rebind_upgrade_handoff(
+                        verified_rebind_plan,
+                        prior,
+                    )
+                    self._require_launchd_services_absent_for_rebind_upgrade(
+                        installed_manager
+                    )
+                    restore_prior_services = False
             else:
+                if verified_rebind_plan is not None:
+                    raise PortableInstallError(
+                        "verified rebind handoff requires an existing installation"
+                    )
                 self._preflight_service_manager(require_absent=True)
             if prior is None:
                 if self.config.install_root.exists() and any(
@@ -3742,7 +4797,10 @@ class PortableInstallationManager:
             )
             if release_staging.exists() or release_staging.is_symlink():
                 raise PortableInstallError("release staging path already exists")
-            launcher_payloads = self._launcher_payloads(external_bindings)
+            launcher_payloads = self._launcher_payloads(
+                external_bindings,
+                release,
+            )
             launcher_owned = {
                 str(path): hashlib.sha256(content).hexdigest()
                 for path, content in launcher_payloads.items()
@@ -3784,7 +4842,7 @@ class PortableInstallationManager:
                 },
             }
             journal = {
-                "schema_version": 2,
+                "schema_version": 2 if restore_prior_services else 3,
                 "consumer_id": self.config.consumer_id,
                 "operation": operation,
                 "candidate": release,
@@ -3803,10 +4861,14 @@ class PortableInstallationManager:
                 "release_preexisting": release_preexisting,
                 "release_staging_path": str(release_staging),
             }
+            if not restore_prior_services:
+                journal["restore_prior_services"] = False
             _atomic_json(self._transaction_path, journal)
             try:
                 if prior is not None:
-                    installed_manager._deactivate_services()
+                    installed_manager._deactivate_services(
+                        absent_ok=not restore_prior_services
+                    )
                 self._publish_release_record(release_root, release, release_staging)
                 if self._install_launchers(launcher_payloads) != launcher_owned:
                     raise PortableInstallError("installed launcher digest mismatch")
@@ -3823,7 +4885,9 @@ class PortableInstallationManager:
                 )
                 if self._prepare_data_identity(initial=False) != data_identity:
                     raise PortableInstallError("data identity changed")
-                self._activate_services()
+                self._activate_services(
+                    retry_bootstrap_after_stop=prior is not None
+                )
                 self._verify_service_manager()
                 if not self._health(release):
                     raise PortableInstallError("health verification failed")
@@ -3861,6 +4925,7 @@ class PortableInstallationManager:
         *,
         version: str,
         expected_current_binding_generation_digest: str,
+        verified_rebind_plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._preflight_lifecycle()
         if SHA256.fullmatch(expected_current_binding_generation_digest) is None:
@@ -3874,6 +4939,7 @@ class PortableInstallationManager:
             expected_current_binding_generation_digest=(
                 expected_current_binding_generation_digest
             ),
+            verified_rebind_plan=verified_rebind_plan,
         )
 
     def _verify_release(self, release: Mapping[str, Any]) -> None:
@@ -4082,7 +5148,12 @@ class PortableInstallationManager:
             inventory_bytes=inventory_bytes,
         )
 
-    def _verify_installed_locked(self, state: Mapping[str, Any]) -> dict[str, Any]:
+    def _verify_installed_locked(
+        self,
+        state: Mapping[str, Any],
+        *,
+        expected_data_identity_digest: str | None = None,
+    ) -> dict[str, Any]:
         if state.get("transaction") is not None:
             raise PortableInstallError("installation transaction is pending")
         installed = self._installed_manager(state)
@@ -4097,7 +5168,12 @@ class PortableInstallationManager:
         ):
             raise PortableInstallError("installed consumer configuration differs")
         data_identity = installed._prepare_data_identity(initial=False)
-        if data_identity != state.get("data_identity_digest"):
+        bound_data_identity = (
+            state.get("data_identity_digest")
+            if expected_data_identity_digest is None
+            else expected_data_identity_digest
+        )
+        if data_identity != bound_data_identity:
             raise PortableInstallError("data identity changed")
         current = state.get("current")
         if not isinstance(current, Mapping):
@@ -4158,8 +5234,1514 @@ class PortableInstallationManager:
             raise PortableInstallError("installed consumer binding differs")
         return verification
 
+    @property
+    def _data_identity_rebind_root(self) -> Path:
+        # Rebind artifacts are immutable recovery evidence. They are
+        # intentionally not auto-pruned while an installation may still need
+        # rollback or audit; lifecycle closeout owns any later retention policy.
+        return self.config.state_root / "data-identity-rebind"
+
+    @staticmethod
+    def _rebind_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_uid,
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_nlink,
+        )
+
+    def _open_rebind_install_root(self) -> tuple[int, tuple[int, int]]:
+        _safe_directory(
+            self.config.install_root,
+            "portable install root",
+            create=False,
+            private_final=True,
+        )
+        descriptor = os.open(
+            self.config.install_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            observed = self.config.install_root.lstat()
+            identity = (metadata.st_dev, metadata.st_ino)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077
+                or (observed.st_dev, observed.st_ino) != identity
+            ):
+                raise PortableInstallError(
+                    "portable install root changed during inspection"
+                )
+            return descriptor, identity
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _verify_rebind_install_root(
+        self,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        try:
+            metadata = os.fstat(descriptor)
+            observed = self.config.install_root.lstat()
+        except OSError as error:
+            raise PortableInstallError(
+                "portable install root changed during rebind"
+            ) from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or (metadata.st_dev, metadata.st_ino) != expected_identity
+            or (observed.st_dev, observed.st_ino) != expected_identity
+        ):
+            raise PortableInstallError(
+                "portable install root changed during rebind"
+            )
+
+    def _snapshot_rebind_entry_at(
+        self,
+        directory_descriptor: int,
+        name: str,
+        label: str,
+    ) -> tuple[bytes, tuple[int, ...]]:
+        descriptor = -1
+        try:
+            before = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 16 * 1024 * 1024:
+                    raise PortableInstallError(f"{label} is too large")
+                chunks.append(chunk)
+            after = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            before_identity = self._rebind_file_identity(before)
+            opened_identity = self._rebind_file_identity(opened)
+            after_identity = self._rebind_file_identity(after)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or before_identity != opened_identity
+                or opened_identity != after_identity
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_nlink != 1
+            ):
+                raise PortableInstallError(
+                    f"{label} entry changed during inspection"
+                )
+            return b"".join(chunks), after_identity
+        except PortableInstallError:
+            raise
+        except OSError as error:
+            raise PortableInstallError(f"{label} is unavailable") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _snapshot_rebind_state_entry(
+        self,
+    ) -> tuple[bytes, tuple[int, ...], tuple[int, int]]:
+        root_descriptor, root_identity = self._open_rebind_install_root()
+        try:
+            content, entry_identity = self._snapshot_rebind_entry_at(
+                root_descriptor,
+                self._state_path.name,
+                "installation state",
+            )
+            self._verify_rebind_install_root(root_descriptor, root_identity)
+            return content, entry_identity, root_identity
+        finally:
+            os.close(root_descriptor)
+
+    def _cas_rebind_state(
+        self,
+        *,
+        expected: bytes,
+        expected_entry_identity: tuple[int, ...],
+        expected_root_identity: tuple[int, int],
+        replacement: bytes,
+        mismatch_message: str,
+    ) -> tuple[tuple[int, ...], bool]:
+        root_descriptor, root_identity = self._open_rebind_install_root()
+        descriptor = -1
+        stage_name = ""
+        stage_path: Path | None = None
+        created_identity: tuple[int, int] | None = None
+        exchange_occurred = False
+        try:
+            if root_identity != expected_root_identity:
+                raise PortableInstallError(mismatch_message)
+            current, current_identity = self._snapshot_rebind_entry_at(
+                root_descriptor,
+                self._state_path.name,
+                "installation state",
+            )
+            self._verify_rebind_install_root(root_descriptor, root_identity)
+            if current != expected or current_identity != expected_entry_identity:
+                raise PortableInstallError(mismatch_message)
+            for _attempt in range(128):
+                stage_name = (
+                    f".{self._state_path.name}.rebind.{secrets.token_hex(16)}"
+                )
+                try:
+                    descriptor = os.open(
+                        stage_name,
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=root_descriptor,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise PortableInstallError(
+                    "cannot allocate installer-state exchange stage"
+                )
+            stage_path = self.config.install_root / stage_name
+            created_metadata = os.fstat(descriptor)
+            created_identity = (created_metadata.st_dev, created_metadata.st_ino)
+            try:
+                os.fchmod(descriptor, 0o600)
+                offset = 0
+                while offset < len(replacement):
+                    written = os.write(descriptor, replacement[offset:])
+                    if written <= 0:
+                        raise OSError("short write")
+                    offset += written
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+                descriptor = -1
+            self._verify_rebind_install_root(root_descriptor, root_identity)
+            _fsync_directory(root_descriptor)
+            self._verify_rebind_install_root(root_descriptor, root_identity)
+            candidate, candidate_identity = self._snapshot_rebind_entry_at(
+                root_descriptor,
+                stage_name,
+                "staged installation state",
+            )
+            if candidate != replacement:
+                raise PortableInstallError(
+                    "staged installation state publication differs"
+                )
+            try:
+                _atomic_exchange(
+                    _AnchoredExchangeEntry(
+                        root_descriptor,
+                        self._state_path.name,
+                    ),
+                    _AnchoredExchangeEntry(root_descriptor, stage_name),
+                )
+                exchange_occurred = True
+            except BaseException as exchange_error:
+                self._verify_rebind_install_root(root_descriptor, root_identity)
+                observed, observed_identity = self._snapshot_rebind_entry_at(
+                    root_descriptor,
+                    self._state_path.name,
+                    "installation state",
+                )
+                if (
+                    observed != expected
+                    or observed_identity != expected_entry_identity
+                ):
+                    raise PortableInstallError(
+                        "installation state diverged before atomic exchange"
+                    ) from exchange_error
+                raise PortableInstallError(
+                    "atomic installer-state exchange failed"
+                ) from exchange_error
+            try:
+                self._verify_rebind_install_root(root_descriptor, root_identity)
+                _fsync_directory(root_descriptor)
+                self._verify_rebind_install_root(root_descriptor, root_identity)
+            except BaseException as durability_error:
+                raise PortableInstallError(
+                    "installer-state exchange is uncertain; preserve "
+                    f"{stage_path}"
+                ) from durability_error
+
+            installed, installed_identity = self._snapshot_rebind_entry_at(
+                root_descriptor,
+                self._state_path.name,
+                "installation state",
+            )
+            displaced, displaced_identity = self._snapshot_rebind_entry_at(
+                root_descriptor,
+                stage_name,
+                "displaced installation state",
+            )
+            self._verify_rebind_install_root(root_descriptor, root_identity)
+            candidate_installed = (
+                installed == candidate and installed_identity == candidate_identity
+            )
+            expected_displaced = (
+                displaced == expected
+                and displaced_identity == expected_entry_identity
+            )
+            if candidate_installed and expected_displaced:
+                try:
+                    self._verify_rebind_install_root(root_descriptor, root_identity)
+                    os.unlink(stage_name, dir_fd=root_descriptor)
+                except BaseException as cleanup_error:
+                    raise PortableInstallError(
+                        "installer-state exchange is uncertain; preserve "
+                        f"{stage_path}"
+                    ) from cleanup_error
+                try:
+                    _fsync_directory(root_descriptor)
+                except BaseException:
+                    self._verify_rebind_install_root(
+                        root_descriptor,
+                        root_identity,
+                    )
+                    return installed_identity, True
+                self._verify_rebind_install_root(root_descriptor, root_identity)
+                return installed_identity, False
+
+            current_installed, current_installed_identity = (
+                self._snapshot_rebind_entry_at(
+                    root_descriptor,
+                    self._state_path.name,
+                    "installation state",
+                )
+            )
+            current_displaced, current_displaced_identity = (
+                self._snapshot_rebind_entry_at(
+                    root_descriptor,
+                    stage_name,
+                    "displaced installation state",
+                )
+            )
+            self._verify_rebind_install_root(root_descriptor, root_identity)
+            if (
+                current_installed == candidate
+                and current_installed_identity == candidate_identity
+                and current_displaced == displaced
+                and current_displaced_identity == displaced_identity
+            ):
+                try:
+                    _atomic_exchange(
+                        _AnchoredExchangeEntry(
+                            root_descriptor,
+                            self._state_path.name,
+                        ),
+                        _AnchoredExchangeEntry(root_descriptor, stage_name),
+                    )
+                except BaseException as exchange_error:
+                    raise PortableInstallError(
+                        "installer-state exchange is uncertain; preserve "
+                        f"{stage_path}"
+                    ) from exchange_error
+                try:
+                    self._verify_rebind_install_root(root_descriptor, root_identity)
+                    _fsync_directory(root_descriptor)
+                    self._verify_rebind_install_root(root_descriptor, root_identity)
+                except BaseException as durability_error:
+                    raise PortableInstallError(
+                        "installer-state exchange is uncertain; preserve "
+                        f"{stage_path}"
+                    ) from durability_error
+                restored, restored_identity = self._snapshot_rebind_entry_at(
+                    root_descriptor,
+                    self._state_path.name,
+                    "installation state",
+                )
+                restaged, restaged_identity = self._snapshot_rebind_entry_at(
+                    root_descriptor,
+                    stage_name,
+                    "restaged installation state",
+                )
+                self._verify_rebind_install_root(root_descriptor, root_identity)
+                if (
+                    restored == displaced
+                    and restored_identity == displaced_identity
+                    and restaged == candidate
+                    and restaged_identity == candidate_identity
+                ):
+                    try:
+                        os.unlink(stage_name, dir_fd=root_descriptor)
+                    except BaseException as cleanup_error:
+                        raise PortableInstallError(
+                            "installer-state exchange was restored with cleanup "
+                            f"pending; preserve {stage_path}"
+                        ) from cleanup_error
+                    try:
+                        _fsync_directory(root_descriptor)
+                        self._verify_rebind_install_root(
+                            root_descriptor,
+                            root_identity,
+                        )
+                    except BaseException:
+                        raise PortableInstallError(
+                            "installer-state exchange was restored with "
+                            "cleanup durability uncertain"
+                        ) from None
+                    raise PortableInstallError(mismatch_message)
+            raise PortableInstallError(
+                f"installer-state exchange is uncertain; preserve {stage_path}"
+            )
+        except BaseException:
+            if (
+                not exchange_occurred
+                and stage_name
+                and created_identity is not None
+            ):
+                try:
+                    self._verify_rebind_install_root(root_descriptor, root_identity)
+                    metadata = os.stat(
+                        stage_name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (metadata.st_dev, metadata.st_ino) == created_identity:
+                        os.unlink(stage_name, dir_fd=root_descriptor)
+                        _fsync_directory(root_descriptor)
+                        self._verify_rebind_install_root(
+                            root_descriptor,
+                            root_identity,
+                        )
+                except BaseException:
+                    pass
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(root_descriptor)
+
+    def _data_identity_profile(self) -> str:
+        binding = self._component_desired_state_binding()
+        if binding is None or len(binding[1]) != 1:
+            raise PortableInstallError(
+                "data-identity rebind requires exactly one managed profile"
+            )
+        return binding[1][0]
+
+    def _require_quiescent_rebind_state_locked(
+        self,
+    ) -> tuple[
+        dict[str, Any],
+        bytes,
+        tuple[int, ...],
+        tuple[int, int],
+    ] | None:
+        """Snapshot and parse installer state without lifecycle recovery."""
+        if any(
+            path.exists() or path.is_symlink()
+            for path in (
+                self._transaction_path,
+                self._uninstall_transaction_path,
+            )
+        ):
+            raise PortableInstallError(
+                "data-identity rebind requires quiescent installer state"
+            )
+        if (
+            self._binding_migration_path.exists()
+            or self._binding_migration_path.is_symlink()
+        ):
+            raise PortableInstallError(
+                "data-identity rebind requires completed binding migration"
+            )
+        self._require_no_pending_rebind_stages()
+        if not self._state_path.exists():
+            return None
+        state_bytes, state_identity, root_identity = (
+            self._snapshot_rebind_state_entry()
+        )
+        state = _strict_json_mapping(state_bytes, "installation state")
+        if (
+            type(state.get("schema_version")) is not int
+            or state.get("schema_version") != 1
+            or state.get("consumer_id") != self.config.consumer_id
+            or "npx_alias" not in state
+            or not isinstance(state.get("npx_alias"), str)
+            or not Path(state["npx_alias"]).is_absolute()
+        ):
+            raise PortableInstallError(
+                "data-identity rebind requires completed binding migration"
+            )
+        if state is not None and state.get("transaction") is not None:
+            raise PortableInstallError(
+                "data-identity rebind requires quiescent installer state"
+            )
+        return state, state_bytes, state_identity, root_identity
+
+    def _validate_rebind_authority(self, plan: Mapping[str, Any]) -> None:
+        if (
+            plan["consumer_id"] != self.config.consumer_id
+            or plan["profile_id"] != self._data_identity_profile()
+        ):
+            raise PortableInstallError("data-identity rebind plan authority differs")
+
+    @staticmethod
+    def _read_rebind_artifact(path: Path, label: str) -> dict[str, Any]:
+        return _strict_json_mapping(_snapshot_regular_file(path, label), label)
+
+    @staticmethod
+    def _rebind_artifact_present(path: Path, label: str) -> bool:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise PortableInstallError(f"{label} is unavailable") from error
+        _snapshot_regular_file(path, label)
+        return True
+
+    def _create_or_match_rebind_artifact(
+        self,
+        path: Path,
+        value: Mapping[str, Any],
+        *,
+        label: str,
+        mismatch_message: str,
+    ) -> None:
+        try:
+            _create_json(path, value)
+            return
+        except _ImmutableArtifactExistsError:
+            pass
+        if self._read_rebind_artifact(path, label) != value:
+            raise PortableInstallError(mismatch_message)
+
+    def _validate_rebind_local_evidence(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        observed_data_identity_digest: str,
+    ) -> None:
+        postgres = evidence["postgres"]
+        try:
+            data_root = self.config.data_root.resolve(strict=True)
+            metadata = data_root.lstat()
+            declared_data_root = Path(postgres["data_root"]).resolve(strict=True)
+            declared_postgres_root = Path(postgres["postgres_data_root"]).resolve(
+                strict=True
+            )
+            postgres_metadata = declared_postgres_root.lstat()
+            backup_root = Path(evidence["backup"]["artifact_root"]).resolve(strict=True)
+            _safe_directory(
+                backup_root,
+                "data-identity backup root",
+                create=False,
+                private_final=True,
+            )
+            backup_metadata = backup_root.lstat()
+            expected_backup_root = (
+                self._data_identity_rebind_root / "backups"
+            ).resolve(strict=True)
+        except OSError as error:
+            raise PortableInstallError(
+                "data-identity evidence data root is unavailable"
+            ) from error
+        if (
+            declared_data_root != data_root
+            or data_root not in declared_postgres_root.parents
+            or postgres["data_root_device"] != metadata.st_dev
+            or postgres["data_root_inode"] != metadata.st_ino
+            or postgres["postgres_data_device"] != postgres_metadata.st_dev
+            or postgres["postgres_data_inode"] != postgres_metadata.st_ino
+            or backup_root != expected_backup_root
+            or evidence["backup"]["artifact_root_device"] != backup_metadata.st_dev
+            or evidence["backup"]["artifact_root_inode"] != backup_metadata.st_ino
+            or observed_data_identity_digest
+            != _data_root_identity_digest(
+                data_root,
+                metadata,
+                platform=self.config.platform,
+            )
+        ):
+            raise PortableInstallError(
+                "data-identity evidence does not describe the configured data root"
+            )
+
+    def _validate_rebind_continuity_evidence(
+        self,
+        plan: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        *,
+        minimum_observed_at: int,
+    ) -> None:
+        database = evidence["database"]
+        if (
+            evidence["profile_id"] != plan["profile_id"]
+            or evidence["postgres"]["system_identifier"]
+            != plan["postgres_system_identifier"]
+            or database["observed_at"] < minimum_observed_at
+            or digest(database_continuity_projection(database))
+            != plan["database_continuity_digest"]
+            or evidence["backup"]["artifact_sha256"] != plan["backup_artifact_digest"]
+            or evidence["safety"]["database_mutation_performed"] is not False
+        ):
+            raise PortableInstallError("data-identity continuity evidence differs")
+        self._validate_rebind_local_evidence(
+            evidence,
+            observed_data_identity_digest=plan["new_data_identity_digest"],
+        )
+
+    def data_identity_rebind_plan(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Build an expiring plan without changing installer or database state."""
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        try:
+            checked_evidence = verify_rebind_evidence(evidence, now=now)
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        with self._lock():
+            state_snapshot = self._require_quiescent_rebind_state_locked()
+            if state_snapshot is None:
+                raise PortableInstallError("installation is absent")
+            state, state_bytes, _state_identity, _root_identity = state_snapshot
+            observed_identity = self._prepare_data_identity(initial=False)
+            if observed_identity == state.get("data_identity_digest"):
+                raise PortableInstallError("data identity is already bound")
+            bindings = self._validate_external_bindings()
+            if state.get("binding_generation_digest") != bindings.generation_digest:
+                raise PortableInstallError("installed consumer binding differs")
+            self._verify_installed_locked(
+                state,
+                expected_data_identity_digest=observed_identity,
+            )
+            profile = self._data_identity_profile()
+            if checked_evidence["profile_id"] != profile:
+                raise PortableInstallError("data-identity evidence profile differs")
+            self._validate_rebind_local_evidence(
+                checked_evidence,
+                observed_data_identity_digest=observed_identity,
+            )
+            prestate_digest = hashlib.sha256(state_bytes).hexdigest()
+            planned_at = int(time.time()) if now is None else now
+            post_state = {**state, "data_identity_digest": observed_identity}
+            post_state_digest = hashlib.sha256(
+                canonical_bytes(post_state) + b"\n"
+            ).hexdigest()
+            authority_id = digest(
+                {
+                    "consumer_id": self.config.consumer_id,
+                    "prestate_digest": prestate_digest,
+                    "post_state_digest": post_state_digest,
+                    "evidence_digest": digest(checked_evidence),
+                    "plan_created_at": planned_at,
+                }
+            )
+            root = self._data_identity_rebind_root
+            try:
+                plan = create_rebind_plan(
+                    consumer_id=self.config.consumer_id,
+                    profile_id=profile,
+                    installation_state_digest=prestate_digest,
+                    expected_post_state_digest=post_state_digest,
+                    old_data_identity_digest=state["data_identity_digest"],
+                    new_data_identity_digest=observed_identity,
+                    current_release_digest=state["current"]["release_digest"],
+                    binding_generation_digest=state["binding_generation_digest"],
+                    evidence=checked_evidence,
+                    rollback_bundle_path=str(
+                        root / "rollback" / f"{authority_id}.json"
+                    ),
+                    authorization_receipt_path=str(
+                        root / "receipts" / f"{authority_id}.json"
+                    ),
+                    application_receipt_path=str(
+                        root / "applications" / f"{authority_id}.json"
+                    ),
+                    verification_receipt_path=str(
+                        root / "verification" / f"{authority_id}.json"
+                    ),
+                    now=planned_at,
+                )
+            except DataIdentityRebindError as error:
+                raise PortableInstallError(str(error)) from error
+            return dict(plan)
+
+    @staticmethod
+    def _rebind_receipt_body(
+        plan: Mapping[str, Any],
+        *,
+        authorized_at: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "action": "authorize-data-identity-rebind",
+            "plan_digest": plan["plan_digest"],
+            "installation_state_digest": plan["installation_state_digest"],
+            "expected_post_state_digest": plan["expected_post_state_digest"],
+            "old_data_identity_digest": plan["old_data_identity_digest"],
+            "new_data_identity_digest": plan["new_data_identity_digest"],
+            "evidence_digest": plan["evidence_digest"],
+            "backup_artifact_digest": plan["backup_artifact_digest"],
+            "authorized_at": authorized_at,
+        }
+
+    @staticmethod
+    def _rebind_rollback_approval(plan: Mapping[str, Any]) -> str:
+        return digest(
+            {
+                "action": "rollback-data-identity",
+                "plan_digest": plan["plan_digest"],
+                "expected_post_state_digest": plan["expected_post_state_digest"],
+            }
+        )
+
+    @staticmethod
+    def _rebind_application_receipt_body(
+        plan: Mapping[str, Any],
+        authorization_receipt: Mapping[str, Any],
+        *,
+        applied_at: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "action": "record-data-identity-rebind-application",
+            "plan_digest": plan["plan_digest"],
+            "expected_post_state_digest": plan["expected_post_state_digest"],
+            "authorization_receipt_digest": authorization_receipt["receipt_digest"],
+            "applied_at": applied_at,
+        }
+
+    def _validate_rebind_application_receipt(
+        self,
+        plan: Mapping[str, Any],
+        authorization_receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        receipt = self._read_rebind_artifact(
+            Path(plan["application_receipt_path"]),
+            "data-identity application receipt",
+        )
+        applied_at = receipt.get("applied_at")
+        if (
+            type(applied_at) is not int
+            or applied_at < authorization_receipt["authorized_at"]
+        ):
+            raise PortableInstallError("data-identity application receipt differs")
+        body = self._rebind_application_receipt_body(
+            plan,
+            authorization_receipt,
+            applied_at=applied_at,
+        )
+        expected = {
+            **body,
+            "application_receipt_digest": digest(body),
+        }
+        if receipt != expected:
+            raise PortableInstallError("data-identity application receipt differs")
+        return receipt
+
+    def _validate_rebind_verification_receipt(
+        self,
+        plan: Mapping[str, Any],
+        application_receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        receipt = self._read_rebind_artifact(
+            Path(plan["verification_receipt_path"]),
+            "data-identity verification receipt",
+        )
+        expected_keys = {
+            "schema_version",
+            "action",
+            "plan_digest",
+            "installation_state_digest",
+            "post_evidence_digest",
+            "postgres_system_identifier",
+            "database_continuity_digest",
+            "verified_at",
+            "verification_receipt_digest",
+        }
+        body = {
+            key: value
+            for key, value in receipt.items()
+            if key != "verification_receipt_digest"
+        }
+        if (
+            set(receipt) != expected_keys
+            or type(receipt.get("schema_version")) is not int
+            or receipt.get("schema_version") != 1
+            or receipt.get("action") != "verify-data-identity-rebind"
+            or receipt.get("plan_digest") != plan["plan_digest"]
+            or receipt.get("installation_state_digest")
+            != plan["expected_post_state_digest"]
+            or not isinstance(receipt.get("post_evidence_digest"), str)
+            or SHA256.fullmatch(receipt["post_evidence_digest"]) is None
+            or receipt.get("postgres_system_identifier")
+            != plan["postgres_system_identifier"]
+            or receipt.get("database_continuity_digest")
+            != plan["database_continuity_digest"]
+            or type(receipt.get("verified_at")) is not int
+            or receipt["verified_at"] < application_receipt["applied_at"]
+            or digest(body) != receipt.get("verification_receipt_digest")
+        ):
+            raise PortableInstallError("data-identity verification receipt differs")
+        return receipt
+
+    def _validate_rebind_authorization_receipt(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        allow_expired: bool = False,
+    ) -> dict[str, Any]:
+        receipt = self._read_rebind_artifact(
+            Path(plan["authorization_receipt_path"]),
+            "data-identity authorization receipt",
+        )
+        authorized_at = receipt.get("authorized_at")
+        if (
+            type(authorized_at) is not int
+            or authorized_at < plan["created_at"]
+            or (
+                not allow_expired
+                and authorized_at >= plan["expires_at"]
+            )
+        ):
+            raise PortableInstallError("data-identity authorization receipt differs")
+        receipt_body = self._rebind_receipt_body(
+            plan,
+            authorized_at=authorized_at,
+        )
+        expected = {
+            **receipt_body,
+            "receipt_digest": digest(receipt_body),
+        }
+        if receipt != expected:
+            raise PortableInstallError("data-identity authorization receipt differs")
+        return receipt
+
+    @staticmethod
+    def _validate_rebind_rollback_bundle(
+        plan: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], bytes]:
+        bundle = PortableInstallationManager._read_rebind_artifact(
+            Path(plan["rollback_bundle_path"]),
+            "data-identity rollback bundle",
+        )
+        expected_keys = {
+            "schema_version",
+            "plan_digest",
+            "installation_state_digest",
+            "expected_post_state_digest",
+            "prior_installation_state",
+            "rollback_bundle_digest",
+        }
+        if (
+            set(bundle) != expected_keys
+            or type(bundle.get("schema_version")) is not int
+            or bundle.get("schema_version") != 1
+            or bundle.get("plan_digest") != plan["plan_digest"]
+            or bundle.get("installation_state_digest")
+            != plan["installation_state_digest"]
+            or bundle.get("expected_post_state_digest")
+            != plan["expected_post_state_digest"]
+            or digest(
+                {key: bundle[key] for key in expected_keys - {"rollback_bundle_digest"}}
+            )
+            != bundle.get("rollback_bundle_digest")
+        ):
+            raise PortableInstallError("data-identity rollback bundle is invalid")
+        try:
+            prior_bytes = base64.b64decode(
+                bundle["prior_installation_state"], validate=True
+            )
+        except (TypeError, ValueError):
+            raise PortableInstallError(
+                "data-identity rollback preimage is invalid"
+            ) from None
+        if hashlib.sha256(prior_bytes).hexdigest() != plan["installation_state_digest"]:
+            raise PortableInstallError("data-identity rollback preimage differs")
+        return bundle, prior_bytes
+
+    def _validate_rebind_paths(self, plan: Mapping[str, Any]) -> None:
+        root = self._data_identity_rebind_root.resolve(strict=False)
+        expected_parents = {
+            "rollback_bundle_path": root / "rollback",
+            "authorization_receipt_path": root / "receipts",
+            "application_receipt_path": root / "applications",
+            "verification_receipt_path": root / "verification",
+        }
+        for field, parent in expected_parents.items():
+            path = Path(plan[field])
+            if (
+                path.parent.resolve(strict=False) != parent
+                or path.suffix != ".json"
+                or not path.name
+            ):
+                raise PortableInstallError(
+                    "data-identity plan artifact path is outside controller state"
+                )
+
+    def _validate_verified_rebind_upgrade_handoff(
+        self,
+        plan_value: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.config.platform != "launchd":
+            raise PortableInstallError(
+                "verified rebind upgrade handoff is supported only on launchd"
+            )
+        try:
+            plan = verify_rebind_plan(plan_value, allow_expired=True)
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        self._validate_rebind_authority(plan)
+        self._validate_rebind_paths(plan)
+        state_bytes = _snapshot_regular_file(
+            self._state_path,
+            "installation state",
+        )
+        if _strict_json_mapping(state_bytes, "installation state") != state:
+            raise PortableInstallError("installation state changed")
+        state_digest = hashlib.sha256(state_bytes).hexdigest()
+        bindings = self._validate_external_bindings()
+        if (
+            state_digest != plan["expected_post_state_digest"]
+            or state.get("transaction") is not None
+            or state.get("data_identity_digest")
+            != plan["new_data_identity_digest"]
+            or state.get("binding_generation_digest")
+            != plan["binding_generation_digest"]
+            or bindings.generation_digest != plan["binding_generation_digest"]
+            or state.get("current", {}).get("release_digest")
+            != plan["current_release_digest"]
+        ):
+            raise PortableInstallError(
+                "verified rebind upgrade handoff does not match installation state"
+            )
+        self._validate_rebind_rollback_bundle(plan)
+        # An already-applied rebind remains the installation's authority after
+        # its planning window closes.  Historical operation-recovery evidence
+        # must therefore validate the receipt without reopening that window;
+        # mutating rebind paths continue to use the default, fail-closed check.
+        authorization = self._validate_rebind_authorization_receipt(
+            plan,
+            allow_expired=True,
+        )
+        application = self._validate_rebind_application_receipt(
+            plan,
+            authorization,
+        )
+        self._validate_rebind_verification_receipt(plan, application)
+        return plan
+
+    @staticmethod
+    def _require_launchd_services_absent_for_rebind_upgrade(
+        installed_manager: "PortableInstallationManager",
+        *,
+        wait_for_absence: bool = False,
+    ) -> None:
+        deadline = time.monotonic() + (
+            LAUNCHD_EXIT_TIMEOUT_SECONDS if wait_for_absence else 0
+        )
+        while True:
+            loaded = False
+            for item in (
+                *installed_manager.config.services,
+                *installed_manager.config.timers,
+            ):
+                manifest = (
+                    installed_manager.config.service_root / f"{item.label}.plist"
+                )
+                if (
+                    installed_manager._launchd_loaded_manifest(item.label, manifest)
+                    is not None
+                ):
+                    loaded = True
+            if not loaded:
+                return
+            remaining = deadline - time.monotonic()
+            if not wait_for_absence or remaining <= 0:
+                raise PortableInstallError(
+                    "verified rebind upgrade requires managed launchd jobs absent"
+                )
+            time.sleep(min(LAUNCHD_SERVICE_START_POLL_SECONDS, remaining))
+
+    def _resume_applied_rebind(
+        self,
+        plan: Mapping[str, Any],
+        state: Mapping[str, Any],
+        state_digest: str,
+        *,
+        recovered_at: int,
+    ) -> dict[str, Any] | None:
+        if (
+            state_digest != plan["expected_post_state_digest"]
+            or state.get("data_identity_digest") != plan["new_data_identity_digest"]
+        ):
+            return None
+        self._validate_rebind_rollback_bundle(plan)
+        authorization = self._validate_rebind_authorization_receipt(plan)
+        application_path = Path(plan["application_receipt_path"])
+        if self._rebind_artifact_present(
+            application_path,
+            "data-identity application receipt",
+        ):
+            application = self._validate_rebind_application_receipt(
+                plan,
+                authorization,
+            )
+        else:
+            body = self._rebind_application_receipt_body(
+                plan,
+                authorization,
+                applied_at=recovered_at,
+            )
+            proposed = {
+                **body,
+                "application_receipt_digest": digest(body),
+            }
+            try:
+                _create_json(application_path, proposed)
+                application = proposed
+            except _ImmutableArtifactExistsError:
+                application = self._validate_rebind_application_receipt(
+                    plan,
+                    authorization,
+                )
+        return {
+            "status": "already-applied",
+            "plan_digest": plan["plan_digest"],
+            "data_identity_digest": state["data_identity_digest"],
+            "application_receipt_digest": application["application_receipt_digest"],
+        }
+
+    def _validate_rebind_prestate(
+        self,
+        plan: Mapping[str, Any],
+        state: Mapping[str, Any],
+        state_digest: str,
+    ) -> str:
+        if state_digest != plan["installation_state_digest"]:
+            raise PortableInstallError("installation state changed after planning")
+        if (
+            state.get("transaction") is not None
+            or state.get("data_identity_digest") != plan["old_data_identity_digest"]
+            or state["current"]["release_digest"] != plan["current_release_digest"]
+            or state["binding_generation_digest"] != plan["binding_generation_digest"]
+        ):
+            raise PortableInstallError("data-identity rebind prestate differs")
+        bindings = self._validate_external_bindings()
+        if (
+            bindings.generation_digest != plan["binding_generation_digest"]
+            or state["binding_generation_digest"] != bindings.generation_digest
+        ):
+            raise PortableInstallError("installed consumer binding differs")
+        observed_identity = self._prepare_data_identity(initial=False)
+        if observed_identity != plan["new_data_identity_digest"]:
+            raise PortableInstallError("data identity changed after planning")
+        self._verify_installed_locked(
+            state,
+            expected_data_identity_digest=observed_identity,
+        )
+        return observed_identity
+
+    def data_identity_rebind_apply(
+        self,
+        plan_value: Mapping[str, Any],
+        *,
+        approval_digest: str,
+        pre_apply_evidence_value: Mapping[str, Any],
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """CAS-rebind installer identity; never mutate the database or services.
+
+        ``approval_digest`` is a deterministic operator-intent confirmation
+        equal to the plan digest, not an authorization credential. A separate
+        out-of-band secret would be required to turn this local-user surface
+        into an access-control boundary.
+        """
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        try:
+            plan = verify_rebind_plan(plan_value, now=now)
+            pre_apply_evidence = verify_rebind_evidence(
+                pre_apply_evidence_value,
+                now=now,
+            )
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        if (
+            not isinstance(approval_digest, str)
+            or SHA256.fullmatch(approval_digest) is None
+        ):
+            raise PortableInstallError(
+                "data-identity rebind approval digest is invalid"
+            )
+        if not hmac.compare_digest(
+            approval_digest.encode("utf-8"),
+            plan["plan_digest"].encode("ascii"),
+        ):
+            raise PortableInstallError("data-identity rebind approval digest differs")
+        self._validate_rebind_authority(plan)
+        self._validate_rebind_paths(plan)
+        rollback_path = Path(plan["rollback_bundle_path"])
+        receipt_path = Path(plan["authorization_receipt_path"])
+        application_path = Path(plan["application_receipt_path"])
+        with self._lock():
+            # The plan may have expired while this process waited for the
+            # controller lock. Revalidate at the mutation boundary.
+            authorized_at = int(time.time()) if now is None else now
+            try:
+                plan = verify_rebind_plan(plan, now=authorized_at)
+                pre_apply_evidence = verify_rebind_evidence(
+                    pre_apply_evidence,
+                    now=authorized_at,
+                )
+            except DataIdentityRebindError as error:
+                raise PortableInstallError(str(error)) from error
+            state_snapshot = self._require_quiescent_rebind_state_locked()
+            if state_snapshot is None:
+                raise PortableInstallError("installation is absent")
+            state, state_bytes, _state_identity, _root_identity = state_snapshot
+            state_digest = hashlib.sha256(state_bytes).hexdigest()
+            if (
+                state_digest == plan["expected_post_state_digest"]
+                and state.get("data_identity_digest")
+                == plan["new_data_identity_digest"]
+            ):
+                self._validate_rebind_continuity_evidence(
+                    plan,
+                    pre_apply_evidence,
+                    minimum_observed_at=plan["created_at"],
+                )
+            resumed = self._resume_applied_rebind(
+                plan,
+                state,
+                state_digest,
+                recovered_at=authorized_at,
+            )
+            if resumed is not None:
+                return resumed
+            if self._rebind_artifact_present(
+                application_path,
+                "data-identity application receipt",
+            ):
+                raise PortableInstallError(
+                    "data-identity application receipt exists before applied state"
+                )
+            observed_identity = self._validate_rebind_prestate(
+                plan,
+                state,
+                state_digest,
+            )
+            self._validate_rebind_continuity_evidence(
+                plan,
+                pre_apply_evidence,
+                minimum_observed_at=plan["created_at"],
+            )
+            rollback_body = {
+                "schema_version": 1,
+                "plan_digest": plan["plan_digest"],
+                "installation_state_digest": plan["installation_state_digest"],
+                "expected_post_state_digest": plan["expected_post_state_digest"],
+                "prior_installation_state": base64.b64encode(state_bytes).decode(
+                    "ascii"
+                ),
+            }
+            rollback = {
+                **rollback_body,
+                "rollback_bundle_digest": digest(rollback_body),
+            }
+            receipt_body = self._rebind_receipt_body(
+                plan,
+                authorized_at=authorized_at,
+            )
+            proposed_receipt = {
+                **receipt_body,
+                "receipt_digest": digest(receipt_body),
+            }
+            self._create_or_match_rebind_artifact(
+                rollback_path,
+                rollback,
+                label="data-identity rollback bundle",
+                mismatch_message="data-identity rollback bundle differs",
+            )
+            try:
+                _create_json(receipt_path, proposed_receipt)
+                receipt = proposed_receipt
+            except _ImmutableArtifactExistsError:
+                # A publication failure deliberately preserves the first
+                # approval receipt. Later retries validate and reuse it rather
+                # than minting a different authorization time.
+                receipt = self._validate_rebind_authorization_receipt(plan)
+            state_publication_attempted = False
+            try:
+                try:
+                    verify_rebind_backup_artifact(plan["backup"])
+                except DataIdentityRebindError as error:
+                    raise PortableInstallError(str(error)) from error
+                mutation_time = int(time.time()) if now is None else now
+                try:
+                    plan = verify_rebind_plan(plan, now=mutation_time)
+                    pre_apply_evidence = verify_rebind_evidence(
+                        pre_apply_evidence,
+                        now=mutation_time,
+                        verify_artifact=False,
+                    )
+                except DataIdentityRebindError as error:
+                    raise PortableInstallError(str(error)) from error
+                self._validate_rebind_continuity_evidence(
+                    plan,
+                    pre_apply_evidence,
+                    minimum_observed_at=plan["created_at"],
+                )
+                final_snapshot = self._require_quiescent_rebind_state_locked()
+                if final_snapshot is None:
+                    raise PortableInstallError("installation is absent")
+                (
+                    final_state,
+                    final_state_bytes,
+                    final_state_identity,
+                    final_root_identity,
+                ) = final_snapshot
+                observed_identity = self._validate_rebind_prestate(
+                    plan,
+                    final_state,
+                    hashlib.sha256(final_state_bytes).hexdigest(),
+                )
+                post_state = {
+                    **final_state,
+                    "data_identity_digest": observed_identity,
+                }
+                post_state_bytes = canonical_bytes(post_state) + b"\n"
+                if (
+                    hashlib.sha256(post_state_bytes).hexdigest()
+                    != plan["expected_post_state_digest"]
+                ):
+                    raise PortableInstallError(
+                        "data-identity rebind poststate differs from approved plan"
+                    )
+                post_state_identity, cleanup_uncertain = self._cas_rebind_state(
+                    expected=final_state_bytes,
+                    expected_entry_identity=final_state_identity,
+                    expected_root_identity=final_root_identity,
+                    replacement=post_state_bytes,
+                    mismatch_message="installation state changed after planning",
+                )
+                state_publication_attempted = True
+                applied_at = int(time.time()) if now is None else now
+                application_body = self._rebind_application_receipt_body(
+                    plan,
+                    receipt,
+                    applied_at=applied_at,
+                )
+                application_receipt = {
+                    **application_body,
+                    "application_receipt_digest": digest(application_body),
+                }
+                self._create_or_match_rebind_artifact(
+                    application_path,
+                    application_receipt,
+                    label="data-identity application receipt",
+                    mismatch_message=("data-identity application receipt differs"),
+                )
+            except BaseException as apply_error:
+                # Preserve the matching authorization receipt and rollback
+                # preimage so the same approved plan can resume safely.
+                if state_publication_attempted:
+                    try:
+                        _restored_identity, recovery_cleanup_uncertain = (
+                            self._cas_rebind_state(
+                                expected=post_state_bytes,
+                                expected_entry_identity=post_state_identity,
+                                expected_root_identity=final_root_identity,
+                                replacement=state_bytes,
+                                mismatch_message=(
+                                    "installation state diverged before rebind recovery"
+                                ),
+                            )
+                        )
+                    except BaseException as recovery_error:
+                        raise PortableInstallError(
+                            "data-identity rebind failed and state recovery was refused"
+                        ) from recovery_error
+                    if recovery_cleanup_uncertain:
+                        apply_error.add_note(
+                            "The installer state was restored, but stage cleanup "
+                            "durability is uncertain."
+                        )
+                raise
+            return {
+                "status": (
+                    "applied-cleanup-uncertain"
+                    if cleanup_uncertain
+                    else "applied"
+                ),
+                "plan_digest": plan["plan_digest"],
+                "data_identity_digest": observed_identity,
+                "authorization_receipt_digest": receipt["receipt_digest"],
+                "application_receipt_digest": application_receipt[
+                    "application_receipt_digest"
+                ],
+                "rollback_bundle_digest": rollback["rollback_bundle_digest"],
+            }
+
+    def data_identity_rebind_status(
+        self,
+        plan_value: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        try:
+            plan = verify_rebind_plan(plan_value, allow_expired=True)
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        self._validate_rebind_authority(plan)
+        self._validate_rebind_paths(plan)
+        with self._lock():
+            state_snapshot = self._require_quiescent_rebind_state_locked()
+            if state_snapshot is None:
+                raise PortableInstallError("installation is absent")
+            state, state_bytes, _state_identity, _root_identity = state_snapshot
+            state_digest = hashlib.sha256(state_bytes).hexdigest()
+            if state_digest == plan["installation_state_digest"]:
+                status = "awaiting-approval"
+            elif state_digest == plan["expected_post_state_digest"]:
+                status = "applied"
+            else:
+                status = "diverged"
+            rollback_authorization_digest = self._rebind_rollback_approval(plan)
+            return {
+                "status": status,
+                "plan_digest": plan["plan_digest"],
+                "installation_state_digest": state_digest,
+                "data_identity_digest": state.get("data_identity_digest"),
+                "authorization_receipt_present": (
+                    self._rebind_artifact_present(
+                        Path(plan["authorization_receipt_path"]),
+                        "data-identity authorization receipt",
+                    )
+                ),
+                "rollback_bundle_present": self._rebind_artifact_present(
+                    Path(plan["rollback_bundle_path"]),
+                    "data-identity rollback bundle",
+                ),
+                "application_receipt_present": (
+                    self._rebind_artifact_present(
+                        Path(plan["application_receipt_path"]),
+                        "data-identity application receipt",
+                    )
+                ),
+                "verification_receipt_present": (
+                    self._rebind_artifact_present(
+                        Path(plan["verification_receipt_path"]),
+                        "data-identity verification receipt",
+                    )
+                ),
+                "rollback_authorization_digest": rollback_authorization_digest,
+            }
+
+    def data_identity_rebind_verify(
+        self,
+        plan_value: Mapping[str, Any],
+        post_evidence_value: Mapping[str, Any],
+        *,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        try:
+            plan = verify_rebind_plan(plan_value, now=now)
+            post_evidence = verify_rebind_evidence(post_evidence_value, now=now)
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        self._validate_rebind_authority(plan)
+        self._validate_rebind_paths(plan)
+        if (
+            post_evidence["profile_id"] != plan["profile_id"]
+            or post_evidence["postgres"]["system_identifier"]
+            != plan["postgres_system_identifier"]
+            or digest(
+                database_continuity_projection(post_evidence["database"])
+            )
+            != plan["database_continuity_digest"]
+            or post_evidence["safety"]["database_mutation_performed"] is not False
+        ):
+            raise PortableInstallError(
+                "post-rebind database continuation evidence differs"
+            )
+        with self._lock():
+            verification_time = int(time.time()) if now is None else now
+            try:
+                plan = verify_rebind_plan(plan, now=verification_time)
+                post_evidence = verify_rebind_evidence(
+                    post_evidence,
+                    now=verification_time,
+                )
+            except DataIdentityRebindError as error:
+                raise PortableInstallError(str(error)) from error
+            state_snapshot = self._require_quiescent_rebind_state_locked()
+            if state_snapshot is None:
+                raise PortableInstallError("installation is absent")
+            state, state_bytes, _state_identity, _root_identity = state_snapshot
+            state_digest = hashlib.sha256(state_bytes).hexdigest()
+            if (
+                state_digest != plan["expected_post_state_digest"]
+                or state.get("data_identity_digest") != plan["new_data_identity_digest"]
+            ):
+                raise PortableInstallError("data-identity rebind is not applied")
+            self._validate_rebind_rollback_bundle(plan)
+            authorization = self._validate_rebind_authorization_receipt(plan)
+            application = self._validate_rebind_application_receipt(
+                plan,
+                authorization,
+            )
+            if post_evidence["database"]["observed_at"] <= application["applied_at"]:
+                raise PortableInstallError("post-rebind evidence predates application")
+            self._validate_rebind_local_evidence(
+                post_evidence,
+                observed_data_identity_digest=plan["new_data_identity_digest"],
+            )
+            verification = self._verify_locked(state)
+            try:
+                verify_rebind_backup_artifact(plan["backup"])
+            except DataIdentityRebindError as error:
+                raise PortableInstallError(str(error)) from error
+            verification_time = int(time.time()) if now is None else now
+            try:
+                plan = verify_rebind_plan(plan, now=verification_time)
+                post_evidence = verify_rebind_evidence(
+                    post_evidence,
+                    now=verification_time,
+                    verify_artifact=False,
+                )
+            except DataIdentityRebindError as error:
+                raise PortableInstallError(str(error)) from error
+            receipt_body = {
+                "schema_version": 1,
+                "action": "verify-data-identity-rebind",
+                "plan_digest": plan["plan_digest"],
+                "installation_state_digest": state_digest,
+                "post_evidence_digest": digest(post_evidence),
+                "postgres_system_identifier": plan["postgres_system_identifier"],
+                "database_continuity_digest": plan["database_continuity_digest"],
+                "verified_at": verification_time,
+            }
+            receipt = {
+                **receipt_body,
+                "verification_receipt_digest": digest(receipt_body),
+            }
+            receipt_path = Path(plan["verification_receipt_path"])
+            try:
+                _create_json(receipt_path, receipt)
+            except _ImmutableArtifactExistsError:
+                # The first verification receipt wins: its timestamp and digest
+                # remain stable on idempotent reuse.
+                receipt = self._validate_rebind_verification_receipt(
+                    plan,
+                    application,
+                )
+            return {
+                "status": "verified",
+                "plan_digest": plan["plan_digest"],
+                "verification_receipt_digest": receipt["verification_receipt_digest"],
+                **verification,
+            }
+
+    def data_identity_rebind_rollback(
+        self,
+        plan_value: Mapping[str, Any],
+        *,
+        approval_digest: str,
+    ) -> dict[str, Any]:
+        """Restore the exact pre-rebind installer state, not database content.
+
+        The deterministic approval digest confirms operator intent; it is not
+        a secret or access-control boundary. Restoring the old state deliberately
+        leaves installation health blocked until the original data root is
+        restored or a new re-adoption plan is approved.
+        """
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        try:
+            plan = verify_rebind_plan(plan_value, allow_expired=True)
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        self._validate_rebind_authority(plan)
+        self._validate_rebind_paths(plan)
+        expected_approval = self._rebind_rollback_approval(plan)
+        if (
+            not isinstance(approval_digest, str)
+            or SHA256.fullmatch(approval_digest) is None
+        ):
+            raise PortableInstallError(
+                "data-identity rollback approval digest is invalid"
+            )
+        if not hmac.compare_digest(
+            approval_digest.encode("utf-8"), expected_approval.encode("ascii")
+        ):
+            raise PortableInstallError("data-identity rollback approval digest differs")
+        with self._lock():
+            state_snapshot = self._require_quiescent_rebind_state_locked()
+            if state_snapshot is None:
+                raise PortableInstallError("installation is absent")
+            _state, state_bytes, state_identity, root_identity = state_snapshot
+            if (
+                hashlib.sha256(state_bytes).hexdigest()
+                != plan["expected_post_state_digest"]
+            ):
+                raise PortableInstallError("data-identity rollback prestate differs")
+            _bundle, prior_bytes = self._validate_rebind_rollback_bundle(plan)
+            _restored_identity, cleanup_uncertain = self._cas_rebind_state(
+                expected=state_bytes,
+                expected_entry_identity=state_identity,
+                expected_root_identity=root_identity,
+                replacement=prior_bytes,
+                mismatch_message="data-identity rollback prestate differs",
+            )
+            return {
+                "status": (
+                    "rolled-back-cleanup-uncertain"
+                    if cleanup_uncertain
+                    else "rolled-back"
+                ),
+                "plan_digest": plan["plan_digest"],
+                "installation_state_digest": plan["installation_state_digest"],
+                "data_identity_digest": plan["old_data_identity_digest"],
+                "installation_health": "blocked-pending-data-root-repair",
+                "required_action": (
+                    "restore the original data root or approve a new "
+                    "data-identity re-adoption plan"
+                ),
+            }
+
     def verify(self) -> dict[str, Any]:
         self._preflight_lifecycle()
+        self._preflight_managed_profile_api_versions()
         self._validate_config_source()
         with self._lock():
             self._recover_pending_locked()
@@ -4173,6 +6755,113 @@ class PortableInstallationManager:
                 raise PortableInstallError("health verification failed")
             return {**verification, "managed_health": "healthy"}
 
+    def stop_services(self) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        with self._lock():
+            self._recover_pending_locked()
+            state = self._load_state()
+            if state is None:
+                raise PortableInstallError("installation is absent")
+            verification = self._verify_locked(state)
+            installed = self._installed_manager(state)
+            installed._deactivate_services(absent_ok=True)
+            status = installed._service_manager_status()
+            if any(
+                value != "stopped"
+                for group in status.values()
+                for value in group.values()
+            ):
+                raise PortableInstallError("managed services did not stop")
+            return {
+                "status": "stopped",
+                **status,
+                "current": verification["current"],
+            }
+
+    def service_status(self) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        with self._lock():
+            self._recover_pending_locked()
+            state = self._load_state()
+            if state is None:
+                raise PortableInstallError("installation is absent")
+            verification = self._verify_locked(state)
+            installed = self._installed_manager(state)
+            status = installed._service_manager_status()
+            observed = [
+                value for group in status.values() for value in group.values()
+            ]
+            if observed and all(value == "running" for value in observed):
+                overall = "running"
+            elif all(value == "stopped" for value in observed):
+                overall = "stopped"
+            else:
+                overall = "partial"
+            return {
+                "status": overall,
+                **status,
+                "current": verification["current"],
+            }
+
+    def _set_services_running(
+        self,
+        *,
+        restart_existing: bool,
+    ) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        with self._lock():
+            self._recover_pending_locked()
+            state = self._load_state()
+            if state is None:
+                raise PortableInstallError("installation is absent")
+            verification = self._verify_locked(state)
+            installed = self._installed_manager(state)
+            installed._preflight_managed_profile_api_versions()
+            prior = installed._service_manager_prestate()
+            component_preimage = installed._reset_component_desired_state()
+            try:
+                if restart_existing:
+                    installed._activate_services()
+                else:
+                    installed._start_services_idempotently()
+                installed._verify_service_manager()
+                if not installed._health(state["current"]):
+                    raise PortableInstallError("health verification failed")
+            except BaseException as start_error:
+                rollback_error: BaseException | None = None
+                try:
+                    installed._restore_service_manager_prestate(
+                        prior
+                    )
+                except BaseException as error:
+                    rollback_error = error
+                try:
+                    installed._restore_component_desired_state(component_preimage)
+                except BaseException as error:
+                    rollback_error = rollback_error or error
+                if rollback_error is not None:
+                    start_error.add_note(
+                        "The intentional stop could not be fully restored."
+                    )
+                    raise start_error from rollback_error
+                raise
+            status = installed._service_manager_status()
+            return {
+                "status": "running",
+                **status,
+                "current": verification["current"],
+                "managed_health": "healthy",
+            }
+
+    def start_services(self) -> dict[str, Any]:
+        return self._set_services_running(restart_existing=False)
+
+    def restart_services(self) -> dict[str, Any]:
+        return self._set_services_running(restart_existing=True)
+
     def rollback(self, *, expected_current_digest: str) -> dict[str, Any]:
         self._preflight_lifecycle()
         if SHA256.fullmatch(expected_current_digest) is None:
@@ -4185,6 +6874,7 @@ class PortableInstallationManager:
                 raise PortableInstallError("installation is absent")
             self._verify_installed_locked(state)
             installed = self._installed_manager(state)
+            installed._validate_credential_resolver_binding()
             current = state["current"]
             target = state["last_known_good"]
             if current["release_digest"] != expected_current_digest:
@@ -4223,6 +6913,7 @@ class PortableInstallationManager:
                 },
             )
             try:
+                installed._disable_harness_authority_for_rollback()
                 installed._quiesce_scheduled_jobs()
                 self._write_state(pending_state)
                 _atomic_json(
@@ -4232,7 +6923,7 @@ class PortableInstallationManager:
                         for key in ("version", "release_digest", "release_path")
                     },
                 )
-                installed._activate_services()
+                installed._activate_services(retry_bootstrap_after_stop=True)
                 installed._verify_service_manager()
                 if not installed._health(target):
                     raise PortableInstallError("rollback health verification failed")
@@ -4428,7 +7119,7 @@ class PortableInstallationManager:
         self._restore_manifests(preimage)
         self._verify_installed_locked(state)
         installed = self._installed_manager(state)
-        installed._activate_services()
+        installed._activate_services(retry_bootstrap_after_stop=True)
         installed._verify_service_manager()
         if not installed._health(state["current"]):
             raise PortableInstallError("uninstall recovery health check failed")
@@ -4446,6 +7137,7 @@ class PortableInstallationManager:
                 return {"status": "absent", "data_preserved": True}
             self._verify_installed_locked(state)
             installed = self._installed_manager(state)
+            installed._validate_credential_resolver_binding()
             installed._verify_all_releases(state)
             self._audit_owned_install_tree(state)
             tombstone = self._uninstall_tombstone_path

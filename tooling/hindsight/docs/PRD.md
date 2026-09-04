@@ -517,7 +517,8 @@ raw Hindsight bank selection remains an implementation detail.
 - Supported hosted LLM authentication includes `openai-codex` with an explicitly
   selected Codex model and reasoning effort, and `claude-code` with an explicitly
   selected Claude model and reasoning effort. Other hosted services require
-  Keychain API-key references.
+  protected, abstract API-key references; policy and profile evidence never
+  contain resolved key values.
 - Hosted retrieval candidates include Jina embedding and reranking, OpenAI
   `text-embedding-3-small` plus Jina reranking, and ZeroEntropy embedding and
   reranking. Their readiness includes endpoint, terms, license, and benchmark
@@ -593,12 +594,15 @@ raw Hindsight bank selection remains an implementation detail.
 - Install, upgrade, and rollback are journaled transitions. Failed or
   interrupted activation restores the verified prestate; explicit rollback is
   compare-and-swap bound to the observed active release digest.
-- Managed service manifests contain no resolved secret. A digest-bound,
-  owner- and mode-protected resolver is copied into the private install root,
-  receives opaque locators out of band, and injects the exact values only into
-  the authorized child environment. Credential bindings use a positive set of
-  Hindsight secret destinations and cannot target process-control environment
-  names. The launcher runs under the configured Python with isolated mode.
+- Managed service manifests contain no resolved secret. The installer keeps a
+  protected copy of the digest-bound resolver as ownership and rollback
+  evidence, while every managed launch revalidates and executes the exact
+  configured resolver path so native credential-store ACLs remain authoritative.
+  The resolver receives opaque locators out of band and injects the exact values
+  only into the authorized child environment. Credential bindings use a positive
+  set of Hindsight secret destinations and cannot target process-control
+  environment names. The launcher runs under the configured Python with isolated
+  mode.
 - A launchd integration job checks compatible harness integration upgrades when
   loaded and daily. A systemd-user timer checks two minutes after its user
   manager starts and daily. Hindsight server, database, provider, embedding,
@@ -806,9 +810,9 @@ raw Hindsight bank selection remains an implementation detail.
   no-authorization rules.
 - Directives affect `reflect` only. Equivalent invariants are enforced in the
   controller and adapters for recall, retain, injection, and projection.
-- Native Hindsight audit logging is disabled because it stores request and
-  response bodies. Native LLM request tracing is disabled because it stores
-  prompts and outputs.
+- Native Hindsight audit logging and LLM request tracing store content-bearing
+  request, response, prompt, and output data. Each consumer declares both
+  settings explicitly and gives every enabled log a bounded retention period.
 - The controller writes a content-free ledger containing action and correlation
   ID, full source and target bank references, policy and artifact digests,
   decision, reason code, timestamp, and any reversible record ID. Default
@@ -1317,7 +1321,8 @@ raw Hindsight bank selection remains an implementation detail.
   migration adapter is not an ad hoc rewrite.
 - Changes to OptiQ itself. The control plane owns the protocol adapter.
 - Raw Hindsight MCP or API capabilities exposed directly to harness agents.
-- Content-bearing native Hindsight audit logging or LLM request tracing.
+- Unbounded or implicitly enabled native Hindsight audit logging or LLM request
+  tracing.
 - Automatic full-transcript routing by content classification.
 - Automatic airlock-to-core promotion or indefinite airlock retention.
 - A production Hermes ambient-memory adapter before its capability audit.

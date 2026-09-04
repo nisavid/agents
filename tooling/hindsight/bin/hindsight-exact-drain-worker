@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Run the upstream Hindsight worker behind an exact-ID claim adapter."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+from contextlib import nullcontext
+import hashlib
+import os
+import signal
+import stat
+import sys
+import time
+from pathlib import Path
+
+
+sys.dont_write_bytecode = True
+
+
+def _unblock_controller_signals() -> None:
+    """Let the worker honor the controller's termination request."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
+
+
+_unblock_controller_signals()
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+import hindsight_memory_control_plane as _control_plane  # noqa: E402
+
+_CANDIDATE_PACKAGE = str(LIB / "hindsight_memory_control_plane")
+if _CANDIDATE_PACKAGE not in _control_plane.__path__:
+    _control_plane.__path__.insert(0, _CANDIDATE_PACKAGE)
+
+from hindsight_memory_control_plane.canonical import (  # noqa: E402
+    StrictJsonError,
+    strict_json_loads,
+)
+from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
+    OperationRecoveryError,
+    exact_drain_execution_deadline,
+    verify_exact_drain_authorization_receipt,
+    verify_exact_drain_plan,
+)
+from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    ExactDrainClaimAdapter,
+    ExactDrainUvicornSignalGuard,
+    ExactDrainWorkerMainShutdownBridge,
+    EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
+    EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS,
+    EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT,
+    EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS,
+    exact_drain_candidate_provider_root,
+    exact_drain_effective_profile_digest,
+    exact_drain_worker_failure_evidence,
+    exact_drain_platform_environment,
+    exact_drain_runtime_evidence,
+    EXACT_DRAIN_START_MESSAGE_BYTES,
+    exact_drain_worker_id,
+    install_exact_drain_candidate_imports,
+    install_exact_drain_runtime_guards,
+    process_start_time,
+    validate_exact_drain_provider_policy,
+    validate_exact_drain_dependency_spec,
+    validate_exact_drain_candidate_release_import,
+    validate_exact_drain_import_origins,
+    verify_exact_drain_start_message,
+)
+from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
+    create_exact_drain_progress_recorder,
+    verify_exact_drain_application_journal,
+)
+
+
+_WORKER_PROGRESS_RECORDER = None
+_WORKER_STAGE = "worker.bootstrap"
+EXECUTION_LEASE_SCHEMA_VERSIONS = frozenset(range(2, 16))
+DETACHED_RUNTIME_SCHEMA_VERSIONS = EXECUTION_LEASE_SCHEMA_VERSIONS
+UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS = frozenset(range(9, 16))
+
+
+def _record_worker_stage(recorder, *, status: str, stage: str) -> None:
+    global _WORKER_STAGE
+    _WORKER_STAGE = stage
+    if getattr(recorder, "progress_schema_version", None) in {3, 4, 5, 6}:
+        recorder.worker_stage(status=status, stage=stage)
+
+
+def _private_bytes(value: str | Path, label: str) -> bytes:
+    path = Path(value)
+    if not path.is_absolute():
+        raise OperationRecoveryError(f"{label} path must be absolute")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        observed = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16 * 1024 * 1024
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(f"{label} is untrusted")
+        chunks = []
+        observed_size = 0
+        while observed_size <= metadata.st_size:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, metadata.st_size + 1),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed_size += len(chunk)
+        if observed_size != metadata.st_size:
+            raise OperationRecoveryError(f"{label} changed while reading")
+        return b"".join(chunks)
+    except OSError as error:
+        raise OperationRecoveryError(f"{label} is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="hindsight-exact-drain-worker")
+    result.add_argument("--plan", required=True)
+    result.add_argument("--provider-policy", required=True)
+    result.add_argument("--provider-runtime-root", required=True)
+    result.add_argument("--worker-runtime", required=True)
+    result.add_argument("--resume", action="store_true")
+    return result
+
+
+def _validated_start_gate() -> tuple[int, str]:
+    descriptor_value = os.environ.get("HINDSIGHT_EXACT_DRAIN_START_FD", "")
+    try:
+        descriptor = int(descriptor_value)
+        metadata = os.fstat(descriptor)
+    except (OSError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "exact drain start gate is unavailable"
+        ) from error
+    if descriptor < 0 or not stat.S_ISFIFO(metadata.st_mode):
+        raise OperationRecoveryError("exact drain start gate differs")
+    return descriptor, descriptor_value
+
+
+def _validate_worker_environment(
+    start_descriptor_value: str,
+    *,
+    plan_digest: str,
+    authorization_receipt_digest: str,
+) -> None:
+    expected_environment = {
+        **exact_drain_platform_environment(),
+        "HOME": str(Path.home()),
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(LIB),
+        "HINDSIGHT_EXACT_DRAIN_START_FD": start_descriptor_value,
+        "HINDSIGHT_EXACT_DRAIN_PLAN_DIGEST": plan_digest,
+        "HINDSIGHT_EXACT_DRAIN_AUTHORIZATION_RECEIPT_DIGEST": (
+            authorization_receipt_digest
+        ),
+    }
+    expected_environment.update(
+        {
+            # Keep one reserved consolidation slot and two retain slots.  The
+            # provider gate is also capped at two, so this raises Hindsight's
+            # own drain-side concurrency without allowing a third Hatchery
+            # execution through this worker.
+            "HINDSIGHT_API_WORKER_MAX_SLOTS": "3",
+            "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
+            "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "2",
+            "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "2",
+            # Batch retain submits directly through the provider implementation,
+            # bypassing managed failover and queue/execution deadlines.  Exact
+            # drain always uses the guarded per-request path instead.
+            "HINDSIGHT_API_RETAIN_BATCH_ENABLED": "0",
+            "HINDSIGHT_API_RETAIN_LLM_TIMEOUT": (
+                EXACT_DRAIN_RETAIN_LLM_TIMEOUT_SECONDS
+            ),
+            "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT": (
+                EXACT_DRAIN_RETAIN_LLM_MAX_CONCURRENT
+            ),
+            "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS": (
+                EXACT_DRAIN_RETAIN_MAX_COMPLETION_TOKENS
+            ),
+            "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS": "0",
+            "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS": "0",
+            "HINDSIGHT_CODEX_TERMINAL_AUTH_COOLDOWN_SECONDS": "300",
+            "HINDSIGHT_EMBEDDING_FAILOVER_ORDER": (
+                "work-codex,personal-codex,alt1-codex,alt2-codex"
+            ),
+        }
+    )
+    allowed_environment = set(expected_environment) | {
+        "HINDSIGHT_API_DATABASE_URL",
+        "LC_CTYPE",
+    }
+    allowed_environment.update(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
+    if (
+        any(
+            os.environ.get(key) != value
+            for key, value in expected_environment.items()
+        )
+        or set(os.environ) - allowed_environment
+        or not os.environ.get("HINDSIGHT_API_DATABASE_URL", "").startswith(
+            "postgresql://"
+        )
+    ):
+        raise OperationRecoveryError("exact drain worker environment differs")
+
+
+def _read_start_gate(descriptor: int) -> bytes:
+    body = bytearray()
+    try:
+        while len(body) <= EXACT_DRAIN_START_MESSAGE_BYTES:
+            chunk = os.read(
+                descriptor,
+                EXACT_DRAIN_START_MESSAGE_BYTES + 1 - len(body),
+            )
+            if not chunk:
+                break
+            body.extend(chunk)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain start gate is unavailable"
+        ) from error
+    finally:
+        os.close(descriptor)
+    return bytes(body)
+
+
+def main() -> int:
+    global _WORKER_PROGRESS_RECORDER, _WORKER_STAGE
+    _WORKER_PROGRESS_RECORDER = None
+    _WORKER_STAGE = "worker.bootstrap"
+    args = parser().parse_args()
+    plan_value = strict_json_loads(
+        _private_bytes(args.plan, "exact drain plan").decode("utf-8")
+    )
+    plan = verify_exact_drain_plan(
+        plan_value,
+        allow_expired=True,
+    )
+    if args.resume and plan["schema_version"] == 11:
+        raise OperationRecoveryError(
+            "schema-11 interrupted exact drain requires post-abort recovery"
+        )
+    authorization = verify_exact_drain_authorization_receipt(
+        strict_json_loads(
+            _private_bytes(
+                plan["authorization_receipt_path"],
+                "exact drain authorization receipt",
+            ).decode("utf-8")
+        ),
+        plan=plan,
+    )
+    if plan["schema_version"] == 1 and not args.resume:
+        plan = verify_exact_drain_plan(plan_value)
+    if (
+        plan["schema_version"] in EXECUTION_LEASE_SCHEMA_VERSIONS
+        and time.time()
+        >= exact_drain_execution_deadline(plan, authorization)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain execution lease expired"
+        )
+    start_descriptor, start_descriptor_value = _validated_start_gate()
+    _validate_worker_environment(
+        start_descriptor_value,
+        plan_digest=plan["plan_digest"],
+        authorization_receipt_digest=authorization["receipt_digest"],
+    )
+    journal_digest = verify_exact_drain_start_message(
+        _read_start_gate(start_descriptor),
+        plan_digest=plan["plan_digest"],
+        authorization_receipt_digest=authorization["receipt_digest"],
+    )
+    current_start_time = process_start_time(os.getpid())
+    if current_start_time is None:
+        raise OperationRecoveryError(
+            "exact drain worker process identity is unavailable"
+        )
+    journal = verify_exact_drain_application_journal(
+        plan=plan,
+        authorization=authorization,
+        journal=strict_json_loads(
+            _private_bytes(
+                plan["application_receipt_path"],
+                "exact drain application journal",
+            ).decode("utf-8")
+        ),
+        expected_receipt_digest=journal_digest,
+        expected_worker_start_time=current_start_time,
+    )
+    from hindsight_memory_control_plane.provider_runtime import (
+        ProviderRuntimeCompatibilityError,
+        ProviderRuntimePolicy,
+        set_exact_drain_progress_recorder,
+    )
+
+    canonical_policy = (
+        Path.home()
+        / ".config"
+        / "hindsight-control-plane"
+        / "provider-runtime-policy.json"
+    ).resolve(strict=True)
+    runtime_digest, provider_bootstrap = exact_drain_runtime_evidence(
+        args.worker_runtime,
+        args.provider_runtime_root,
+        LIB / "hindsight_api",
+        schema_version=plan["schema_version"],
+    )
+    provider_policy_bytes = _private_bytes(
+        args.provider_policy,
+        "exact drain provider policy",
+    )
+    try:
+        provider_policy = ProviderRuntimePolicy.load(
+            strict_json_loads(provider_policy_bytes)
+        )
+    except (
+        ProviderRuntimeCompatibilityError,
+        StrictJsonError,
+    ) as error:
+        raise OperationRecoveryError(
+            "exact drain provider policy differs"
+        ) from error
+    validate_exact_drain_provider_policy(
+        provider_policy,
+        plan_schema_version=plan["schema_version"],
+    )
+    if (
+        Path(args.provider_policy).resolve(strict=True) != canonical_policy
+        or hashlib.sha256(provider_policy_bytes).hexdigest()
+        != plan["provider_policy_digest"]
+        or runtime_digest != plan["worker_runtime_digest"]
+    ):
+        raise OperationRecoveryError("exact drain runtime authority drifted")
+    if (
+        exact_drain_effective_profile_digest(
+            provider_policy,
+            os.environ,
+        )
+        != plan["effective_profile_digest"]
+    ):
+        raise OperationRecoveryError("exact drain LLM profile differs")
+    progress_recorder = create_exact_drain_progress_recorder(
+        plan=plan,
+        authorization=authorization,
+        journal=journal,
+        terminal_reconciliation=False,
+    )
+    _WORKER_PROGRESS_RECORDER = progress_recorder
+    _record_worker_stage(
+        progress_recorder,
+        status="starting",
+        stage="worker.imports",
+    )
+    set_exact_drain_progress_recorder(progress_recorder)
+
+    install_exact_drain_candidate_imports(args.worker_runtime, LIB)
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
+        validate_exact_drain_dependency_spec(
+            "asyncpg",
+            args.worker_runtime,
+        )
+    if plan["schema_version"] in UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS:
+        validate_exact_drain_dependency_spec(
+            "uvicorn",
+            args.worker_runtime,
+        )
+
+    provider_globals = {
+        "__builtins__": __builtins__,
+        "__file__": str(
+            (
+                Path(args.provider_runtime_root)
+                if plan["schema_version"] == 1
+                else exact_drain_candidate_provider_root(LIB)
+            )
+            / "sitecustomize.py"
+        ),
+        "__name__": "_hindsight_exact_provider_bootstrap",
+    }
+    provider_tree = ast.parse(
+        provider_bootstrap,
+        filename=provider_globals["__file__"],
+    )
+    if not provider_tree.body or not isinstance(
+        provider_tree.body[-1], ast.If
+    ):
+        raise OperationRecoveryError(
+            "exact drain provider bootstrap shape differs"
+        )
+    definitions = ast.Module(
+        body=provider_tree.body[:-1],
+        type_ignores=provider_tree.type_ignores,
+    )
+    activation = ast.Module(
+        body=[provider_tree.body[-1]],
+        type_ignores=[],
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(definitions),
+            provider_globals["__file__"],
+            "exec",
+        ),
+        provider_globals,
+    )
+    candidate_release_root = validate_exact_drain_candidate_release_import(
+        LIB
+    )
+    normal_release_resolver = provider_globals.get(
+        "_resolve_active_release"
+    )
+    if not callable(normal_release_resolver):
+        raise OperationRecoveryError(
+            "exact drain provider release resolver differs"
+        )
+
+    def resolve_detached_candidate(_install_root: Path) -> Path:
+        return candidate_release_root
+
+    provider_globals["_resolve_active_release"] = resolve_detached_candidate
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
+        validate_exact_drain_import_origins(args.worker_runtime, LIB)
+    original_protected_reader = provider_globals.get(
+        "_read_protected_file"
+    )
+    if not callable(original_protected_reader):
+        raise OperationRecoveryError(
+            "exact drain provider bootstrap reader differs"
+        )
+
+    def read_bound_provider_file(path: Path, label: str) -> bytes:
+        if Path(path) == canonical_policy:
+            return provider_policy_bytes
+        return original_protected_reader(path, label)
+
+    provider_globals["_read_protected_file"] = read_bound_provider_file
+    _record_worker_stage(
+        progress_recorder,
+        status="starting",
+        stage="worker.provider.activate",
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(activation),
+            provider_globals["__file__"],
+            "exec",
+        ),
+        provider_globals,
+    )
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
+        validate_exact_drain_import_origins(args.worker_runtime, LIB)
+
+    def complete() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    adapter = ExactDrainClaimAdapter(
+        plan,
+        completion_callback=complete,
+        progress_recorder=progress_recorder,
+        resume=args.resume,
+        authorization=authorization,
+    )
+    _record_worker_stage(
+        progress_recorder,
+        status="starting",
+        stage="worker.api.import",
+    )
+    from hindsight_api import MemoryEngine
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+    from hindsight_api.worker import main as worker_main_module
+    from hindsight_api.worker.poller import WorkerPoller
+    from uvicorn import Server as UvicornServer
+
+    if plan["schema_version"] in DETACHED_RUNTIME_SCHEMA_VERSIONS:
+        validate_exact_drain_import_origins(args.worker_runtime, LIB)
+
+    signal_guard = (
+        ExactDrainUvicornSignalGuard(UvicornServer)
+        if plan["schema_version"] in UVICORN_SIGNAL_GUARD_SCHEMA_VERSIONS
+        else nullcontext()
+    )
+    with (
+        ExactDrainWorkerMainShutdownBridge(worker_main_module) as shutdown,
+        signal_guard,
+    ):
+        _record_worker_stage(
+            progress_recorder,
+            status="starting",
+            stage="worker.guard.install",
+        )
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            adapter,
+            request_worker_shutdown=shutdown.request,
+        )
+        sys.argv = [
+            "hindsight-worker",
+            "--worker-id",
+            exact_drain_worker_id(plan["plan_digest"]),
+            "--poll-interval",
+            "250",
+            "--max-retries",
+            str(plan["worker_max_retries"]),
+            "--http-host",
+            "127.0.0.1",
+            "--http-port",
+            "0",
+            "--log-level",
+            "info",
+        ]
+        _record_worker_stage(
+            progress_recorder,
+            status="running",
+            stage="worker.main",
+        )
+        worker_main_module.main()
+    return 0
+
+
+def run() -> int:
+    """Run the worker and seal any post-progress failure without raw text."""
+    try:
+        return main()
+    except BaseException as error:  # noqa: BLE001
+        if isinstance(error, SystemExit) and error.code in {None, 0}:
+            return 0
+        recorder = _WORKER_PROGRESS_RECORDER
+        if recorder is None and isinstance(
+            error,
+            (OperationRecoveryError, UnicodeDecodeError),
+        ):
+            print(f"hindsight-exact-drain-worker: {error}", file=sys.stderr)
+            return 2
+        progress_schema_version = getattr(
+            recorder,
+            "progress_schema_version",
+            5,
+        )
+        failure = exact_drain_worker_failure_evidence(
+            error,
+            worker_stage=getattr(recorder, "_worker_stage", _WORKER_STAGE),
+            progress_schema_version=progress_schema_version,
+        )
+        failure_stage = getattr(recorder, "_worker_stage", _WORKER_STAGE)
+        if getattr(recorder, "progress_schema_version", None) in {3, 4, 5, 6}:
+            try:
+                if getattr(recorder, "_worker_status", None) != "failed":
+                    recorder.worker_failure(exit_code=2, failure=failure)
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        print(
+            "hindsight-exact-drain-worker: "
+            f"stage={failure_stage} "
+            f"category={failure['category']} "
+            f"retryable={str(failure['retryable']).lower()} "
+            f"error_digest={failure['error_digest']}",
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

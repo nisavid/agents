@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import ctypes
+from dataclasses import replace
+from decimal import localcontext
 import errno
 import hashlib
 import io
@@ -17,8 +19,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Any
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 
 
@@ -37,11 +40,27 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
     _systemd_user_service_root,
 )
 import hindsight_memory_control_plane.portable_install as portable_install_module  # noqa: E402
+from hindsight_memory_control_plane.canonical import digest  # noqa: E402
 from hindsight_memory_control_plane.inventory import load_inventory  # noqa: E402
+from tooling.hindsight.tests.hindsight_data_identity_test_support import (  # noqa: E402
+    build_rebind_evidence,
+    reseal_rebind_evidence,
+)
 
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def directory_argument_matches(value: Path | int, path: Path) -> bool:
+    if isinstance(value, int):
+        descriptor_metadata = os.fstat(value)
+        path_metadata = path.lstat()
+        return (descriptor_metadata.st_dev, descriptor_metadata.st_ino) == (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        )
+    return value == path
 
 
 def runtime_library(source: str) -> str:
@@ -162,6 +181,72 @@ class InactiveSystemdRunner(RecordingRunner):
         if argv[:3] == ("/usr/bin/systemctl", "--user", "is-active"):
             return "inactive\n"
         return None
+
+
+class InactiveLaunchdServiceRunner(RecordingRunner):
+    def __call__(self, argv: tuple[str, ...]) -> str | None:
+        result = super().__call__(argv)
+        if (
+            argv[:2] == ("/bin/launchctl", "print")
+            and argv[2].endswith(
+                "/io.nisavid.hindsight.synthetic.broker"
+            )
+        ):
+            if result is None:
+                return None
+            return result.replace("state = running", "state = waiting")
+        return result
+
+
+class DelayedLaunchdServiceRunner(RecordingRunner):
+    def __init__(self, delayed_snapshots: int = 2) -> None:
+        super().__init__()
+        self.delayed_snapshots = delayed_snapshots
+
+    def __call__(self, argv: tuple[str, ...]) -> str | None:
+        result = super().__call__(argv)
+        if (
+            argv[:2] == ("/bin/launchctl", "print")
+            and argv[2].endswith("/io.nisavid.hindsight.synthetic.broker")
+            and result is not None
+            and self.delayed_snapshots > 0
+        ):
+            self.delayed_snapshots -= 1
+            return result.replace(
+                "state = running", "state = spawn scheduled"
+            )
+        return result
+
+
+class DelayedBootoutRunner(RecordingRunner):
+    def __init__(self, delayed_snapshots: int = 2) -> None:
+        super().__init__()
+        self.delayed_snapshots = delayed_snapshots
+        self.draining: dict[str, int] = {}
+
+    def __call__(self, argv: tuple[str, ...]) -> str | None:
+        if argv[:2] == ("/bin/launchctl", "bootout"):
+            self.calls.append(argv)
+            label = argv[2].rsplit("/", 1)[-1]
+            if label not in self.launchd_jobs:
+                raise _ManagedServiceCommandError(113)
+            self.draining[label] = self.delayed_snapshots
+            return None
+        if argv[:2] == ("/bin/launchctl", "print"):
+            label = argv[2].rsplit("/", 1)[-1]
+            remaining = self.draining.get(label)
+            if remaining is not None:
+                self.calls.append(argv)
+                if remaining > 0:
+                    self.draining[label] = remaining - 1
+                    return (
+                        f"path = {self.launchd_jobs[label]}\n"
+                        "state = SIGTERMed\n"
+                    )
+                del self.draining[label]
+                self.launchd_jobs.pop(label)
+                raise _ManagedServiceCommandError(113)
+        return super().__call__(argv)
 
 
 class ForeignManifestRunner(RecordingRunner):
@@ -368,10 +453,511 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertNotIn("HINDSIGHT_API_KEY", rendered)
         self.assertNotIn("pass://hindsight/data-plane", rendered)
         self.assertEqual(plist["Label"], "io.nisavid.hindsight.synthetic.broker")
+        self.assertEqual(plist["ExitTimeOut"], 330)
         self.assertIn("--service", plist["ProgramArguments"])
         self.assertTrue(
             any(call[0].endswith("launchctl") for call in self.runner.calls)
         )
+
+    def test_fresh_install_waits_for_launchd_service_to_become_running(
+        self,
+    ) -> None:
+        runner = DelayedLaunchdServiceRunner()
+        manager = self.manager()
+        manager._command_runner = runner
+
+        with mock.patch.object(portable_install_module.time, "sleep"):
+            result = manager.install(
+                self.release("1.0.0"),
+                version="1.0.0",
+            )
+
+        self.assertEqual(result["status"], "installed")
+        service_prints = [
+            call
+            for call in runner.calls
+            if call[:2] == ("/bin/launchctl", "print")
+            and call[2].endswith(
+                "/io.nisavid.hindsight.synthetic.broker"
+            )
+        ]
+        self.assertGreaterEqual(len(service_prints), 3)
+
+    def test_fresh_install_rolls_back_when_launchd_never_becomes_running(
+        self,
+    ) -> None:
+        runner = InactiveLaunchdServiceRunner()
+        manager = self.manager()
+        manager._command_runner = runner
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "LAUNCHD_SERVICE_START_TIMEOUT_SECONDS",
+                0,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError,
+                "managed launchd job is not active",
+            ),
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertEqual(runner.launchd_jobs, {})
+        self.assertFalse(self.install_root.exists())
+        self.assertTrue(self.data_root.is_dir())
+        self.assertEqual(list(self.service_root.glob("*")), [])
+
+    def test_intentional_service_stop_preserves_installation_and_stays_stopped(
+        self,
+    ) -> None:
+        release = self.release("1.0.0")
+        manager = self.manager()
+        manager.install(release, version="1.0.0")
+
+        stopped = manager.stop_services()
+
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["services"], {"broker": "stopped"})
+        self.assertNotIn(
+            "io.nisavid.hindsight.synthetic.broker",
+            self.runner.launchd_jobs,
+        )
+        self.assertTrue((self.install_root / "install-state.json").is_file())
+        self.assertTrue(
+            (
+                self.service_root
+                / "io.nisavid.hindsight.synthetic.broker.plist"
+            ).is_file()
+        )
+
+    def test_service_status_reports_intentional_stop_without_requiring_health(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(
+            self.release("1.0.0"),
+            version="1.0.0",
+        )
+        manager.stop_services()
+        manager._health_runner = lambda _check, _release: False
+
+        status = manager.service_status()
+
+        self.assertEqual(status["status"], "stopped")
+        self.assertEqual(status["services"], {"broker": "stopped"})
+        self.assertEqual(
+            status["timers"], {"integration-upgrades": "stopped"}
+        )
+
+    def test_explicit_service_start_recovers_an_intentionally_stopped_stack(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+
+        started = manager.start_services()
+
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["managed_health"], "healthy")
+        self.assertEqual(started["services"], {"broker": "running"})
+        self.assertEqual(
+            started["timers"], {"integration-upgrades": "running"}
+        )
+
+    def test_service_start_is_idempotent_for_running_launchd_jobs(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        self.runner.calls.clear()
+
+        started = manager.start_services()
+
+        self.assertEqual(started["status"], "running")
+        self.assertFalse(
+            any(
+                call[1] in {"bootout", "bootstrap", "kickstart"}
+                for call in self.runner.calls
+                if call[0] == "/bin/launchctl"
+            )
+        )
+
+    def test_service_restart_replaces_loaded_jobs_and_requires_health(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        self.runner.calls.clear()
+
+        restarted = manager.restart_services()
+
+        self.assertEqual(restarted["status"], "running")
+        self.assertEqual(restarted["managed_health"], "healthy")
+        for label in (
+            "io.nisavid.hindsight.synthetic.broker",
+            "io.nisavid.hindsight.synthetic.integration-upgrades",
+        ):
+            self.assertIn(
+                ("/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"),
+                self.runner.calls,
+            )
+        self.assertEqual(
+            sum(
+                call[:2] == ("/bin/launchctl", "bootstrap")
+                for call in self.runner.calls
+            ),
+            2,
+        )
+
+    def test_service_restart_explicitly_resets_component_stop_intent(self) -> None:
+        data = self.config_data()
+        stack_state = self.state_root / "embed"
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(stack_state),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "work",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True), encoding="utf-8"
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        desired = stack_state / "desired" / "profiles" / "work"
+        desired.mkdir(parents=True, mode=0o700)
+        for directory in (
+            stack_state,
+            stack_state / "desired",
+            stack_state / "desired" / "profiles",
+            desired,
+        ):
+            directory.chmod(0o700)
+        for component in ("daemon", "ui"):
+            (desired / component).write_text("stopped\n", encoding="ascii")
+            (desired / component).chmod(0o600)
+
+        manager.restart_services()
+
+        for component in ("daemon", "ui"):
+            self.assertEqual(
+                (desired / component).read_text(encoding="ascii"),
+                "running\n",
+            )
+
+    def test_service_start_rejects_profile_api_version_drift_before_mutation(
+        self,
+    ) -> None:
+        data = self.config_data()
+        stack_state = self.state_root / "embed"
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(stack_state),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "work",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True), encoding="utf-8"
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        home = self.root / "home"
+        profile = home / ".hindsight" / "profiles" / "work.env"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "HINDSIGHT_EMBED_API_VERSION=0.9.2\n",
+            encoding="utf-8",
+        )
+        account = mock.Mock(pw_dir=str(home))
+
+        with mock.patch(
+            "hindsight_memory_control_plane.portable_install.pwd.getpwuid",
+            return_value=account,
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+            manager.stop_services()
+            self.runner.calls.clear()
+            profile.write_text(
+                "HINDSIGHT_EMBED_API_VERSION=0.9.1\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                PortableInstallError,
+                "managed profile API version differs",
+            ):
+                manager.start_services()
+
+        self.assertEqual(self.runner.calls, [])
+        self.assertFalse(
+            any((stack_state / "desired").glob("profiles/work/*"))
+        )
+
+    def test_failed_service_start_restores_the_intentional_stop(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+        manager._health_runner = lambda _check, _release: False
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "health verification failed"
+        ):
+            manager.start_services()
+
+        self.assertEqual(manager.service_status()["status"], "stopped")
+
+    def test_failed_systemd_start_restores_the_intentional_stop(self) -> None:
+        class StatefulSystemdRunner:
+            def __init__(self, service_root):
+                self.service_root = service_root
+                self.calls = []
+                self.active = set()
+                self.enabled = set()
+                self.ignored_restore = None
+
+            def __call__(self, argv):
+                self.calls.append(argv)
+                if argv[:5] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "show",
+                    "--property=FragmentPath",
+                    "--value",
+                ):
+                    return str(self.service_root / argv[-1])
+                if argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "is-active",
+                ):
+                    if argv[-1] not in self.active:
+                        raise _ManagedServiceCommandError(3)
+                    return "active"
+                if argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "is-enabled",
+                ):
+                    if argv[-1] not in self.enabled:
+                        raise _ManagedServiceCommandError(1)
+                    return "enabled"
+                if argv[:4] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                ):
+                    self.enabled.add(argv[-1])
+                    self.active.add(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "enable",
+                ):
+                    self.enabled.add(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "restart",
+                ):
+                    self.active.add(argv[-1])
+                elif argv[:4] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                ):
+                    self.enabled.discard(argv[-1])
+                    self.active.discard(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "disable",
+                ):
+                    if self.ignored_restore != ("disable", argv[-1]):
+                        self.enabled.discard(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "start",
+                ):
+                    self.active.add(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "stop",
+                ):
+                    if self.ignored_restore != ("stop", argv[-1]):
+                        self.active.discard(argv[-1])
+                return None
+
+        manager = self.manager(
+            platform="systemd-user",
+            health_runner=lambda _check, _release: True,
+        )
+        runner = StatefulSystemdRunner(self.service_root)
+        manager._command_runner = runner
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+        manager._health_runner = lambda _check, _release: False
+        runner.calls.clear()
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.start_services()
+
+        label = "io.nisavid.hindsight.synthetic"
+        for command in (
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "disable",
+                f"{label}.integration-upgrades.timer",
+            ),
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "stop",
+                f"{label}.integration-upgrades.timer",
+            ),
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "disable",
+                f"{label}.broker.service",
+            ),
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "stop",
+                f"{label}.broker.service",
+            ),
+            ("/usr/bin/systemctl", "--user", "daemon-reload"),
+        ):
+            self.assertIn(command, runner.calls)
+        self.assertEqual(manager.service_status()["status"], "stopped")
+
+        manager._health_runner = lambda _check, _release: True
+        manager.start_services()
+        label = "io.nisavid.hindsight.synthetic"
+        service_unit = f"{label}.broker.service"
+        timer_unit = f"{label}.integration-upgrades.timer"
+        runner.active.discard(service_unit)
+        runner.enabled.discard(timer_unit)
+        prior_active = set(runner.active)
+        prior_enabled = set(runner.enabled)
+        manager._health_runner = lambda _check, _release: False
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.start_services()
+
+        self.assertEqual(runner.active, prior_active)
+        self.assertEqual(runner.enabled, prior_enabled)
+
+        runner.active.discard(service_unit)
+        runner.ignored_restore = ("stop", service_unit)
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ) as raised:
+            manager.start_services()
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            PortableInstallError,
+        )
+        self.assertIn(
+            "service manager prestate restoration failed",
+            str(raised.exception.__cause__),
+        )
+
+    def test_failed_service_start_restores_a_partial_prestate(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+        service = manager.config.services[0]
+        service_manifest = (
+            manager.config.service_root / f"{service.label}.plist"
+        )
+        self.runner.launchd_jobs[service.label] = service_manifest
+        self.assertEqual(manager.service_status()["status"], "partial")
+        manager._health_runner = lambda _check, _release: False
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.start_services()
+
+        status = manager.service_status()
+        self.assertEqual(status["status"], "partial")
+        self.assertEqual(status["services"]["broker"], "running")
+        self.assertEqual(status["timers"]["integration-upgrades"], "stopped")
+
+    def test_failed_launchd_activation_restores_running_job_booted_out_first(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        expected_jobs = dict(self.runner.launchd_jobs)
+        failed_once = False
+
+        def fail_first_bootstrap(argv: tuple[str, ...]) -> str | None:
+            nonlocal failed_once
+            if argv[:2] == ("/bin/launchctl", "bootstrap") and not failed_once:
+                failed_once = True
+                self.runner.calls.append(argv)
+                raise _ManagedServiceCommandError(22)
+            return self.runner(argv)
+
+        manager._command_runner = fail_first_bootstrap
+
+        with self.assertRaises(_ManagedServiceCommandError):
+            manager.restart_services()
+
+        self.assertTrue(failed_once)
+        self.assertEqual(self.runner.launchd_jobs, expected_jobs)
+        self.assertEqual(manager.service_status()["status"], "running")
+
+    def test_service_status_treats_loaded_inactive_launchd_service_as_stopped(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        inactive_runner = InactiveLaunchdServiceRunner()
+        inactive_runner.launchd_jobs = dict(self.runner.launchd_jobs)
+        manager._command_runner = inactive_runner
+
+        status = manager.service_status()
+
+        self.assertEqual(status["status"], "partial")
+        self.assertEqual(status["services"]["broker"], "stopped")
+        self.assertEqual(status["timers"]["integration-upgrades"], "running")
+
+    def test_service_status_treats_unknown_launchd_output_as_loaded_and_active(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager._command_runner = lambda _argv: None
+
+        status = manager.service_status()
+
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["services"]["broker"], "running")
+        self.assertEqual(status["timers"]["integration-upgrades"], "running")
 
     def test_portable_consumer_examples_match_the_closed_schema(self) -> None:
         examples = ROOT / "examples" / "portable-consumer"
@@ -897,6 +1483,165 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(
             result["data_identity_digest"], manager.verify()["data_identity_digest"]
         )
+
+    def test_launchd_verify_tolerates_data_root_device_reassignment(self) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        manager = self.manager(installation_mode="adopt")
+        original_lstat = Path.lstat
+        root_inode = original_lstat(self.data_root).st_ino
+        device = 11
+
+        class RemountedMetadata:
+            def __init__(self, metadata):
+                self._metadata = metadata
+                self.st_dev = device
+                self.st_birthtime = 1_786_203_815.3676865
+
+            def __getattr__(self, name):
+                return getattr(self._metadata, name)
+
+        def remounted_lstat(path):
+            metadata = original_lstat(path)
+            if path == self.data_root:
+                return RemountedMetadata(metadata)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", remounted_lstat):
+            installed = manager.install(self.release("1.0.0"), version="1.0.0")
+            device = 12
+            verified = manager.verify()
+
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(
+            verified["data_identity_digest"], installed["data_identity_digest"]
+        )
+        self.assertEqual(
+            installed["data_identity_digest"],
+            digest(
+                {
+                    "schema_version": 2,
+                    "path": str(self.data_root),
+                    "inode": root_inode,
+                    "birthtime_ns": "1786203815367686500",
+                }
+            ),
+        )
+
+    def test_launchd_data_identity_owns_decimal_precision(self) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        manager = self.manager(installation_mode="adopt")
+
+        with localcontext() as decimal_context:
+            decimal_context.prec = 10
+            installed = manager.install(self.release("1.0.0"), version="1.0.0")
+        verified = manager.verify()
+
+        self.assertEqual(
+            installed["data_identity_digest"],
+            verified["data_identity_digest"],
+        )
+
+    def test_launchd_verify_rejects_data_root_inode_or_birthtime_change(
+        self,
+    ) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        manager = self.manager(installation_mode="adopt")
+        original_lstat = Path.lstat
+        inode_delta = 0
+        birthtime_delta = 0.0
+
+        class ChangedMetadata:
+            def __init__(self, metadata):
+                self._metadata = metadata
+                self.st_ino = metadata.st_ino + inode_delta
+                self.st_birthtime = 1_786_203_815.3676865 + birthtime_delta
+
+            def __getattr__(self, name):
+                return getattr(self._metadata, name)
+
+        def changed_lstat(path):
+            metadata = original_lstat(path)
+            if path == self.data_root:
+                return ChangedMetadata(metadata)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", changed_lstat):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+            for inode_delta, birthtime_delta in ((1, 0.0), (0, 1.0)):
+                with (
+                    self.subTest(
+                        inode_delta=inode_delta,
+                        birthtime_delta=birthtime_delta,
+                    ),
+                    self.assertRaisesRegex(
+                        PortableInstallError,
+                        "data identity changed",
+                    ),
+                ):
+                    manager.verify()
+
+    def test_systemd_data_identity_keeps_legacy_device_inode_projection(
+        self,
+    ) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        metadata = self.data_root.lstat()
+        manager = self.manager(
+            platform="systemd-user",
+            installation_mode="adopt",
+        )
+
+        installed = manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertEqual(
+            installed["data_identity_digest"],
+            digest(
+                {
+                    "path": str(self.data_root),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                }
+            ),
+        )
+
+    def test_launchd_data_identity_requires_a_finite_birthtime(self) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        original_lstat = Path.lstat
+        release = self.release("1.0.0")
+
+        class InvalidBirthtimeMetadata:
+            def __init__(self, metadata, birthtime):
+                self._metadata = metadata
+                if birthtime is not None:
+                    self.st_birthtime = birthtime
+
+            def __getattr__(self, name):
+                if name == "st_birthtime":
+                    raise AttributeError(name)
+                return getattr(self._metadata, name)
+
+        for birthtime in (None, float("nan"), float("inf"), -1.0):
+            with self.subTest(birthtime=birthtime):
+                manager = self.manager(installation_mode="adopt")
+
+                def invalid_birthtime_lstat(path):
+                    metadata = original_lstat(path)
+                    if path == self.data_root:
+                        return InvalidBirthtimeMetadata(metadata, birthtime)
+                    return metadata
+
+                with (
+                    mock.patch.object(Path, "lstat", invalid_birthtime_lstat),
+                    self.assertRaisesRegex(
+                        PortableInstallError,
+                        "launchd data root birth time is unavailable",
+                    ),
+                ):
+                    manager.install(release, version="1.0.0")
 
     def test_adoption_rechecks_the_bound_data_root_before_activation(self) -> None:
         self.data_root.mkdir(mode=0o700)
@@ -1697,6 +2442,188 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(result["release_digest"], first["release_digest"])
         self.assertEqual(manager.verify()["current"]["version"], "1.0.0")
 
+    def test_rollback_rejects_resolver_drift_before_mutation(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+        calls_before = list(self.runner.calls)
+        self.resolver.chmod(0o700)
+        self.resolver.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+        self.resolver.chmod(0o500)
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "credential resolver digest mismatch",
+        ):
+            manager.rollback(
+                expected_current_digest=current["release_digest"],
+            )
+
+        self.assertEqual(self.runner.calls, calls_before)
+        self.assertFalse(manager._transaction_path.exists())
+        self.assertEqual(manager._load_state()["current"]["version"], "2.0.0")
+
+    def test_rollback_disables_bound_harness_authority_before_quiesce(
+        self,
+    ) -> None:
+        reconciler = self.root / "harness-reconcile"
+        reconciler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reconciler.chmod(0o700)
+        reconcile_config = self.root / "harness-reconcile.json"
+        reconcile_config.write_text("{}\n", encoding="utf-8")
+        reconcile_config.chmod(0o600)
+        data = self.config_data()
+        for collection in ("services", "timers", "health_checks"):
+            for surface in data[collection]:
+                surface["environment"].update(
+                    {
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(
+                            reconciler
+                        ),
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(
+                            reconcile_config
+                        ),
+                    }
+                )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True),
+            encoding="utf-8",
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+        self.runner.calls.clear()
+
+        manager.rollback(expected_current_digest=current["release_digest"])
+
+        disable = (str(reconciler), "disable", str(reconcile_config))
+        self.assertIn(disable, self.runner.calls)
+        first_quiesce = next(
+            index
+            for index, call in enumerate(self.runner.calls)
+            if call[:2] == ("/bin/launchctl", "bootout")
+        )
+        self.assertLess(self.runner.calls.index(disable), first_quiesce)
+
+    def test_rollback_rejects_inconsistent_harness_authority_binding(
+        self,
+    ) -> None:
+        reconciler = self.root / "harness-reconcile"
+        reconciler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reconciler.chmod(0o700)
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(reconciler),
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(
+                    self.root / "one.json"
+                ),
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True),
+            encoding="utf-8",
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "harness rollback authority binding is inconsistent",
+        ):
+            manager.rollback(
+                expected_current_digest=current["release_digest"],
+            )
+
+    def test_rollback_uses_installed_harness_binding_not_caller_source(
+        self,
+    ) -> None:
+        reconciler = self.root / "installed-harness-reconcile"
+        reconciler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reconciler.chmod(0o700)
+        reconcile_config = self.root / "installed-harness-reconcile.json"
+        reconcile_config.write_text("{}\n", encoding="utf-8")
+        reconcile_config.chmod(0o600)
+        installed_data = self.config_data()
+        for collection in ("services", "timers", "health_checks"):
+            for surface in installed_data[collection]:
+                surface["environment"].update(
+                    {
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(
+                            reconciler
+                        ),
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(
+                            reconcile_config
+                        ),
+                    }
+                )
+        self.config_path.write_text(
+            json.dumps(installed_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        installed_manager = PortableInstallationManager(
+            InstallationConfig.load(
+                installed_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        installed_manager.install(
+            self.release("1.0.0"),
+            version="1.0.0",
+        )
+        current = self.upgrade(
+            installed_manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+
+        caller_data = self.config_data()
+        self.config_path.write_text(
+            json.dumps(caller_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        caller = PortableInstallationManager(
+            InstallationConfig.load(
+                caller_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        self.runner.calls.clear()
+
+        caller.rollback(
+            expected_current_digest=current["release_digest"],
+        )
+
+        self.assertIn(
+            (str(reconciler), "disable", str(reconcile_config)),
+            self.runner.calls,
+        )
+
     def test_interrupted_rollback_recovers_the_prestate(self) -> None:
         v1 = self.release("1.0.0")
         v2 = self.release("2.0.0")
@@ -1953,6 +2880,91 @@ class PortableInstallationManagerTest(unittest.TestCase):
         manager.install(release, version="1.0.0")
 
         self.assertEqual(manager.verify()["managed_health"], "healthy")
+
+    def test_runtime_executes_the_exact_configured_credential_resolver(self) -> None:
+        marker = self.root / "resolver-path"
+        self.resolver.chmod(0o700)
+        self.resolver.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' \"$0\" > {str(marker)!r}\n"
+            "printf '%s\\n' "
+            '\'{"schema_version":1,"values":{"HINDSIGHT_API_KEY":"canary"}}\'\n',
+            encoding="utf-8",
+        )
+        self.resolver.chmod(0o500)
+        data = self.config_data()
+        data["credential_resolver"]["sha256"] = file_sha256(self.resolver)
+        data["health_checks"][0]["credentials"] = [
+            {
+                "environment": "HINDSIGHT_API_KEY",
+                "locator": "pass://hindsight/data-plane",
+            }
+        ]
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertTrue(
+            manager._default_health_runner(
+                manager.config.health_checks[0].to_dict(),
+                manager._load_state()["current"],
+            )
+        )
+        self.assertEqual(marker.read_text(encoding="utf-8"), str(self.resolver))
+        self.assertTrue((self.install_root / "credential-resolver").is_file())
+
+    def test_runtime_rejects_credential_resolver_symlinked_ancestry(self) -> None:
+        resolver_parent = self.root / "resolver-parent"
+        resolver_parent.mkdir()
+        resolver = resolver_parent / "resolver"
+        resolver.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            '\'{"schema_version":1,"values":{"HINDSIGHT_API_KEY":"canary"}}\'\n',
+            encoding="utf-8",
+        )
+        resolver.chmod(0o500)
+        data = self.config_data()
+        data["credential_resolver"] = {
+            "path": str(resolver),
+            "sha256": file_sha256(resolver),
+        }
+        data["health_checks"][0]["credentials"] = [
+            {
+                "environment": "HINDSIGHT_API_KEY",
+                "locator": "pass://hindsight/data-plane",
+            }
+        ]
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        relocated_parent = self.root / "relocated-resolver-parent"
+        resolver_parent.rename(relocated_parent)
+        resolver_parent.symlink_to(relocated_parent, target_is_directory=True)
+
+        completed = subprocess.run(
+            manager._launch_argv("health", "broker"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr,
+            b"credential resolver is not protected\n",
+        )
 
     def test_install_rejects_an_unprotected_managed_python(self) -> None:
         managed_python = self.root / "consumer" / "python"
@@ -2651,6 +3663,27 @@ class PortableInstallationManagerTest(unittest.TestCase):
 
         self.assertEqual(calls, 2)
 
+    def test_launchd_retries_transient_bootstrap_after_an_explicit_stop(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager._deactivate_services()
+        bootstrap_calls = 0
+
+        def transient_runner(argv: tuple[str, ...]) -> str | None:
+            nonlocal bootstrap_calls
+            if argv[:2] == ("/bin/launchctl", "bootstrap"):
+                bootstrap_calls += 1
+                if bootstrap_calls == 1:
+                    raise _ManagedServiceCommandError(5)
+            return self.runner(argv)
+
+        manager._command_runner = transient_runner
+
+        manager._activate_services(retry_bootstrap_after_stop=True)
+
+        self.assertEqual(bootstrap_calls, 3)
+        self.assertEqual(manager.service_status()["status"], "running")
+
     def test_launchd_does_not_retry_a_fresh_invalid_bootstrap(self) -> None:
         manager = self.manager()
         manager._command_runner = lambda _argv: (_ for _ in ()).throw(
@@ -2663,6 +3696,24 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 self.service_root / "owned.plist",
                 replacing_loaded_job=False,
             )
+
+    def test_fresh_install_does_not_retry_an_invalid_launchd_bootstrap(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        bootstrap_calls = 0
+
+        def invalid_bootstrap_runner(argv: tuple[str, ...]) -> str | None:
+            nonlocal bootstrap_calls
+            if argv[:2] == ("/bin/launchctl", "bootstrap"):
+                bootstrap_calls += 1
+                raise _ManagedServiceCommandError(5)
+            return self.runner(argv)
+
+        manager._command_runner = invalid_bootstrap_runner
+
+        with self.assertRaises(_ManagedServiceCommandError):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertEqual(bootstrap_calls, 1)
 
     def test_systemd_refuses_to_restart_or_disable_a_foreign_fragment(self) -> None:
         data = self.config_data(platform="systemd-user")
@@ -2820,17 +3871,17 @@ class PortableInstallationManagerTest(unittest.TestCase):
         child.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
-            'pathlib.Path(sys.argv[1]).write_text(json.dumps({"secret": os.environ.get("HINDSIGHT_API_KEY"), "ambient": os.environ.get("UNRELATED_AMBIENT"), "release_path": os.environ.get("CAPTURE_RELEASE"), "inventory": os.environ.get("HINDSIGHT_MEMORY_INVENTORY"), "uvx": os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE"), "path": os.environ.get("PATH"), "isolated": sys.flags.isolated}))\n',
+            'pathlib.Path(sys.argv[1]).write_text(json.dumps({"secret": os.environ.get("HINDSIGHT_API_KEY"), "ambient": os.environ.get("UNRELATED_AMBIENT"), "release_path": os.environ.get("CAPTURE_RELEASE"), "inventory": os.environ.get("HINDSIGHT_MEMORY_INVENTORY"), "uvx": os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE"), "npx": os.environ.get("HINDSIGHT_EMBED_NPX_EXECUTABLE"), "path": os.environ.get("PATH"), "isolated": sys.flags.isolated}))\n',
             encoding="utf-8",
         )
         child.chmod(0o755)
         self.resolver.chmod(0o700)
-        self.resolver.write_text(
+        resolver_source = (
             "#!/usr/bin/env python3\n"
             "import json\n"
-            'print(json.dumps({"schema_version": 1, "values": {"HINDSIGHT_API_KEY": "test-canary-secret"}}))\n',
-            encoding="utf-8",
+            'print(json.dumps({"schema_version": 1, "values": {"HINDSIGHT_API_KEY": "test-canary-secret"}}))\n'
         )
+        self.resolver.write_text(resolver_source, encoding="utf-8")
         self.resolver.chmod(0o500)
         data = self.config_data()
         npx_directory = self.inventory.parent / "node-bin"
@@ -2849,12 +3900,6 @@ class PortableInstallationManagerTest(unittest.TestCase):
         manager = PortableInstallationManager(config, command_runner=self.runner)
         manager.install(release, version="1.0.0")
         launcher = self.install_root / "launcher.py"
-        self.resolver.chmod(0o700)
-        self.resolver.write_text(
-            "#!/bin/sh\nprintf '%s\\n' 'source resolver was replaced' >&2\nexit 91\n",
-            encoding="utf-8",
-        )
-        self.resolver.chmod(0o500)
 
         environment = {
             "UNRELATED_AMBIENT": "must-not-cross",
@@ -2887,10 +3932,35 @@ class PortableInstallationManagerTest(unittest.TestCase):
             str((self.install_root / "managed-inventory.json").resolve()),
         )
         self.assertEqual(captured["uvx"], "/usr/bin/true")
+        self.assertEqual(captured["npx"], str(npx))
         self.assertEqual(captured["path"], f"{npx_directory}:/usr/bin:/bin")
         self.assertEqual(captured["isolated"], 1)
         for path in self.service_root.glob("*"):
             self.assertNotIn("test-canary-secret", path.read_text())
+
+        self.resolver.chmod(0o700)
+        self.resolver.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'source resolver was replaced' >&2\nexit 91\n",
+            encoding="utf-8",
+        )
+        self.resolver.chmod(0o500)
+        drifted_resolver = subprocess.run(
+            manager._launch_argv("service", "broker"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=10,
+        )
+        self.assertNotEqual(drifted_resolver.returncode, 0)
+        self.assertEqual(
+            drifted_resolver.stderr,
+            b"credential resolver is not protected\n",
+        )
+        self.resolver.chmod(0o700)
+        self.resolver.write_text(resolver_source, encoding="utf-8")
+        self.resolver.chmod(0o500)
 
         original_config = self.config_path.read_text()
         self.config_path.chmod(0o600)
@@ -3209,6 +4279,378 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(capture.read_text(encoding="utf-8"), "2.0.0")
 
+    def test_hook_authority_remains_on_candidate_after_runtime_rollback(
+        self,
+    ) -> None:
+        capture = self.root / "hook-authority"
+        arguments_capture = self.root / "hook-authority-arguments"
+
+        def authority_release(version: str) -> Path:
+            release = self.release(version)
+            target = release / "bin" / "hindsight-memory"
+            target.write_text(
+                (
+                    "#!/bin/sh\n"
+                    f"printf '%s' {version!r} > {str(capture)!r}\n"
+                    f"printf '%s\\n' \"$@\" > {str(arguments_capture)!r}\n"
+                ),
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+            return release
+
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(authority_release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            authority_release("2.0.0"),
+            version="2.0.0",
+        )
+
+        manager.rollback(expected_current_digest=current["release_digest"])
+        completed = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "harness-config",
+                "status",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(capture.read_text(encoding="utf-8"), "2.0.0")
+
+        state_scoped = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertEqual(
+            state_scoped.returncode,
+            0,
+            state_scoped.stderr.decode(),
+        )
+        self.assertEqual(
+            arguments_capture.read_text(encoding="utf-8").splitlines(),
+            [
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+        )
+        wrong_state = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.root / "wrong-state"),
+                "harness-config",
+                "disable",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(wrong_state.returncode, 0)
+        self.assertIn(
+            b"hook authority state directory is invalid",
+            wrong_state.stderr,
+        )
+        disallowed = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "uninstall",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(disallowed.returncode, 0)
+        self.assertIn(
+            b"hook authority permits only harness configuration commands",
+            disallowed.stderr,
+        )
+        self.assertEqual(
+            arguments_capture.read_text(encoding="utf-8").splitlines(),
+            [
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+        )
+
+        managed_config_path = self.install_root / "managed-config.json"
+        state_path = self.install_root / "install-state.json"
+        managed_config_preimage = managed_config_path.read_bytes()
+        state_preimage = state_path.read_bytes()
+        malformed_config = b'{"state_root":"/first","state_root":"/second"}\n'
+        malformed_digest = hashlib.sha256(malformed_config).hexdigest()
+        managed_config_path.chmod(0o700)
+        managed_config_path.write_bytes(malformed_config)
+        managed_config_path.chmod(0o500)
+        malformed_state = json.loads(state_preimage)
+        malformed_state["config_file_digest"] = malformed_digest
+        malformed_state["owned_install_files"][
+            str(managed_config_path)
+        ] = malformed_digest
+        state_path.write_text(
+            json.dumps(malformed_state),
+            encoding="utf-8",
+        )
+        malformed = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertEqual(
+            malformed.stderr,
+            b"managed config binding is invalid\n",
+        )
+        managed_config_path.chmod(0o700)
+        managed_config_path.write_bytes(managed_config_preimage)
+        managed_config_path.chmod(0o500)
+        state_path.write_bytes(state_preimage)
+
+        authority_path = self.install_root / "hook-authority.json"
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+        authority["version"] = "1.0.0"
+        authority_path.chmod(0o700)
+        authority_path.write_text(
+            json.dumps(authority),
+            encoding="utf-8",
+        )
+        authority_path.chmod(0o500)
+        drifted = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "harness-config",
+                "status",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(drifted.returncode, 0)
+        self.assertIn(b"hook authority digest mismatch", drifted.stderr)
+
+    def test_rollback_launcher_uses_candidate_authority_and_omits_extension(
+        self,
+    ) -> None:
+        runtime_capture = self.root / "runtime-capture.json"
+        authority_capture = self.root / "authority-capture.json"
+
+        def release_with_probes(version: str, *, authority: bool) -> Path:
+            release = self.release(version)
+            runtime = release / "bin" / "runtime-capture"
+            runtime.write_text(
+                (
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, pathlib\n"
+                    f"pathlib.Path({str(runtime_capture)!r}).write_text("
+                    "json.dumps({"
+                    f"'version': {version!r}, "
+                    "'extension': os.environ.get("
+                    "'HINDSIGHT_API_HTTP_EXTENSION')"
+                    "}))\n"
+                ),
+                encoding="utf-8",
+            )
+            runtime.chmod(0o755)
+            if authority:
+                supervisor = (
+                    release / "bin/hindsight-hook-authority-supervisor"
+                )
+                supervisor.write_text(
+                    (
+                        "#!/usr/bin/env python3\n"
+                        "import json, os, pathlib\n"
+                        f"pathlib.Path({str(authority_capture)!r}).write_text("
+                        "json.dumps({"
+                        "'release': os.environ.get("
+                        "'HINDSIGHT_HOOK_AUTHORITY_RELEASE_DIGEST'), "
+                        "'controller': os.environ.get("
+                        "'HINDSIGHT_HOOK_AUTHORITY_CONTROLLER_SHA256')"
+                        "}))\n"
+                    ),
+                    encoding="utf-8",
+                )
+                supervisor.chmod(0o755)
+            return release
+
+        base = release_with_probes("1.0.0", authority=False)
+        old_data = self.config_data()
+        old_data["services"][0].update(
+            entrypoint="bin/runtime-capture",
+            arguments=[],
+            credentials=[],
+        )
+        self.config_path.write_text(
+            json.dumps(old_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        old_manager = PortableInstallationManager(
+            InstallationConfig.load(
+                old_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        installed = old_manager.install(base, version="1.0.0")
+
+        candidate = release_with_probes("2.0.0", authority=True)
+        new_data = json.loads(json.dumps(old_data))
+        extension = (
+            "hindsight_memory_control_plane."
+            "migration_generation_extension:"
+            "MigrationGenerationHttpExtension"
+        )
+        new_data["services"][0]["environment"][
+            "HINDSIGHT_API_HTTP_EXTENSION"
+        ] = extension
+        new_data["health_checks"][0]["environment"][
+            "HINDSIGHT_API_HTTP_EXTENSION"
+        ] = extension
+        new_data["services"].append(
+            {
+                "service_id": "hook-authority",
+                "label": "io.nisavid.hindsight.synthetic.hook-authority",
+                "entrypoint": "bin/hindsight-hook-authority-supervisor",
+                "arguments": [],
+                "environment": {"PATH": "/usr/bin:/bin"},
+                "credentials": [],
+                "restart": "on-failure",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(new_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(
+                new_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        upgraded = manager.upgrade(
+            candidate,
+            version="2.0.0",
+            expected_current_binding_generation_digest=installed[
+                "binding_generation_digest"
+            ],
+        )
+        manager.rollback(
+            expected_current_digest=upgraded["release_digest"],
+        )
+
+        runtime = subprocess.run(
+            manager._launch_argv("service", "broker"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        authority = subprocess.run(
+            manager._launch_argv("service", "hook-authority"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+
+        self.assertEqual(runtime.returncode, 0, runtime.stderr.decode())
+        self.assertEqual(authority.returncode, 0, authority.stderr.decode())
+        self.assertEqual(
+            json.loads(runtime_capture.read_text()),
+            {"version": "1.0.0", "extension": None},
+        )
+        authority_environment = json.loads(authority_capture.read_text())
+        self.assertEqual(
+            authority_environment["release"],
+            upgraded["release_digest"],
+        )
+        self.assertEqual(
+            authority_environment["controller"],
+            next(
+                entry["sha256"]
+                for entry in json.loads(
+                    (
+                        self.install_root / "hook-authority.json"
+                    ).read_text()
+                )["manifest"]["files"]
+                if entry["path"] == "bin/hindsight-memory"
+            ),
+        )
+
     def test_service_launcher_uses_owned_inventory_after_external_drift(self) -> None:
         data = self.config_data()
         data["services"][0]["credentials"] = []
@@ -3373,6 +4815,33 @@ class PortableInstallationManagerTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(PortableInstallError, "credential resolver"):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+    def test_install_rejects_credential_resolver_symlinked_ancestry(self) -> None:
+        real_parent = self.root / "real-resolver-parent"
+        real_parent.mkdir()
+        real_resolver = real_parent / "resolver"
+        real_resolver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        real_resolver.chmod(0o500)
+        linked_parent = self.root / "linked-resolver-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        configured_resolver = linked_parent / "resolver"
+        data = self.config_data()
+        data["credential_resolver"] = {
+            "path": str(configured_resolver),
+            "sha256": file_sha256(real_resolver),
+        }
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "credential resolver ancestry",
+        ):
             manager.install(self.release("1.0.0"), version="1.0.0")
 
     def test_install_rejects_symlink_managed_roots_and_lock(self) -> None:
@@ -3618,7 +5087,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 manager._launch_argv("health", "broker"),
             ),
             (
-                self.install_root / "credential-resolver",
+                self.resolver,
                 manager._launch_argv("health", "broker"),
             ),
         )
@@ -3750,6 +5219,26 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertTrue(self.resolver.exists())
         self.assertFalse(self.install_root.exists())
         self.assertEqual(list(self.service_root.glob("*")), [])
+
+    def test_uninstall_rejects_resolver_drift_before_mutation(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        calls_before = list(self.runner.calls)
+        manifests = tuple(manager.config.service_root.iterdir())
+        self.resolver.chmod(0o700)
+        self.resolver.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+        self.resolver.chmod(0o500)
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "credential resolver digest mismatch",
+        ):
+            manager.uninstall()
+
+        self.assertEqual(self.runner.calls, calls_before)
+        self.assertFalse(manager._uninstall_transaction_path.exists())
+        self.assertTrue(self.install_root.is_dir())
+        self.assertTrue(all(path.is_file() for path in manifests))
 
     def test_uninstall_rejects_external_owned_install_paths(self) -> None:
         manager = self.manager(health_runner=lambda _check, _release: True)
@@ -3956,6 +5445,44 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 data = self.config_data()
                 data["services"][0]["environment"][name] = "ordinary"
                 InstallationConfig.load(data, source_path=self.config_path)
+
+    def test_embeddings_api_key_environment_accepts_only_policy_marker(self) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"][
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
+        ] = "provider-policy:openai-luna"
+        loaded = InstallationConfig.load(data, source_path=self.config_path)
+        self.assertIn(
+            (
+                "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY",
+                "provider-policy:openai-luna",
+            ),
+            loaded.services[0].environment,
+        )
+
+        for invalid in (
+            "",
+            "sk-example",
+            "provider-policy:",
+            "provider-policy:openai luna",
+            "provider-policy:openai/luna",
+        ):
+            with self.subTest(invalid=invalid):
+                data = self.config_data()
+                data["services"][0]["environment"][
+                    "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
+                ] = invalid
+                with self.assertRaisesRegex(PortableInstallError, "environment"):
+                    InstallationConfig.load(data, source_path=self.config_path)
+
+        data = self.config_data()
+        data["services"][0]["environment"]["OPENAI_API_KEY"] = (
+            "provider-policy:openai-luna"
+        )
+        with self.assertRaisesRegex(
+            PortableInstallError, "credential environment"
+        ):
+            InstallationConfig.load(data, source_path=self.config_path)
 
     def test_config_requires_exact_schema_version_and_protected_path(self) -> None:
         for schema_version in (True, 1.0, "1"):
@@ -4172,6 +5699,100 @@ class PortableInstallationManagerTest(unittest.TestCase):
             PortableInstallError, "health_checks must be a non-empty list"
         ):
             InstallationConfig.load(data, source_path=self.config_path)
+
+    def test_config_accepts_the_approved_hindsight_api_version(self) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"]["HINDSIGHT_EMBED_API_VERSION"] = (
+            "0.9.2"
+        )
+
+        config = InstallationConfig.load(data, source_path=self.config_path)
+
+        self.assertEqual(
+            dict(config.services[0].environment)["HINDSIGHT_EMBED_API_VERSION"],
+            "0.9.2",
+        )
+
+    def test_config_rejects_an_unapproved_hindsight_api_version(self) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"]["HINDSIGHT_EMBED_API_VERSION"] = (
+            "0.9.1"
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "HINDSIGHT_EMBED_API_VERSION must equal 0.9.2",
+        ):
+            InstallationConfig.load(data, source_path=self.config_path)
+
+    def test_install_rejects_a_profile_api_version_override_before_mutation(
+        self,
+    ) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_root / "embed"),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True), encoding="utf-8"
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+        )
+        home = self.root / "home"
+        profile = home / ".hindsight" / "profiles" / "core.env"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "HINDSIGHT_EMBED_API_VERSION=0.9.1\n",
+            encoding="utf-8",
+        )
+        account = mock.Mock(pw_dir=str(home))
+
+        with (
+            mock.patch(
+                "hindsight_memory_control_plane.portable_install.pwd.getpwuid",
+                return_value=account,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError,
+                "managed profile API version differs",
+            ),
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertFalse(self.install_root.exists())
+        self.assertEqual(self.runner.calls, [])
+
+    def test_profile_api_version_preflight_accepts_an_absent_override(
+        self,
+    ) -> None:
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_root / "embed"),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+        )
+        home = self.root / "home"
+        home.mkdir()
+        account = mock.Mock(pw_dir=str(home))
+
+        with mock.patch(
+            "hindsight_memory_control_plane.portable_install.pwd.getpwuid",
+            return_value=account,
+        ):
+            manager._preflight_managed_profile_api_versions()
 
     def test_service_launcher_rejects_duplicate_and_oversized_resolver_output(
         self,
@@ -4418,6 +6039,65 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 argument_parser, portable_with_ambient
             )
 
+    def test_cli_exposes_supported_data_identity_evidence_commands(self) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        argument_parser = module["parser"]()
+        evidence = argument_parser.parse_args(
+            [
+                "data-identity",
+                "evidence",
+                "--config",
+                str(self.config_path),
+                "--candidate-release-root",
+                str(self.root),
+                "--candidate-release-identity",
+                str(self.root / "identity.json"),
+                "--artifact",
+                str(self.root / "backup.age"),
+                "--backup-attestation",
+                str(self.root / "backup.json"),
+                "--output",
+                str(self.root / "evidence.json"),
+                "--age",
+                str(self.root / "age"),
+                "--age-identity",
+                str(self.root / "key.txt"),
+                "--recipient",
+                "age1example",
+                "--postgres-bin-dir",
+                str(self.root / "postgres"),
+                "--run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "1" * 32,
+                "--restore-run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "2" * 32,
+                "--port",
+                "55432",
+            ]
+        )
+        observe = argument_parser.parse_args(
+            [
+                "data-identity",
+                "observe",
+                "--config",
+                str(self.config_path),
+                "--base-evidence",
+                str(self.root / "evidence.json"),
+                "--output",
+                str(self.root / "observation.json"),
+            ]
+        )
+
+        self.assertIs(
+            evidence.run,
+            module["data_identity_rebind_evidence_command"],
+        )
+        self.assertIs(
+            observe.run,
+            module["data_identity_rebind_observe_command"],
+        )
+
     def test_cli_requires_upgrade_to_run_from_the_candidate_release(self) -> None:
         module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
         argument_parser = module["parser"]()
@@ -4467,6 +6147,43 @@ class PortableInstallationManagerTest(unittest.TestCase):
             expected_current_binding_generation_digest="b" * 64,
         )
 
+        manager.reset_mock()
+        rebind_plan_path = self.root / "verified-rebind-plan.json"
+        rebind_plan = {"plan_digest": "c" * 64}
+        candidate_with_handoff = argument_parser.parse_args(
+            [
+                "upgrade",
+                "--config",
+                str(self.config_path),
+                "--release-root",
+                str(ROOT),
+                "--version",
+                "2.0.0",
+                "--expected-current-binding-generation-digest",
+                "b" * 64,
+                "--verified-rebind-plan",
+                str(rebind_plan_path),
+            ]
+        )
+        with mock.patch.dict(
+            function_globals,
+            {
+                "_portable_manager": lambda _args: manager,
+                "_print_result": lambda _result: 0,
+                "read_json": lambda path: rebind_plan,
+            },
+        ):
+            self.assertEqual(
+                module["portable_upgrade_command"](candidate_with_handoff),
+                0,
+            )
+        manager.upgrade.assert_called_once_with(
+            str(ROOT),
+            version="2.0.0",
+            expected_current_binding_generation_digest="b" * 64,
+            verified_rebind_plan=rebind_plan,
+        )
+
     def test_candidate_cli_does_not_mutate_release_with_bytecode(self) -> None:
         release = self.root / "candidate-release"
         shutil.copytree(
@@ -4487,6 +6204,2617 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(list(release.rglob("__pycache__")), [])
         self.assertEqual(list(release.rglob("*.pyc")), [])
+
+    def rebind_manager(
+        self, *, fleet_profiles: str = "systalyze"
+    ) -> PortableInstallationManager:
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_root / "embed"),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": fleet_profiles,
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        return PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+
+    def rebind_evidence(
+        self,
+        artifact: Path,
+        *,
+        now: int,
+    ) -> dict[str, Any]:
+        data_metadata = self.data_root.lstat()
+        postgres_root = self.data_root / "data"
+        postgres_metadata = postgres_root.lstat()
+        return build_rebind_evidence(
+            artifact=artifact,
+            data_root=self.data_root,
+            data_root_device=data_metadata.st_dev,
+            data_root_inode=data_metadata.st_ino,
+            postgres_data_root=postgres_root,
+            postgres_data_device=postgres_metadata.st_dev,
+            postgres_data_inode=postgres_metadata.st_ino,
+            collected_at=now - 10,
+            expires_at=now + 300,
+            backup_created_at=now - 5,
+            restored_at=now - 1,
+            postmaster_pid=1234,
+            postmaster_start_time=now - 100,
+        )
+
+    def rebind_inputs(
+        self,
+        *,
+        fleet_profiles: str = "systalyze",
+    ) -> tuple[
+        PortableInstallationManager,
+        dict[str, Any],
+        bytes,
+        Path,
+    ]:
+        manager = self.rebind_manager(fleet_profiles=fleet_profiles)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        displaced = self.root / "displaced-data"
+        self.data_root.rename(displaced)
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "data").mkdir(mode=0o700)
+        sentinel = self.data_root / "data" / "database-sentinel"
+        sentinel.write_bytes(b"database-unchanged")
+        backup_root = self.state_root / "data-identity-rebind" / "backups"
+        backup_root.mkdir(parents=True, mode=0o700)
+        artifact = backup_root / "fresh-full-schema.dump.age"
+        artifact.write_bytes(b"age-encryption.org/v1\nencrypted-full-schema")
+        evidence = self.rebind_evidence(artifact, now=1000)
+        prestate = (self.install_root / "install-state.json").read_bytes()
+        return manager, evidence, prestate, sentinel
+
+    def prepared_rebind(
+        self,
+    ) -> tuple[
+        PortableInstallationManager,
+        dict[str, Any],
+        dict[str, Any],
+        bytes,
+        Path,
+    ]:
+        manager, evidence, prestate, sentinel = self.rebind_inputs()
+        plan = manager.data_identity_rebind_plan(evidence, now=1000)
+        return manager, evidence, dict(plan), prestate, sentinel
+
+    def test_data_identity_rebind_migrates_same_launchd_root_to_v2(self) -> None:
+        manager = self.rebind_manager()
+
+        def legacy_identity(path, metadata, *, platform):
+            self.assertEqual(platform, "launchd")
+            return digest(
+                {
+                    "path": str(path.resolve(strict=True)),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                }
+            )
+
+        with mock.patch.object(
+            portable_install_module,
+            "_data_root_identity_digest",
+            side_effect=legacy_identity,
+        ):
+            installed = manager.install(self.release("1.0.0"), version="1.0.0")
+        root_before = self.data_root.lstat()
+        (self.data_root / "data").mkdir(mode=0o700)
+        sentinel = self.data_root / "data" / "database-sentinel"
+        sentinel.write_bytes(b"database-unchanged")
+        backup_root = self.state_root / "data-identity-rebind" / "backups"
+        backup_root.mkdir(parents=True, mode=0o700)
+        artifact = backup_root / "fresh-full-schema.dump.age"
+        artifact.write_bytes(b"age-encryption.org/v1\nencrypted-full-schema")
+        evidence = self.rebind_evidence(artifact, now=1000)
+
+        plan = manager.data_identity_rebind_plan(evidence, now=1000)
+        self.assertEqual(
+            plan["old_data_identity_digest"],
+            installed["data_identity_digest"],
+        )
+        self.assertNotEqual(
+            plan["new_data_identity_digest"],
+            plan["old_data_identity_digest"],
+        )
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        verified = manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        root_after = self.data_root.lstat()
+
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(manager.verify()["status"], "verified")
+        self.assertEqual(
+            (root_after.st_dev, root_after.st_ino, root_after.st_birthtime),
+            (root_before.st_dev, root_before.st_ino, root_before.st_birthtime),
+        )
+        self.assertEqual(sentinel.read_bytes(), b"database-unchanged")
+
+    def test_verified_rebind_handoff_upgrades_from_stopped_old_release(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        state = manager._load_state()
+        assert state is not None
+
+        upgraded = manager.upgrade(
+            self.release("2.0.0"),
+            version="2.0.0",
+            expected_current_binding_generation_digest=state[
+                "binding_generation_digest"
+            ],
+            verified_rebind_plan=plan,
+        )
+
+        self.assertEqual(upgraded["status"], "upgraded")
+        self.assertEqual(manager.verify()["current"]["version"], "2.0.0")
+        self.assertEqual(
+            set(self.runner.launchd_jobs),
+            {
+                "io.nisavid.hindsight.synthetic.broker",
+                "io.nisavid.hindsight.synthetic.integration-upgrades",
+            },
+        )
+
+    def test_failed_verified_rebind_upgrade_restores_stopped_old_release(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        manager._health_runner = (
+            lambda _check, release: release["version"] != "2.0.0"
+        )
+        state = manager._load_state()
+        assert state is not None
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        restored = manager._load_state()
+        assert restored is not None
+        self.assertEqual(restored["current"]["version"], "1.0.0")
+        self.assertIsNone(restored["transaction"])
+        self.assertEqual(self.runner.launchd_jobs, {})
+        self.assertFalse(manager._transaction_path.exists())
+
+    def test_failed_rebind_upgrade_waits_for_launchd_bootout_before_recovery(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        delayed = DelayedBootoutRunner(delayed_snapshots=2)
+        manager._command_runner = delayed
+        manager._health_runner = (
+            lambda _check, release: release["version"] != "2.0.0"
+        )
+        state = manager._load_state()
+        assert state is not None
+
+        with (
+            mock.patch.object(portable_install_module.time, "sleep"),
+            self.assertRaisesRegex(
+                PortableInstallError,
+                "health verification failed",
+            ),
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        restored = manager._load_state()
+        assert restored is not None
+        self.assertEqual(restored["current"]["version"], "1.0.0")
+        self.assertEqual(delayed.launchd_jobs, {})
+        self.assertFalse(manager._transaction_path.exists())
+        self.assertGreaterEqual(
+            sum(
+                call[:2] == ("/bin/launchctl", "print")
+                for call in delayed.calls
+            ),
+            6,
+        )
+
+    def test_interrupted_verified_rebind_upgrade_retries_from_stopped_prestate(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        state = manager._load_state()
+        assert state is not None
+        release = self.release("2.0.0")
+
+        def interrupt_candidate(_check, candidate):
+            if candidate["version"] == "2.0.0":
+                raise KeyboardInterrupt
+            return True
+
+        manager._health_runner = interrupt_candidate
+        with self.assertRaises(KeyboardInterrupt):
+            manager.upgrade(
+                release,
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+        self.assertTrue(manager._transaction_path.is_file())
+
+        manager._health_runner = lambda _check, _release: True
+        upgraded = manager.upgrade(
+            release,
+            version="2.0.0",
+            expected_current_binding_generation_digest=state[
+                "binding_generation_digest"
+            ],
+            verified_rebind_plan=plan,
+        )
+
+        self.assertEqual(upgraded["status"], "upgraded")
+        self.assertEqual(manager.verify()["current"]["version"], "2.0.0")
+        self.assertFalse(manager._transaction_path.exists())
+
+    def test_rebind_handoff_upgrade_requires_verification_before_mutation(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager._deactivate_services()
+        state = manager._load_state()
+        assert state is not None
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "verification receipt is unavailable",
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        self.assertEqual(manager._load_state(), state)
+        self.assertFalse(manager._transaction_path.exists())
+        self.assertEqual(self.runner.launchd_jobs, {})
+
+    def test_rebind_handoff_upgrade_requires_jobs_absent_before_mutation(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        state = manager._load_state()
+        assert state is not None
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "requires managed launchd jobs absent",
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        self.assertEqual(manager._load_state(), state)
+        self.assertFalse(manager._transaction_path.exists())
+
+    def test_data_identity_rebind_plan_refuses_evidence_profile_mismatch(
+        self,
+    ) -> None:
+        manager, evidence, _prestate, _sentinel = self.rebind_inputs()
+        evidence["profile_id"] = "other"
+        with self.assertRaisesRegex(PortableInstallError, "profile differs"):
+            manager.data_identity_rebind_plan(evidence, now=1000)
+
+    def test_data_identity_rebind_plan_does_not_require_pre_repair_health(
+        self,
+    ) -> None:
+        manager, evidence, _prestate, _sentinel = self.rebind_inputs()
+        health_runner = mock.Mock(return_value=True)
+        manager._health_runner = health_runner
+
+        with mock.patch.object(
+            PortableInstallationManager,
+            "_verify_service_manager",
+        ) as service_manager_check:
+            plan = manager.data_identity_rebind_plan(evidence, now=1000)
+
+        health_runner.assert_not_called()
+        service_manager_check.assert_not_called()
+        self.assertEqual(plan["action"], "rebind-data-identity")
+
+    def test_data_identity_profile_refuses_incomplete_desired_state_binding(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            PortableInstallError, "environment value is invalid"
+        ):
+            self.rebind_manager(fleet_profiles="")
+        incomplete_binding_manager = self.rebind_manager()
+        service = incomplete_binding_manager.config.services[0]
+        incomplete_binding_manager.config = replace(
+            incomplete_binding_manager.config,
+            services=(
+                replace(
+                    service,
+                    environment=(
+                        (
+                            "HINDSIGHT_EMBED_STATE_DIR",
+                            str(self.state_root / "embed"),
+                        ),
+                        ("HINDSIGHT_EMBED_FLEET_PROFILES", ""),
+                    ),
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(PortableInstallError, "binding is incomplete"):
+            incomplete_binding_manager._data_identity_profile()
+
+    def test_data_identity_profile_refuses_invalid_identifier(self) -> None:
+        with self.assertRaisesRegex(
+            PortableInstallError, "fleet profile binding is invalid"
+        ):
+            self.rebind_manager(
+                fleet_profiles="systalyze,not a profile"
+            )._data_identity_profile()
+
+    def test_data_identity_rebind_plan_refuses_multiple_profiles(self) -> None:
+        manager, evidence, _prestate, _sentinel = self.rebind_inputs(
+            fleet_profiles="systalyze,other"
+        )
+        with self.assertRaisesRegex(PortableInstallError, "exactly one"):
+            manager.data_identity_rebind_plan(evidence, now=1000)
+
+    def test_data_identity_rebind_plan_refuses_already_bound_root(self) -> None:
+        manager = self.rebind_manager()
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        (self.data_root / "data").mkdir(mode=0o700)
+        backup_root = self.state_root / "data-identity-rebind" / "backups"
+        backup_root.mkdir(parents=True, mode=0o700)
+        artifact = backup_root / "fresh-full-schema.dump.age"
+        artifact.write_bytes(b"age-encryption.org/v1\nencrypted-full-schema")
+        evidence = self.rebind_evidence(artifact, now=1000)
+
+        with self.assertRaisesRegex(PortableInstallError, "already bound"):
+            manager.data_identity_rebind_plan(evidence, now=1000)
+
+    def test_data_identity_replanning_uses_distinct_artifact_sets(self) -> None:
+        manager, evidence, _prestate, _sentinel = self.rebind_inputs()
+
+        first = manager.data_identity_rebind_plan(evidence, now=1000)
+        second = manager.data_identity_rebind_plan(evidence, now=1001)
+
+        self.assertNotEqual(first["plan_digest"], second["plan_digest"])
+        for field in (
+            "rollback_bundle_path",
+            "authorization_receipt_path",
+            "application_receipt_path",
+            "verification_receipt_path",
+        ):
+            self.assertNotEqual(first[field], second[field])
+
+    def assert_rebind_unmutated(self, plan: dict[str, Any], prestate: bytes) -> None:
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+        self.assertFalse(Path(plan["rollback_bundle_path"]).exists())
+        self.assertFalse(Path(plan["authorization_receipt_path"]).exists())
+
+    @contextmanager
+    def expire_plan_at_rebind_mutation_boundary(self):
+        original_verify = portable_install_module.verify_rebind_plan
+        original_backup_verify = portable_install_module.verify_rebind_backup_artifact
+        boundary = {"backup_checked": False}
+
+        def mark_backup_boundary(value):
+            result = original_backup_verify(value)
+            boundary["backup_checked"] = True
+            return result
+
+        def expire_at_mutation_boundary(value, **arguments):
+            if boundary["backup_checked"]:
+                raise portable_install_module.DataIdentityRebindError(
+                    "data-identity rebind plan is expired"
+                )
+            return original_verify(value, **arguments)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "verify_rebind_plan",
+                side_effect=expire_at_mutation_boundary,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "verify_rebind_backup_artifact",
+                side_effect=mark_backup_boundary,
+            ),
+        ):
+            yield boundary
+
+    def test_data_identity_rebind_rejects_out_of_tree_artifacts(self) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        out_of_tree = {
+            **plan,
+            "rollback_bundle_path": str(self.root / "outside.json"),
+        }
+        out_of_tree["plan_digest"] = digest(
+            {key: value for key, value in out_of_tree.items() if key != "plan_digest"}
+        )
+        with self.assertRaisesRegex(PortableInstallError, "outside controller state"):
+            manager.data_identity_rebind_apply(
+                out_of_tree,
+                approval_digest=out_of_tree["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def test_data_identity_rebind_rejects_expired_plan(self) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        with self.assertRaisesRegex(PortableInstallError, "plan is expired"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=plan["expires_at"],
+            )
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def test_data_identity_rebind_rechecks_expiry_after_lock_acquisition(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        with (
+            self.expire_plan_at_rebind_mutation_boundary() as boundary,
+            self.assertRaisesRegex(PortableInstallError, "plan is expired"),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertTrue(boundary["backup_checked"])
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+        self.assertTrue(Path(plan["rollback_bundle_path"]).is_file())
+        self.assertTrue(Path(plan["authorization_receipt_path"]).is_file())
+
+    def test_data_identity_rebind_apply_rehashes_backup_before_state_write(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        Path(plan["backup"]["artifact_path"]).unlink()
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "backup artifact is unavailable"
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+
+    def test_data_identity_rebind_apply_rechecks_database_continuity(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        changed = self.pre_apply_evidence(evidence)
+        changed["database"]["generation_before"] = "generation-2"
+        changed["database"]["generation_after"] = "generation-2"
+        changed = reseal_rebind_evidence(changed)
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "continuity evidence differs"
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=changed,
+                now=1000,
+            )
+
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def test_data_identity_rebind_plan_refuses_pending_recovery_without_mutation(
+        self,
+    ) -> None:
+        manager, evidence, prestate, _sentinel = self.rebind_inputs()
+        pending = b'{"operator":"must-recover-explicitly"}\n'
+        manager._transaction_path.write_bytes(pending)
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "requires quiescent installer state"
+        ):
+            manager.data_identity_rebind_plan(evidence, now=1000)
+
+        self.assertEqual(manager._transaction_path.read_bytes(), pending)
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+
+    def test_data_identity_rebind_plan_refuses_external_binding_drift(
+        self,
+    ) -> None:
+        manager, evidence, prestate, _sentinel = self.rebind_inputs()
+        inventory = manager.config.inventory_path
+        inventory.write_bytes(inventory.read_bytes() + b"\n")
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "installed consumer binding differs"
+        ):
+            manager.data_identity_rebind_plan(evidence, now=1000)
+
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+
+    def test_data_identity_rebind_apply_refuses_external_binding_drift(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        inventory = manager.config.inventory_path
+        inventory.write_bytes(inventory.read_bytes() + b"\n")
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "installed consumer binding differs"
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def test_data_identity_rebind_apply_rechecks_binding_after_backup_hash(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        inventory = manager.config.inventory_path
+        original_backup_verify = portable_install_module.verify_rebind_backup_artifact
+
+        def drift_after_backup(value):
+            result = original_backup_verify(value)
+            inventory.write_bytes(inventory.read_bytes() + b"\n")
+            return result
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "verify_rebind_backup_artifact",
+                side_effect=drift_after_backup,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "installed consumer binding differs"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(),
+            prestate,
+        )
+
+    def test_data_identity_rebind_preserves_concurrent_state_at_final_cas(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        concurrent_state = json.loads(prestate)
+        concurrent_state["npx_alias"] = "/concurrent/installer-owned-alias"
+        concurrent_bytes = (
+            json.dumps(concurrent_state, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+        original_backup_verify = portable_install_module.verify_rebind_backup_artifact
+
+        def publish_concurrent_state(value):
+            result = original_backup_verify(value)
+            state_path.write_bytes(concurrent_bytes)
+            return result
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "verify_rebind_backup_artifact",
+                side_effect=publish_concurrent_state,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "installation state changed after planning"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(state_path.read_bytes(), concurrent_bytes)
+        self.assertTrue(Path(plan["rollback_bundle_path"]).is_file())
+        self.assertTrue(Path(plan["authorization_receipt_path"]).is_file())
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+
+    def test_data_identity_rebind_rejects_unpaired_final_state_snapshot(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        original_snapshot = manager._require_quiescent_rebind_state_locked
+        snapshot_calls = 0
+
+        def return_unpaired_final_snapshot():
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            snapshot = original_snapshot()
+            if snapshot is None or snapshot_calls != 2:
+                return snapshot
+            state, state_bytes, state_identity, root_identity = snapshot
+            return (
+                {**state, "concurrent_unapproved_field": True},
+                state_bytes,
+                state_identity,
+                root_identity,
+            )
+
+        with (
+            mock.patch.object(
+                manager,
+                "_require_quiescent_rebind_state_locked",
+                side_effect=return_unpaired_final_snapshot,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "poststate differs from approved plan"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+
+    def test_immutable_rebind_artifact_replacement_during_fsync_fails_closed(
+        self,
+    ) -> None:
+        artifact_root = self.root / "immutable-artifacts"
+        artifact_root.mkdir(mode=0o700)
+        original_fsync = portable_install_module._fsync_directory
+        foreign = b'{"foreign":true}\n'
+
+        for role in ("rollback", "authorization", "application", "verification"):
+            with self.subTest(role=role):
+                artifact = artifact_root / f"{role}.json"
+                replaced = False
+
+                def replace_during_fsync(path):
+                    nonlocal replaced
+                    if (
+                        directory_argument_matches(path, artifact_root)
+                        and not replaced
+                    ):
+                        replaced = True
+                        artifact.unlink()
+                        artifact.write_bytes(foreign)
+                    original_fsync(path)
+
+                with (
+                    mock.patch.object(
+                        portable_install_module,
+                        "_fsync_directory",
+                        side_effect=replace_during_fsync,
+                    ),
+                    self.assertRaisesRegex(
+                        PortableInstallError, "cannot create immutable artifact"
+                    ),
+                ):
+                    portable_install_module._create_json(
+                        artifact,
+                        {"schema_version": 1, "role": role},
+                    )
+
+                self.assertTrue(replaced)
+                self.assertEqual(artifact.read_bytes(), foreign)
+
+    def test_immutable_rebind_artifact_replacement_on_fsync_error_is_preserved(
+        self,
+    ) -> None:
+        artifact_root = self.root / "immutable-artifact-errors"
+        artifact_root.mkdir(mode=0o700)
+        foreign = b'{"foreign":true}\n'
+
+        for role in ("rollback", "authorization", "application", "verification"):
+            with self.subTest(role=role):
+                artifact = artifact_root / f"{role}.json"
+                replaced = False
+
+                def replace_then_fail(path):
+                    nonlocal replaced
+                    if (
+                        directory_argument_matches(path, artifact_root)
+                        and not replaced
+                    ):
+                        replaced = True
+                        artifact.unlink()
+                        artifact.write_bytes(foreign)
+                    raise OSError(errno.EIO, "simulated directory fsync failure")
+
+                with (
+                    mock.patch.object(
+                        portable_install_module,
+                        "_fsync_directory",
+                        side_effect=replace_then_fail,
+                    ),
+                    self.assertRaisesRegex(
+                        PortableInstallError, "cannot create immutable artifact"
+                    ),
+                ):
+                    portable_install_module._create_json(
+                        artifact,
+                        {"schema_version": 1, "role": role},
+                    )
+
+                self.assertTrue(replaced)
+                self.assertEqual(artifact.read_bytes(), foreign)
+
+    def test_immutable_rebind_artifact_parent_swap_is_preserved_and_rejected(
+        self,
+    ) -> None:
+        artifact_root = self.root / "immutable-parent-swap"
+        artifact_root.mkdir(mode=0o700)
+        prior = artifact_root / "prior.json"
+        prior.write_bytes(b'{"prior":true}\n')
+        prior.chmod(0o600)
+        artifact = artifact_root / "new.json"
+        displaced = self.root / "displaced-immutable-parent"
+        original_fsync = portable_install_module._fsync_directory
+        swapped = False
+
+        def swap_parent_with_hardlink(path):
+            nonlocal swapped
+            if isinstance(path, int) and not swapped:
+                swapped = True
+                artifact_root.rename(displaced)
+                artifact_root.mkdir(mode=0o700)
+                os.link(displaced / artifact.name, artifact)
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=swap_parent_with_hardlink,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "cannot create immutable artifact"
+            ),
+        ):
+            portable_install_module._create_json(
+                artifact,
+                {"schema_version": 1, "role": "authorization"},
+            )
+
+        self.assertTrue(swapped)
+        self.assertEqual((displaced / "prior.json").read_bytes(), b'{"prior":true}\n')
+        self.assertTrue((displaced / artifact.name).is_file())
+        self.assertTrue(artifact.is_file())
+        self.assertEqual(
+            (displaced / artifact.name).stat().st_ino,
+            artifact.stat().st_ino,
+        )
+
+    def test_immutable_rebind_artifact_mode_and_link_drift_fail_closed(
+        self,
+    ) -> None:
+        artifact_root = self.root / "immutable-metadata-drift"
+        artifact_root.mkdir(mode=0o700)
+        original_fsync = portable_install_module._fsync_directory
+
+        for drift in ("mode", "hardlink"):
+            with self.subTest(drift=drift):
+                artifact = artifact_root / f"{drift}.json"
+                alias = artifact_root / f"{drift}.alias"
+                changed = False
+
+                def change_metadata(path):
+                    nonlocal changed
+                    if (
+                        directory_argument_matches(path, artifact_root)
+                        and not changed
+                    ):
+                        changed = True
+                        if drift == "mode":
+                            artifact.chmod(0o644)
+                        else:
+                            os.link(artifact, alias)
+                    original_fsync(path)
+
+                with (
+                    mock.patch.object(
+                        portable_install_module,
+                        "_fsync_directory",
+                        side_effect=change_metadata,
+                    ),
+                    self.assertRaisesRegex(
+                        PortableInstallError, "cannot create immutable artifact"
+                    ),
+                ):
+                    portable_install_module._create_json(
+                        artifact,
+                        {"schema_version": 1, "drift": drift},
+                    )
+
+                self.assertTrue(changed)
+                self.assertFalse(artifact.exists())
+                if drift == "hardlink":
+                    self.assertTrue(alias.is_file())
+
+    def test_data_identity_rebind_writer_failure_preserves_divergent_state(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        divergent = json.loads(prestate)
+        divergent["npx_alias"] = "/concurrent/apply-writer"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+
+        def fail_before_exchange(_first: Path, _second: Path) -> None:
+            state_path.write_bytes(divergent_bytes)
+            raise OSError("simulated exchange failure")
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=fail_before_exchange,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "diverged before atomic exchange"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+        self.assertEqual(
+            list(state_path.parent.glob(f".{state_path.name}.rebind.*")),
+            [],
+        )
+
+    def test_data_identity_rebind_exchange_race_preserves_divergent_state(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        divergent = json.loads(prestate)
+        divergent["npx_alias"] = "/concurrent/apply-exchange"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        raced = False
+
+        def exchange_after_divergence(first: Path, second: Path) -> None:
+            nonlocal raced
+            if not raced:
+                raced = True
+                state_path.write_bytes(divergent_bytes)
+            original_exchange(first, second)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=exchange_after_divergence,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "installation state changed after planning"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+        self.assertEqual(
+            list(state_path.parent.glob(f".{state_path.name}.rebind.*")),
+            [],
+        )
+
+    def test_data_identity_rebind_install_root_swap_fails_uncertain(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        displaced_root = self.root / "displaced-install-root"
+        original_exchange = portable_install_module._atomic_exchange
+        swapped = False
+
+        def swap_root_with_hardlinks(first, second) -> None:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                self.install_root.rename(displaced_root)
+                self.install_root.mkdir(mode=0o700)
+                os.link(displaced_root / first.name, self.install_root / first.name)
+                os.link(displaced_root / second.name, self.install_root / second.name)
+            original_exchange(first, second)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=swap_root_with_hardlinks,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertTrue(swapped)
+        displaced_stages = list(
+            displaced_root.glob(f".{state_path.name}.rebind.*")
+        )
+        shadow_stages = list(
+            self.install_root.glob(f".{state_path.name}.rebind.*")
+        )
+        self.assertEqual(len(displaced_stages), 1)
+        self.assertEqual(len(shadow_stages), 1)
+        self.assertEqual(state_path.read_bytes(), prestate)
+        self.assertEqual(
+            hashlib.sha256((displaced_root / state_path.name).read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertEqual(displaced_stages[0].read_bytes(), prestate)
+        self.assertEqual(
+            hashlib.sha256(shadow_stages[0].read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+
+    def test_data_identity_rebind_post_exchange_drift_preserves_both_entries(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        divergent = json.loads(prestate)
+        divergent["npx_alias"] = "/concurrent/apply-post-exchange"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        raced = False
+
+        def drift_after_exchange(first: Path, second: Path) -> None:
+            nonlocal raced
+            original_exchange(first, second)
+            if not raced:
+                raced = True
+                state_path.write_bytes(divergent_bytes)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=drift_after_exchange,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].read_bytes(), prestate)
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+        live_state = state_path.read_bytes()
+        binding_generation = json.loads(live_state)["binding_generation_digest"]
+        calls_before = list(self.runner.calls)
+        for operation in (
+            lambda: manager.data_identity_rebind_status(plan),
+            lambda: manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1001,
+            ),
+            manager.verify,
+            manager.stop_services,
+            lambda: manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=binding_generation,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                PortableInstallError, "unresolved installer-state exchange stage"
+            ):
+                operation()
+        self.assertEqual(self.runner.calls, calls_before)
+        self.assertEqual(state_path.read_bytes(), live_state)
+        self.assertEqual(stages[0].read_bytes(), prestate)
+
+    def test_data_identity_rebind_post_exchange_fsync_failure_is_uncertain(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        original_exchange = portable_install_module._atomic_exchange
+        original_fsync = portable_install_module._fsync_directory
+        exchanged = False
+
+        def record_exchange(first: Path, second: Path) -> None:
+            nonlocal exchanged
+            original_exchange(first, second)
+            exchanged = True
+
+        def fail_after_exchange(path: Path) -> None:
+            if exchanged:
+                raise OSError("simulated post-exchange fsync failure")
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=record_exchange,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=fail_after_exchange,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(
+            hashlib.sha256(state_path.read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].read_bytes(), prestate)
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+
+    def test_data_identity_rebind_exchange_back_fsync_preserves_stage(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        divergent = json.loads(prestate)
+        divergent["npx_alias"] = "/concurrent/apply-exchange-back-fsync"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        original_fsync = portable_install_module._fsync_directory
+        exchange_count = 0
+
+        def race_first_exchange(first: Path, second: Path) -> None:
+            nonlocal exchange_count
+            if exchange_count == 0:
+                state_path.write_bytes(divergent_bytes)
+            original_exchange(first, second)
+            exchange_count += 1
+
+        def fail_after_exchange_back(path: Path) -> None:
+            if exchange_count == 2:
+                raise OSError("simulated exchange-back fsync failure")
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=race_first_exchange,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=fail_after_exchange_back,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(
+            hashlib.sha256(stages[0].read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+        for operation in (
+            lambda: manager.data_identity_rebind_status(plan),
+            lambda: manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1001,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                PortableInstallError, "unresolved installer-state exchange stage"
+            ):
+                operation()
+
+    def test_data_identity_rebind_exchange_back_failure_blocks_retry(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        divergent = json.loads(prestate)
+        divergent["npx_alias"] = "/concurrent/apply-exchange-back-failure"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        exchange_count = 0
+
+        def fail_exchange_back(first: Path, second: Path) -> None:
+            nonlocal exchange_count
+            if exchange_count == 0:
+                state_path.write_bytes(divergent_bytes)
+                original_exchange(first, second)
+                exchange_count += 1
+                return
+            raise OSError("simulated exchange-back failure")
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=fail_exchange_back,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(
+            hashlib.sha256(state_path.read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].read_bytes(), divergent_bytes)
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+        for operation in (
+            lambda: manager.data_identity_rebind_status(plan),
+            lambda: manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1001,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                PortableInstallError, "unresolved installer-state exchange stage"
+            ):
+                operation()
+
+    def test_data_identity_rebind_cleanup_fsync_reports_committed_state(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        original_exchange = portable_install_module._atomic_exchange
+        original_fsync = portable_install_module._fsync_directory
+        exchanged = False
+        post_exchange_fsyncs = 0
+
+        def record_exchange(first: Path, second: Path) -> None:
+            nonlocal exchanged
+            original_exchange(first, second)
+            exchanged = True
+
+        def fail_cleanup_fsync(path: Path) -> None:
+            nonlocal post_exchange_fsyncs
+            if exchanged:
+                post_exchange_fsyncs += 1
+                if post_exchange_fsyncs == 2:
+                    raise OSError("simulated committed cleanup fsync failure")
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=record_exchange,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=fail_cleanup_fsync,
+            ),
+        ):
+            result = manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(result["status"], "applied-cleanup-uncertain")
+        self.assertEqual(
+            hashlib.sha256(state_path.read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertTrue(Path(plan["application_receipt_path"]).is_file())
+        self.assertEqual(
+            list(state_path.parent.glob(f".{state_path.name}.rebind.*")),
+            [],
+        )
+
+    def test_data_identity_rebind_stage_unlink_failure_preserves_pair(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        original_unlink = os.unlink
+
+        def fail_stage_unlink(path, *args, **kwargs) -> None:
+            if Path(path).name.startswith(f".{state_path.name}.rebind."):
+                raise OSError("simulated stage unlink failure")
+            original_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(os, "unlink", new=fail_stage_unlink),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(
+            hashlib.sha256(state_path.read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].read_bytes(), prestate)
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+        with self.assertRaisesRegex(
+            PortableInstallError, "unresolved installer-state exchange stage"
+        ):
+            manager.verify()
+
+    def test_data_identity_rebind_exchange_back_unlink_preserves_stage(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        divergent = json.loads(prestate)
+        divergent["npx_alias"] = "/concurrent/apply-exchange-back-unlink"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        original_unlink = os.unlink
+        raced = False
+
+        def race_first_exchange(first: Path, second: Path) -> None:
+            nonlocal raced
+            if not raced:
+                raced = True
+                state_path.write_bytes(divergent_bytes)
+            original_exchange(first, second)
+
+        def fail_stage_unlink(path, *args, **kwargs) -> None:
+            if Path(path).name.startswith(f".{state_path.name}.rebind."):
+                raise OSError("simulated restored-stage unlink failure")
+            original_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=race_first_exchange,
+            ),
+            mock.patch.object(os, "unlink", new=fail_stage_unlink),
+            self.assertRaisesRegex(
+                PortableInstallError, "restored with cleanup pending; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(
+            hashlib.sha256(stages[0].read_bytes()).hexdigest(),
+            plan["expected_post_state_digest"],
+        )
+        self.assertFalse(Path(plan["application_receipt_path"]).exists())
+
+    def test_data_identity_rebind_rejects_foreign_authority(self) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        foreign_authority = {**plan, "consumer_id": "foreign"}
+        foreign_authority["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in foreign_authority.items()
+                if key != "plan_digest"
+            }
+        )
+        with self.assertRaisesRegex(PortableInstallError, "authority differs"):
+            manager.data_identity_rebind_apply(
+                foreign_authority,
+                approval_digest=foreign_authority["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def test_data_identity_rebind_rejects_diverged_prestate(self) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        diverged = json.loads(prestate)
+        diverged["npx_alias"] = "/unexpected"
+        (self.install_root / "install-state.json").write_text(
+            json.dumps(diverged, sort_keys=True), encoding="utf-8"
+        )
+        self.assertEqual(
+            manager.data_identity_rebind_status(plan)["status"], "diverged"
+        )
+        with self.assertRaisesRegex(PortableInstallError, "changed after planning"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        (self.install_root / "install-state.json").write_bytes(prestate)
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def test_data_identity_rebind_rejects_invalid_approval(self) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        with self.assertRaisesRegex(PortableInstallError, "approval digest is invalid"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest="short",
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        with self.assertRaisesRegex(PortableInstallError, "approval digest differs"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest="0" * 64,
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        self.assert_rebind_unmutated(plan, prestate)
+
+    def applied_rebind(self):
+        manager, evidence, plan, prestate, sentinel = self.prepared_rebind()
+        applied = manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        return manager, evidence, plan, prestate, sentinel, applied
+
+    @staticmethod
+    def pre_apply_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+        current = json.loads(json.dumps(evidence))
+        current["database"]["observed_at"] = 1000
+        return reseal_rebind_evidence(current)
+
+    @staticmethod
+    def post_rebind_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+        post_evidence = json.loads(json.dumps(evidence))
+        post_evidence["postgres"]["postmaster_pid"] += 1
+        post_evidence["database"]["observed_at"] = 1001
+        return reseal_rebind_evidence(post_evidence)
+
+    def test_data_identity_rebind_apply_changes_only_identity_and_preserves_data(
+        self,
+    ) -> None:
+        _manager, _evidence, plan, prestate, sentinel, applied = self.applied_rebind()
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(sentinel.read_bytes(), b"database-unchanged")
+        state = json.loads(
+            (self.install_root / "install-state.json").read_text(encoding="utf-8")
+        )
+        prior = json.loads(prestate)
+        self.assertEqual(
+            {
+                key: value
+                for key, value in state.items()
+                if key != "data_identity_digest"
+            },
+            {
+                key: value
+                for key, value in prior.items()
+                if key != "data_identity_digest"
+            },
+        )
+        self.assertEqual(
+            state["data_identity_digest"], plan["new_data_identity_digest"]
+        )
+        self.assertTrue(Path(plan["rollback_bundle_path"]).is_file())
+        self.assertTrue(Path(plan["authorization_receipt_path"]).is_file())
+        self.assertTrue(Path(plan["application_receipt_path"]).is_file())
+
+    def test_data_identity_rebind_receipt_records_first_apply_time(self) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1001,
+        )
+        receipt_path = Path(plan["authorization_receipt_path"])
+        receipt = json.loads(receipt_path.read_bytes())
+        self.assertEqual(receipt["authorized_at"], 1001)
+        self.assertNotEqual(receipt["authorized_at"], plan["created_at"])
+
+        self.assertEqual(
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1002,
+            )["status"],
+            "already-applied",
+        )
+        self.assertEqual(json.loads(receipt_path.read_bytes()), receipt)
+
+    def test_data_identity_rebind_recovers_missing_application_receipt(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        application_path = Path(plan["application_receipt_path"])
+        application_path.unlink()
+        current = self.pre_apply_evidence(evidence)
+        current["database"]["observed_at"] = 1001
+        current = reseal_rebind_evidence(current)
+
+        recovered = manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=current,
+            now=1001,
+        )
+
+        self.assertEqual(recovered["status"], "already-applied")
+        self.assertTrue(application_path.is_file())
+        self.assertEqual(
+            json.loads(application_path.read_bytes())["applied_at"],
+            1001,
+        )
+
+    def test_data_identity_rebind_resume_rejects_tampered_artifacts(self) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        authorization_path = Path(plan["authorization_receipt_path"])
+        authorization_receipt = authorization_path.read_bytes()
+        tampered_receipt = json.loads(authorization_receipt)
+        tampered_receipt["plan_digest"] = "0" * 64
+        authorization_path.write_text(
+            json.dumps(tampered_receipt, sort_keys=True), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(PortableInstallError, "receipt differs"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        authorization_path.write_bytes(authorization_receipt)
+        rollback_path = Path(plan["rollback_bundle_path"])
+        rollback_bundle = rollback_path.read_bytes()
+        tampered_bundle = json.loads(rollback_bundle)
+        tampered_bundle["plan_digest"] = "0" * 64
+        rollback_path.write_text(
+            json.dumps(tampered_bundle, sort_keys=True), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(PortableInstallError, "bundle is invalid"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+        rollback_path.write_bytes(rollback_bundle)
+        self.assertEqual(
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )["status"],
+            "already-applied",
+        )
+
+    def test_data_identity_rebind_rejects_symlinked_immutable_artifacts(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        authorization_path = Path(plan["authorization_receipt_path"])
+        outside = self.root / "outside-authorization.json"
+        outside.write_bytes(authorization_path.read_bytes())
+        authorization_path.unlink()
+        authorization_path.symlink_to(outside)
+
+        with self.assertRaisesRegex(PortableInstallError, "must not be a symlink"):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        authorization_path.unlink()
+        authorization_path.write_bytes(outside.read_bytes())
+        rollback_path = Path(plan["rollback_bundle_path"])
+        status = manager.data_identity_rebind_status(plan)
+        outside_rollback = self.root / "outside-rollback.json"
+        outside_rollback.write_bytes(rollback_path.read_bytes())
+        rollback_path.unlink()
+        rollback_path.symlink_to(outside_rollback)
+        with self.assertRaisesRegex(PortableInstallError, "must not be a symlink"):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+    def test_data_identity_rebind_verify_is_idempotent_and_reports_status(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        post_evidence = self.post_rebind_evidence(evidence)
+        unsafe_evidence = json.loads(json.dumps(post_evidence))
+        unsafe_evidence["safety"]["database_mutation_performed"] = True
+        with self.assertRaisesRegex(PortableInstallError, "database mutation marker"):
+            manager.data_identity_rebind_verify(
+                plan,
+                unsafe_evidence,
+                now=1001,
+            )
+        verified = manager.data_identity_rebind_verify(
+            plan,
+            post_evidence,
+            now=1001,
+        )
+        self.assertEqual(verified["status"], "verified")
+        self.assertTrue(Path(plan["verification_receipt_path"]).is_file())
+        verification_receipt = Path(plan["verification_receipt_path"]).read_bytes()
+        repeated_verification = manager.data_identity_rebind_verify(
+            plan,
+            post_evidence,
+            now=1002,
+        )
+        self.assertEqual(repeated_verification["status"], "verified")
+        self.assertEqual(
+            Path(plan["verification_receipt_path"]).read_bytes(),
+            verification_receipt,
+        )
+
+        status = manager.data_identity_rebind_status(plan)
+        self.assertEqual(status["status"], "applied")
+        self.assertEqual(
+            status["data_identity_digest"], plan["new_data_identity_digest"]
+        )
+        self.assertTrue(status["authorization_receipt_present"])
+        self.assertTrue(status["rollback_bundle_present"])
+        self.assertTrue(status["verification_receipt_present"])
+
+    def test_data_identity_rebind_verify_is_offline(self) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = (
+            self.applied_rebind()
+        )
+        with (
+            mock.patch.object(
+                PortableInstallationManager,
+                "_verify_service_manager",
+                side_effect=AssertionError("service verification attempted"),
+            ),
+            mock.patch.object(
+                PortableInstallationManager,
+                "_health",
+                side_effect=AssertionError("runtime health attempted"),
+            ),
+        ):
+            verified = manager.data_identity_rebind_verify(
+                plan,
+                self.post_rebind_evidence(evidence),
+                now=1001,
+            )
+
+        self.assertEqual(verified["status"], "verified")
+
+    def test_data_identity_rebind_verify_rejects_expired_plan(self) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        with self.assertRaisesRegex(PortableInstallError, "plan is expired"):
+            manager.data_identity_rebind_verify(
+                plan,
+                self.post_rebind_evidence(evidence),
+                now=plan["expires_at"],
+            )
+        self.assertFalse(Path(plan["verification_receipt_path"]).exists())
+
+    def test_data_identity_rebind_verify_rejects_preapplication_evidence(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        with self.assertRaisesRegex(PortableInstallError, "predates application"):
+            manager.data_identity_rebind_verify(
+                plan,
+                self.pre_apply_evidence(evidence),
+                now=1001,
+            )
+        self.assertFalse(Path(plan["verification_receipt_path"]).exists())
+
+    def test_data_identity_rebind_verify_rechecks_expiry_after_lock_acquisition(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        with (
+            self.expire_plan_at_rebind_mutation_boundary() as boundary,
+            self.assertRaisesRegex(PortableInstallError, "plan is expired"),
+        ):
+            manager.data_identity_rebind_verify(
+                plan,
+                self.post_rebind_evidence(evidence),
+                now=1001,
+            )
+
+        self.assertTrue(boundary["backup_checked"])
+        self.assertFalse(Path(plan["verification_receipt_path"]).exists())
+
+    def test_data_identity_rebind_verify_requires_apply_artifacts(self) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        post_evidence = self.post_rebind_evidence(evidence)
+        authorization_path = Path(plan["authorization_receipt_path"])
+        authorization = authorization_path.read_bytes()
+        authorization_path.unlink()
+        with self.assertRaisesRegex(
+            PortableInstallError, "authorization receipt.*unavailable"
+        ):
+            manager.data_identity_rebind_verify(
+                plan,
+                post_evidence,
+                now=1001,
+            )
+
+        authorization_path.write_bytes(authorization)
+        rollback_path = Path(plan["rollback_bundle_path"])
+        rollback = json.loads(rollback_path.read_bytes())
+        rollback["plan_digest"] = "0" * 64
+        rollback_path.write_text(json.dumps(rollback), encoding="utf-8")
+        with self.assertRaisesRegex(PortableInstallError, "bundle is invalid"):
+            manager.data_identity_rebind_verify(
+                plan,
+                post_evidence,
+                now=1001,
+            )
+
+    def test_data_identity_rebind_verify_binds_post_evidence_to_data_root(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        post_evidence = self.post_rebind_evidence(evidence)
+        other_root = self.root / "other-data-root"
+        other_postgres = other_root / "data"
+        other_postgres.mkdir(parents=True)
+        root_metadata = other_root.lstat()
+        postgres_metadata = other_postgres.lstat()
+        post_evidence["postgres"].update(
+            data_root=str(other_root),
+            data_root_device=root_metadata.st_dev,
+            data_root_inode=root_metadata.st_ino,
+            postgres_data_root=str(other_postgres),
+            postgres_data_device=postgres_metadata.st_dev,
+            postgres_data_inode=postgres_metadata.st_ino,
+        )
+        post_evidence = reseal_rebind_evidence(post_evidence)
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "does not describe the configured data root"
+        ):
+            manager.data_identity_rebind_verify(
+                plan,
+                post_evidence,
+                now=1001,
+            )
+
+    def test_data_identity_rebind_rollback_restores_blocked_prestate(self) -> None:
+        manager, _evidence, plan, prestate, sentinel, _applied = self.applied_rebind()
+        status = manager.data_identity_rebind_status(plan)
+        with self.assertRaisesRegex(PortableInstallError, "approval digest is invalid"):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest="short",
+            )
+        rolled_back = manager.data_identity_rebind_rollback(
+            plan,
+            approval_digest=status["rollback_authorization_digest"],
+        )
+
+        self.assertEqual(rolled_back["status"], "rolled-back")
+        self.assertEqual(
+            rolled_back["installation_health"],
+            "blocked-pending-data-root-repair",
+        )
+        self.assertEqual(
+            (self.install_root / "install-state.json").read_bytes(), prestate
+        )
+        self.assertEqual(sentinel.read_bytes(), b"database-unchanged")
+        with self.assertRaisesRegex(PortableInstallError, "data identity changed"):
+            manager.verify()
+
+    def test_data_identity_rebind_receipt_failure_restores_prestate(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        state_path = self.install_root / "install-state.json"
+        application_path = Path(plan["application_receipt_path"])
+        original_create = manager._create_or_match_rebind_artifact
+
+        def fail_application_receipt(path, value, *, label, mismatch_message):
+            if path == application_path:
+                raise PortableInstallError("simulated application receipt failure")
+            return original_create(
+                path,
+                value,
+                label=label,
+                mismatch_message=mismatch_message,
+            )
+
+        with (
+            mock.patch.object(
+                manager,
+                "_create_or_match_rebind_artifact",
+                side_effect=fail_application_receipt,
+            ),
+            self.assertRaisesRegex(PortableInstallError, "receipt failure"),
+        ):
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1000,
+            )
+
+        self.assertEqual(state_path.read_bytes(), prestate)
+        self.assertTrue(Path(plan["rollback_bundle_path"]).is_file())
+        self.assertTrue(Path(plan["authorization_receipt_path"]).is_file())
+        self.assertEqual(
+            manager.data_identity_rebind_apply(
+                plan,
+                approval_digest=plan["plan_digest"],
+                pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                now=1001,
+            )["status"],
+            "applied",
+        )
+
+    def test_data_identity_rebind_rollback_exchange_race_preserves_divergence(
+        self,
+    ) -> None:
+        manager, _evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        state_path = self.install_root / "install-state.json"
+        status = manager.data_identity_rebind_status(plan)
+        divergent = json.loads(state_path.read_bytes())
+        divergent["npx_alias"] = "/concurrent/rollback-exchange"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        raced = False
+
+        def exchange_after_divergence(first: Path, second: Path) -> None:
+            nonlocal raced
+            if not raced:
+                raced = True
+                state_path.write_bytes(divergent_bytes)
+            original_exchange(first, second)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=exchange_after_divergence,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "data-identity rollback prestate differs"
+            ),
+        ):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertEqual(
+            list(state_path.parent.glob(f".{state_path.name}.rebind.*")),
+            [],
+        )
+
+    def test_data_identity_rebind_rollback_writer_failure_preserves_divergence(
+        self,
+    ) -> None:
+        manager, _evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        state_path = self.install_root / "install-state.json"
+        status = manager.data_identity_rebind_status(plan)
+        divergent = json.loads(state_path.read_bytes())
+        divergent["npx_alias"] = "/concurrent/rollback-writer"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        def fail_before_exchange(_first: Path, _second: Path) -> None:
+            state_path.write_bytes(divergent_bytes)
+            raise OSError("simulated rollback exchange failure")
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=fail_before_exchange,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "diverged before atomic exchange"
+            ),
+        ):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertEqual(
+            list(state_path.parent.glob(f".{state_path.name}.rebind.*")),
+            [],
+        )
+
+    def test_data_identity_rebind_rollback_post_exchange_fsync_is_uncertain(
+        self,
+    ) -> None:
+        manager, _evidence, plan, prestate, _sentinel, _applied = self.applied_rebind()
+        state_path = self.install_root / "install-state.json"
+        poststate = state_path.read_bytes()
+        status = manager.data_identity_rebind_status(plan)
+        original_exchange = portable_install_module._atomic_exchange
+        original_fsync = portable_install_module._fsync_directory
+        exchanged = False
+
+        def record_exchange(first: Path, second: Path) -> None:
+            nonlocal exchanged
+            original_exchange(first, second)
+            exchanged = True
+
+        def fail_after_exchange(path: Path) -> None:
+            if exchanged:
+                raise OSError("simulated rollback fsync failure")
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=record_exchange,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=fail_after_exchange,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(state_path.read_bytes(), prestate)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].read_bytes(), poststate)
+
+    def test_data_identity_rebind_rollback_exchange_back_fsync_preserves_stage(
+        self,
+    ) -> None:
+        manager, _evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
+        state_path = self.install_root / "install-state.json"
+        poststate = state_path.read_bytes()
+        status = manager.data_identity_rebind_status(plan)
+        divergent = json.loads(poststate)
+        divergent["npx_alias"] = "/concurrent/rollback-exchange-back-fsync"
+        divergent_bytes = (
+            json.dumps(divergent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        original_exchange = portable_install_module._atomic_exchange
+        original_fsync = portable_install_module._fsync_directory
+        exchange_count = 0
+
+        def race_first_exchange(first: Path, second: Path) -> None:
+            nonlocal exchange_count
+            if exchange_count == 0:
+                state_path.write_bytes(divergent_bytes)
+            original_exchange(first, second)
+            exchange_count += 1
+
+        def fail_after_exchange_back(path: Path) -> None:
+            if exchange_count == 2:
+                raise OSError("simulated rollback exchange-back fsync failure")
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=race_first_exchange,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=fail_after_exchange_back,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(state_path.read_bytes(), divergent_bytes)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(
+            hashlib.sha256(stages[0].read_bytes()).hexdigest(),
+            plan["installation_state_digest"],
+        )
+
+    def test_data_identity_rebind_rollback_cleanup_fsync_reports_commit(
+        self,
+    ) -> None:
+        manager, _evidence, plan, prestate, _sentinel, _applied = self.applied_rebind()
+        state_path = self.install_root / "install-state.json"
+        status = manager.data_identity_rebind_status(plan)
+        original_exchange = portable_install_module._atomic_exchange
+        original_fsync = portable_install_module._fsync_directory
+        exchanged = False
+        post_exchange_fsyncs = 0
+
+        def record_exchange(first: Path, second: Path) -> None:
+            nonlocal exchanged
+            original_exchange(first, second)
+            exchanged = True
+
+        def fail_cleanup_fsync(path: Path) -> None:
+            nonlocal post_exchange_fsyncs
+            if exchanged:
+                post_exchange_fsyncs += 1
+                if post_exchange_fsyncs == 2:
+                    raise OSError("simulated rollback cleanup fsync failure")
+            original_fsync(path)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_exchange",
+                side_effect=record_exchange,
+            ),
+            mock.patch.object(
+                portable_install_module,
+                "_fsync_directory",
+                side_effect=fail_cleanup_fsync,
+            ),
+        ):
+            result = manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+        self.assertEqual(result["status"], "rolled-back-cleanup-uncertain")
+        self.assertEqual(state_path.read_bytes(), prestate)
+        self.assertEqual(
+            list(state_path.parent.glob(f".{state_path.name}.rebind.*")),
+            [],
+        )
+
+    def test_data_identity_rebind_rollback_unlink_failure_preserves_pair(
+        self,
+    ) -> None:
+        manager, _evidence, plan, prestate, _sentinel, _applied = self.applied_rebind()
+        state_path = self.install_root / "install-state.json"
+        poststate = state_path.read_bytes()
+        status = manager.data_identity_rebind_status(plan)
+        original_unlink = os.unlink
+
+        def fail_stage_unlink(path, *args, **kwargs) -> None:
+            if Path(path).name.startswith(f".{state_path.name}.rebind."):
+                raise OSError("simulated rollback stage unlink failure")
+            original_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(os, "unlink", new=fail_stage_unlink),
+            self.assertRaisesRegex(
+                PortableInstallError, "exchange is uncertain; preserve"
+            ),
+        ):
+            manager.data_identity_rebind_rollback(
+                plan,
+                approval_digest=status["rollback_authorization_digest"],
+            )
+
+        stages = list(state_path.parent.glob(f".{state_path.name}.rebind.*"))
+        self.assertEqual(state_path.read_bytes(), prestate)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].read_bytes(), poststate)
+        with self.assertRaisesRegex(
+            PortableInstallError, "unresolved installer-state exchange stage"
+        ):
+            manager.verify()
+
+    def test_data_identity_followups_refuse_pending_recovery_without_mutation(
+        self,
+    ) -> None:
+        manager, evidence, plan, prestate, _sentinel = self.prepared_rebind()
+        pending = b'{"operator":"must-recover-explicitly"}\n'
+        manager._transaction_path.write_bytes(pending)
+        calls = (
+            (
+                "apply",
+                lambda: manager.data_identity_rebind_apply(
+                    plan,
+                    approval_digest=plan["plan_digest"],
+                    pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+                    now=1000,
+                ),
+            ),
+            ("status", lambda: manager.data_identity_rebind_status(plan)),
+            (
+                "verify",
+                lambda: manager.data_identity_rebind_verify(
+                    plan,
+                    self.post_rebind_evidence(evidence),
+                    now=1001,
+                ),
+            ),
+            (
+                "rollback",
+                lambda: manager.data_identity_rebind_rollback(
+                    plan,
+                    approval_digest=manager._rebind_rollback_approval(plan),
+                ),
+            ),
+        )
+        for name, call in calls:
+            with (
+                self.subTest(command=name),
+                self.assertRaisesRegex(
+                    PortableInstallError,
+                    "requires quiescent installer state",
+                ),
+            ):
+                call()
+            self.assertEqual(manager._transaction_path.read_bytes(), pending)
+            self.assertEqual(
+                (self.install_root / "install-state.json").read_bytes(),
+                prestate,
+            )
+
+    def test_data_identity_followup_commands_gate_lifecycle_and_config(self) -> None:
+        manager = self.rebind_manager()
+        calls = (
+            ("plan", lambda: manager.data_identity_rebind_plan({})),
+            (
+                "apply",
+                lambda: manager.data_identity_rebind_apply(
+                    {},
+                    approval_digest="0" * 64,
+                    pre_apply_evidence_value={},
+                ),
+            ),
+            ("status", lambda: manager.data_identity_rebind_status({})),
+            ("verify", lambda: manager.data_identity_rebind_verify({}, {})),
+            (
+                "rollback",
+                lambda: manager.data_identity_rebind_rollback(
+                    {}, approval_digest="0" * 64
+                ),
+            ),
+        )
+        for name, call in calls:
+            preflight = mock.Mock(side_effect=PortableInstallError("preflight blocked"))
+            with (
+                self.subTest(gate="preflight", command=name),
+                mock.patch.object(
+                    manager,
+                    "_preflight_lifecycle",
+                    preflight,
+                ),
+                self.assertRaisesRegex(PortableInstallError, "preflight blocked"),
+            ):
+                call()
+            preflight.assert_called_once_with()
+
+        changed = json.loads(self.config_path.read_text(encoding="utf-8"))
+        changed["consumer_id"] = "changed"
+        self.config_path.write_text(
+            json.dumps(changed, sort_keys=True), encoding="utf-8"
+        )
+        for name, call in calls:
+            with (
+                self.subTest(gate="config", command=name),
+                mock.patch.object(
+                    manager, "_lock", side_effect=AssertionError("lock entered")
+                ),
+                self.assertRaisesRegex(PortableInstallError, "config changed"),
+            ):
+                call()
+
+    def test_data_identity_verify_cli_persists_create_only_result(self) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        output = self.root / "verification.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "verify",
+                "--config",
+                str(self.config_path),
+                "--plan",
+                str(self.root / "plan.json"),
+                "--post-evidence",
+                str(self.root / "post-evidence.json"),
+                "--output",
+                str(output),
+            ]
+        )
+        result = {"status": "verified", "plan_digest": "a" * 64}
+        manager = mock.Mock()
+        manager.data_identity_rebind_verify.return_value = result
+        write_private = mock.Mock()
+        function_globals = module["data_identity_rebind_verify_command"].__globals__
+        with mock.patch.dict(
+            function_globals,
+            {
+                "_portable_manager": lambda _args: manager,
+                "read_json": lambda path: {"path": str(path)},
+                "write_private": write_private,
+                "_print_result": lambda value: 0 if value == result else 1,
+            },
+        ):
+            self.assertEqual(
+                module["data_identity_rebind_verify_command"](args),
+                0,
+            )
+        write_private.assert_called_once_with(
+            str(output),
+            result,
+            create_only=True,
+        )
+        manager.data_identity_rebind_verify.assert_called_once_with(
+            {"path": str(self.root / "plan.json")},
+            {"path": str(self.root / "post-evidence.json")},
+        )
+
+    def test_data_identity_observe_cli_refreshes_without_renewing_window(
+        self,
+    ) -> None:
+        self.data_root.mkdir(mode=0o700)
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        output = self.root / "observation.json"
+        base_path = self.root / "base-evidence.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "observe",
+                "--config",
+                str(self.config_path),
+                "--base-evidence",
+                str(base_path),
+                "--output",
+                str(output),
+            ]
+        )
+        base = {
+            "profile_id": "systalyze",
+            "expires_at": 1200,
+            "postgres": {"system_identifier": "7659746962107358086"},
+            "safety": {"controller_authority_disabled": True},
+        }
+        postgres = {"data_root": str(self.data_root)}
+        database = {"observed_at": 1000}
+        refreshed = {**base, "postgres": postgres, "database": database}
+        manager = mock.Mock()
+        manager.config.data_root = self.data_root
+
+        async def observe_live(**_keywords):
+            return {}, postgres, database
+
+        write_private = mock.Mock()
+        verification_times = []
+        refresh_times = []
+
+        def verify(value, *, now):
+            verification_times.append(now)
+            return value
+
+        def refresh(value, **keywords):
+            refresh_times.append(keywords["now"])
+            return refreshed
+
+        function_globals = module[
+            "data_identity_rebind_observe_command"
+        ].__globals__
+        with mock.patch.dict(
+            function_globals,
+            {
+                "_portable_manager": lambda _args: manager,
+                "read_json": lambda path: base if Path(path) == base_path else {},
+                "verify_rebind_evidence": verify,
+                "_read_live_data_identity_evidence": observe_live,
+                "_data_identity_safety_evidence": lambda value: base["safety"],
+                "refresh_rebind_evidence": refresh,
+                "write_private": write_private,
+                "_print_result": lambda value: 0,
+                "time": mock.Mock(time=mock.Mock(side_effect=(1000, 1005))),
+            },
+        ):
+            self.assertEqual(
+                module["data_identity_rebind_observe_command"](args),
+                0,
+            )
+
+        manager._preflight_lifecycle.assert_called_once_with()
+        manager._validate_config_source.assert_called_once_with()
+        self.assertEqual(verification_times, [1000])
+        self.assertEqual(refresh_times, [1005])
+        write_private.assert_called_once_with(
+            str(output),
+            refreshed,
+            create_only=True,
+        )
+
+    def test_data_identity_evidence_cli_binds_backup_and_evidence_outputs(
+        self,
+    ) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        output = self.root / "evidence.json"
+        backup_attestation = self.root / "backup.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "evidence",
+                "--config",
+                str(self.config_path),
+                "--candidate-release-root",
+                str(self.root),
+                "--candidate-release-identity",
+                str(self.root / "identity.json"),
+                "--artifact",
+                str(self.root / "backup.age"),
+                "--backup-attestation",
+                str(backup_attestation),
+                "--output",
+                str(output),
+                "--age",
+                str(self.root / "age"),
+                "--age-identity",
+                str(self.root / "key.txt"),
+                "--recipient",
+                "age1example",
+                "--postgres-bin-dir",
+                str(self.root / "postgres"),
+                "--run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "1" * 32,
+                "--restore-run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "2" * 32,
+                "--port",
+                "55432",
+            ]
+        )
+        backup_live = mock.Mock(return_value=0)
+        function_globals = module[
+            "data_identity_rebind_evidence_command"
+        ].__globals__
+        with mock.patch.dict(
+            function_globals,
+            {
+                "operation_recovery_backup_live_command": backup_live,
+                "time": mock.Mock(time=lambda: 1000),
+            },
+        ):
+            self.assertEqual(
+                module["data_identity_rebind_evidence_command"](args),
+                0,
+            )
+
+        backup_live.assert_called_once_with(args)
+        self.assertEqual(args.data_identity_output, str(output))
+        self.assertEqual(args.output, str(backup_attestation))
+        self.assertEqual(args.data_identity_collected_at, 1000)
+
+    def test_data_identity_evidence_cli_rejects_artifact_path_aliases(
+        self,
+    ) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        shared = self.root / "shared.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "evidence",
+                "--config",
+                str(self.config_path),
+                "--candidate-release-root",
+                str(self.root),
+                "--candidate-release-identity",
+                str(self.root / "identity.json"),
+                "--artifact",
+                str(self.root / "backup.age"),
+                "--backup-attestation",
+                str(shared),
+                "--output",
+                str(shared),
+                "--age",
+                str(self.root / "age"),
+                "--age-identity",
+                str(self.root / "key.txt"),
+                "--recipient",
+                "age1example",
+                "--postgres-bin-dir",
+                str(self.root / "postgres"),
+                "--run-root",
+                "/private/tmp/hindsight-operation-recovery-" + "1" * 32,
+                "--restore-run-root",
+                "/private/tmp/hindsight-operation-recovery-" + "2" * 32,
+                "--port",
+                "55432",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "path aliases an artifact",
+        ):
+            module["data_identity_rebind_evidence_command"](args)
+
+    def test_data_identity_safety_evidence_requires_all_authorities_absent(
+        self,
+    ) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        classify = module["_data_identity_safety_evidence"]
+        globals_ = classify.__globals__
+        absent = subprocess.CompletedProcess([], 113)
+        with mock.patch.dict(
+            globals_,
+            {
+                "subprocess": mock.Mock(
+                    run=mock.Mock(side_effect=(absent, absent, absent)),
+                    DEVNULL=subprocess.DEVNULL,
+                    SubprocessError=subprocess.SubprocessError,
+                )
+            },
+        ):
+            self.assertEqual(
+                classify({"generic_import_receipt_count": 0}),
+                {
+                    "hooks_disabled": True,
+                    "controller_authority_disabled": True,
+                    "no_serena_import_authority": True,
+                    "target_bank_inspected": False,
+                    "database_mutation_performed": False,
+                },
+            )
+
+        for returncode, message in (
+            (0, "is active"),
+            (3, "is unavailable"),
+        ):
+            with (
+                self.subTest(returncode=returncode),
+                mock.patch.dict(
+                    globals_,
+                    {
+                        "subprocess": mock.Mock(
+                            run=mock.Mock(
+                                return_value=subprocess.CompletedProcess(
+                                    [], returncode
+                                )
+                            ),
+                            DEVNULL=subprocess.DEVNULL,
+                            SubprocessError=subprocess.SubprocessError,
+                        )
+                    },
+                ),
+                self.assertRaisesRegex(
+                    module["DataIdentityRebindError"],
+                    message,
+                ),
+            ):
+                classify({"generic_import_receipt_count": 0})
 
 
 if __name__ == "__main__":

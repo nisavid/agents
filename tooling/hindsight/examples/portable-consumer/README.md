@@ -32,14 +32,21 @@ Before use:
 
 Set every `HINDSIGHT_EMBED_UVX` binding to
 `release://bin/hindsight-embed-uvx`. The release-owned wrapper keeps managed
-stack commands on exactly `hindsight-embed==0.8.4`; upgrading the Hindsight
-server remains an explicit, separately validated release decision. The
-top-level `uvx_executable` selects the protected absolute `uvx` runtime; the
+stack commands on exactly `hindsight-embed==0.8.4`, defaults and allowlists the
+nested API runtime to `hindsight-api==0.9.2`, and leaves the UI runtime at
+`0.8.4`; upgrading any component remains an explicit, separately validated
+release decision. An installation environment may bind
+`HINDSIGHT_EMBED_API_VERSION` only to `0.9.2`. A managed profile must omit that
+key or bind the same value because upstream profile configuration takes
+precedence, and the existing daemon must be stopped before changing versions.
+The top-level `uvx_executable` selects the protected absolute `uvx` runtime; the
 installer validates it and the managed launcher injects it without consulting
-the service's `PATH`. The top-level `npx_executable` selects the protected UI
-package runner; the launcher prepends only its validated directory to the
-closed service path. The top-level `zsh_executable` similarly pins Zsh
-entrypoints to a protected runtime invoked with startup files disabled.
+ambient `PATH`. The top-level `npx_executable` selects the protected UI package
+runner. The launcher supplies both exact executable bindings to the
+release-owned embed wrapper, which constructs its child `PATH` from only their
+validated directories and protected system directories. The top-level
+`zsh_executable` similarly pins Zsh entrypoints to a protected runtime invoked
+with startup files disabled.
 
 The resolver receives one strict JSON object on standard input:
 
@@ -57,7 +64,10 @@ The resolver should retrieve each locator from a protected store such as
 `pass`, the macOS Keychain, or Secret Service. It must write no diagnostics or
 secret values to logs. Its file and ancestry must be owned by the current user
 or root and must not be group- or world-writable. The installer verifies its
-digest and copies it into the private managed install root before activation.
+configured path and digest before activation and keeps a protected copy as
+installer-owned rollback and uninstall evidence. Every managed launch repeats
+the configured-path verification and executes that exact resolver in place so
+native credential-store ACLs remain bound to its final installed path.
 The managed launcher supplies a trusted `HOME`, `USER`, and `LOGNAME`, a
 minimal system `PATH`, and a validated bound user-session bus when one is
 available. Resolver implementations must invoke non-system helpers such as a
@@ -77,8 +87,10 @@ Keep `HINDSIGHT_API_TENANT_EXTENSION` bound to
 service and health-check environments. The launcher maps the resolved data
 plane token to `HINDSIGHT_API_TENANT_API_KEY` only for the API child; the
 extension selector is non-secret and does not grant authority by itself.
-Keep upstream audit logging and LLM request tracing explicitly disabled, and
-replace the example worker ID with a stable consumer-and-profile identity.
+Keep upstream audit logging explicitly disabled. The example also disables LLM
+request tracing; a consumer that enables it must declare a bounded retention
+policy. Replace the example worker ID with a stable consumer-and-profile
+identity.
 Keep the broker startup budget long enough for the first authenticated runtime
 probe and route compilation; the examples use five minutes.
 

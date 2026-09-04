@@ -454,7 +454,7 @@ class NativeHarnessDestination:
     def persist_rollback(self, configuration: Mapping[str, Any]) -> Path:
         if not isinstance(configuration, Mapping):
             raise HarnessPersistenceError("rollback configuration is invalid")
-        path = self.rollback_root / f"{self.harness_id}.{digest(configuration)}.json"
+        path = self.rollback_path(digest(configuration))
         with self._locked():
             if _entry_exists(path):
                 if (
@@ -468,14 +468,17 @@ class NativeHarnessDestination:
             _atomic_write(path, configuration, max_bytes=_MAX_CONFIGURATION_BYTES)
             return path
 
-    def read_rollback(self, configuration_digest: str) -> dict[str, Any]:
+    def rollback_path(self, configuration_digest: str) -> Path:
         if (
             not isinstance(configuration_digest, str)
             or DIGEST.fullmatch(configuration_digest) is None
         ):
             raise HarnessPersistenceError("rollback digest is invalid")
+        return self.rollback_root / f"{self.harness_id}.{configuration_digest}.json"
+
+    def read_rollback(self, configuration_digest: str) -> dict[str, Any]:
         with self._locked():
             return _read_document(
-                self.rollback_root / f"{self.harness_id}.{configuration_digest}.json",
+                self.rollback_path(configuration_digest),
                 max_bytes=_MAX_CONFIGURATION_BYTES,
             )

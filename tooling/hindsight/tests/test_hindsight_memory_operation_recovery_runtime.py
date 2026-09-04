@@ -1,0 +1,8449 @@
+from contextlib import asynccontextmanager, contextmanager
+from builtins import BaseExceptionGroup
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+import asyncio
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import tracemalloc
+from types import SimpleNamespace
+import unittest
+import uuid
+
+from tooling.hindsight.tests import (
+    test_hindsight_memory_operation_recovery as recovery_fixtures,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+LIB = ROOT / "lib"
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+
+from hindsight_memory_control_plane import operation_recovery_runtime  # noqa: E402
+from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    GLOBAL_QUEUE_BLOCKER_QUERY,
+    QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+    QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+    QUEUE_BLOCKER_PREDICATE,
+    CLAIM_RELEASE_EVIDENCE_QUERY,
+    ExactDrainClaimAdapter,
+    ExactDrainWorkerMainShutdownBridge,
+    FAILURE_CLASSIFICATION_QUERY,
+    SAFE_OPERATION_QUERY,
+    apply_requeue_transaction,
+    apply_post_abort_recovery_transaction,
+    assert_connected_live_database,
+    connect_verified_local_postgres,
+    exact_drain_worker_interpreter_path,
+    exact_drain_worker_failure_evidence,
+    install_exact_drain_runtime_guards,
+    live_row_digest,
+    postgres_peer_pid_matches,
+    read_global_queue_blockers,
+    read_failure_classifications,
+    read_claim_release_evidence,
+    read_snapshot,
+    rollback_requeue_transaction,
+    _exact_drain_interpreter_evidence,
+    _postgres_safe_error_text,
+)
+from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
+    OperationRecoveryError,
+)
+from hindsight_memory_control_plane.operation_recovery_progress import (
+    ExactDrainProgressRecorder,
+    read_exact_drain_progress,
+)
+
+
+# Several runtime tests intentionally import the real upstream Hindsight
+# worker into this interpreter. Keep that test-only import state from leaking
+# into a later module in a combined unittest discovery run: the exact-drain
+# bootstrap must reject any preloaded Hindsight package, and later candidate
+# import tests must start from the same clean boundary as a fresh worker.
+_INITIAL_HINDSIGHT_MODULES = {
+    name: module
+    for name, module in sys.modules.items()
+    if name == "hindsight_api" or name.startswith("hindsight_api.")
+}
+
+
+def tearDownModule() -> None:
+    for name in tuple(sys.modules):
+        if name == "hindsight_api" or name.startswith("hindsight_api."):
+            sys.modules.pop(name, None)
+    sys.modules.update(_INITIAL_HINDSIGHT_MODULES)
+
+
+class _RunCapableWorkerPoller:
+    async def run(self):
+        raise AssertionError("test worker poller run seam was not configured")
+
+
+class _ControlConnectionAdapterMixin:
+    async def reserve_control_connection(self, _backend):
+        return None
+
+    async def close_control_connection(self):
+        return None
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self.transaction_arguments = None
+        self.fetch_calls = []
+        self.generation_reads = 0
+
+    @asynccontextmanager
+    async def transaction(self, **arguments):
+        self.transaction_arguments = arguments
+        yield
+
+    async def fetchrow(self, query, *arguments):
+        self.generation_reads += 1
+        return {
+            "generation": 123,
+            "missing_trigger_count": 0,
+            "reserved_guard_count": 0,
+        }
+
+    async def fetch(self, query, *arguments):
+        self.fetch_calls.append((query, arguments))
+        return [
+            {
+                "operation_id": "00000000-0000-4000-8000-000000000001",
+                "bank_id": "engineering",
+                "operation_type": "retain",
+                "status": "failed",
+                "created_at": "2026-07-29T12:00:00.000000Z",
+                "updated_at": "2026-07-29T13:00:00.000000Z",
+                "completed_at": "2026-07-29T13:00:00.000000Z",
+                "retry_count": 1,
+                "next_retry_at": None,
+                "worker_id_present": False,
+                "worker_id_digest": None,
+                "claimed_at": None,
+                "task_payload_present": True,
+                "task_payload_digest": "a" * 64,
+                "result_metadata_digest": "b" * 64,
+                "error_category": "provider_capacity",
+                "error_digest": "c" * 64,
+            }
+        ]
+
+
+class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_progress_schema_six_records_closed_runtime_evidence(self):
+        events = []
+
+        class Recorder:
+            _worker_status = "running"
+            _worker_stage = "worker.main"
+
+            def task_stage(self, operation_id, *, status, stage):
+                events.append(("task_stage", operation_id, status, stage))
+
+            def task_outcome(
+                self,
+                operation_id,
+                *,
+                status,
+                stage,
+                failure,
+                checkpoint,
+            ):
+                events.append(
+                    (
+                        "task_outcome",
+                        operation_id,
+                        status,
+                        stage,
+                        failure,
+                        checkpoint,
+                    )
+                )
+
+            def task_runtime_failure(
+                self,
+                operation_id,
+                *,
+                stage,
+                failure,
+            ):
+                events.append(
+                    ("task_runtime_failure", operation_id, stage, failure)
+                )
+
+            def worker_stage(self, *, status, stage):
+                events.append(("worker_stage", status, stage))
+
+            def worker_failure(self, *, exit_code, failure):
+                events.append(("worker_failure", exit_code, failure))
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {"progress_schema_version": 6}
+        adapter._progress_recorder = Recorder()
+
+        adapter._record_task_outcome(
+            "00000000-0000-4000-8000-000000000001",
+            status="failed",
+            stage="task.failed",
+            failure={"category": "provider_transport"},
+            checkpoint=None,
+        )
+        adapter.record_upstream_failure(
+            "00000000-0000-4000-8000-000000000001",
+            stage="provider.execution",
+            category="retry_ceiling",
+            retryable=True,
+            error_message=ConnectionError("private provider detail"),
+        )
+        adapter.record_worker_stage(status="running", stage="worker.main")
+        adapter.record_worker_failure(
+            RuntimeError("private worker detail"),
+            exit_code=2,
+        )
+
+        self.assertEqual(
+            [event[0] for event in events],
+            [
+                "task_outcome",
+                "task_runtime_failure",
+                "worker_stage",
+                "worker_failure",
+            ],
+        )
+        self.assertEqual(events[1][3]["category"], "retry_ceiling")
+        self.assertEqual(events[3][2]["category"], "worker_runtime_failure")
+        self.assertNotIn("private", json.dumps(events))
+
+    def test_schema_fifteen_runtime_evidence_reaches_path_validation(self):
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain runtime paths must be absolute",
+        ):
+            operation_recovery_runtime.exact_drain_runtime_evidence(
+                "relative-worker",
+                "relative-provider-runtime",
+                "relative-package",
+                schema_version=15,
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain runtime evidence schema version is invalid",
+        ):
+            operation_recovery_runtime.exact_drain_runtime_evidence(
+                "relative-worker",
+                "relative-provider-runtime",
+                "relative-package",
+                schema_version=16,
+            )
+
+    def test_interrupted_progress_rows_bind_every_selected_row(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = fixtures.drain_plan(schema_version=12)
+        tasks = [
+            {
+                "operation_id": item["operation_id"],
+                "status": "pending",
+                "row_digest": item["row_digest"],
+            }
+            for item in plan["selected_operations"]
+        ]
+        tasks[0]["stage"] = "retrying"
+        progress = {
+            "plan_digest": plan["plan_digest"],
+            "selected_status_counts": {
+                "pending": plan["selected_operation_count"] - 1,
+                "retrying": 1,
+            },
+            "tasks": tasks,
+        }
+
+        evidence = operation_recovery_runtime._interrupted_progress_rows(
+            plan,
+            progress,
+        )
+
+        self.assertEqual(set(evidence), {
+            item["operation_id"] for item in plan["selected_operations"]
+        })
+        self.assertEqual(
+            evidence[tasks[0]["operation_id"]],
+            {
+                "status": "pending",
+                "row_digest": tasks[0]["row_digest"],
+                "stage": "retrying",
+            },
+        )
+
+    def test_interrupted_progress_rows_reject_stale_or_incomplete_evidence(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = fixtures.drain_plan(schema_version=12)
+        tasks = [
+            {
+                "operation_id": item["operation_id"],
+                "status": "pending",
+                "row_digest": item["row_digest"],
+            }
+            for item in plan["selected_operations"]
+        ]
+        progress = {
+            "plan_digest": plan["plan_digest"],
+            "selected_status_counts": {
+                "pending": plan["selected_operation_count"]
+            },
+            "tasks": tasks,
+        }
+
+        for changed in (
+            {**progress, "plan_digest": "0" * 64},
+            {**progress, "tasks": tasks[:-1]},
+            {
+                **progress,
+                "tasks": [
+                    {**tasks[0], "row_digest": "0" * 64},
+                    *tasks[1:],
+                ],
+            },
+            {
+                **progress,
+                "selected_status_counts": {
+                    "completed": plan["selected_operation_count"]
+                },
+            },
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "interrupted progress evidence differs",
+                ):
+                    operation_recovery_runtime._interrupted_progress_rows(
+                        plan,
+                        changed,
+                    )
+
+    def test_schema_15_interrupted_progress_rows_bind_the_grant(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        _reference, _grant, plan, _create_plan = (
+            fixtures.standing_grant_fixture()
+        )
+        tasks = [
+            {
+                "operation_id": item["operation_id"],
+                "status": "pending",
+                "stage": "pending",
+                "row_digest": item["row_digest"],
+            }
+            for item in plan["selected_operations"]
+        ]
+        progress = {
+            "plan_digest": plan["plan_digest"],
+            "grant_id": plan["grant_id"],
+            "grant_digest": plan["grant_digest"],
+            "selected_status_counts": {
+                "pending": plan["selected_operation_count"]
+            },
+            "tasks": tasks,
+        }
+
+        operation_recovery_runtime._interrupted_progress_rows(plan, progress)
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "interrupted progress evidence differs",
+        ):
+            operation_recovery_runtime._interrupted_progress_rows(
+                plan,
+                {**progress, "grant_digest": "0" * 64},
+            )
+
+    def test_worker_failure_classifies_exact_drain_execution_lease_expiry(self):
+        evidence = exact_drain_worker_failure_evidence(
+            OperationRecoveryError(
+                "operation-recovery exact drain execution lease expired"
+            )
+        )
+
+        self.assertEqual(evidence["category"], "execution_lease_expired")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(
+                (
+                    "OperationRecoveryError: operation-recovery exact drain "
+                    "execution lease expired"
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            evidence["error_digest"],
+            "2814599b21d040f684426dfa56cf6036e3f9bd90eb629aa355d27a33ed41221f",
+        )
+        self.assertEqual(
+            set(evidence),
+            {"category", "retryable", "http_status", "error_digest"},
+        )
+
+    def test_worker_failure_classifies_operation_attempt_timeout(self):
+        evidence = exact_drain_worker_failure_evidence(
+            OperationRecoveryError(
+                operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
+            )
+        )
+
+        self.assertEqual(evidence["category"], "operation_attempt_timeout")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(
+                operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE.encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+        )
+
+    def test_worker_failure_classifies_bare_timeout(self):
+        evidence = exact_drain_worker_failure_evidence(TimeoutError())
+
+        self.assertEqual(
+            evidence["category"],
+            "worker_initialization_timeout",
+        )
+        self.assertTrue(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(b"TimeoutError").hexdigest(),
+        )
+
+    def test_worker_failure_classifies_database_timeouts_as_retryable(self):
+        sqlstate_timeout = RuntimeError("query canceled")
+        sqlstate_timeout.sqlstate = "57014"
+
+        for error in (
+            RuntimeError("canceling statement due to statement timeout"),
+            sqlstate_timeout,
+        ):
+            with self.subTest(error=str(error)):
+                evidence = exact_drain_worker_failure_evidence(error)
+
+                self.assertEqual(
+                    evidence["category"],
+                    "worker_initialization_timeout",
+                )
+                self.assertTrue(evidence["retryable"])
+                self.assertIsNone(evidence["http_status"])
+
+    def test_worker_failure_classifies_poller_runtime_failures_separately(self):
+        evidence = exact_drain_worker_failure_evidence(
+            RuntimeError("poller task bookkeeping failed"),
+            worker_stage="worker.poller.running",
+        )
+
+        self.assertEqual(evidence["category"], "worker_runtime_failure")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+
+    def test_provider_capacity_failures_are_transient_for_task_failover(self):
+        self.assertTrue(
+            operation_recovery_runtime._exact_drain_error_is_transient(
+                "provider capacity exhausted"
+            )
+        )
+
+    def test_worker_failure_preserves_phase_one_deadline_category(self):
+        message = (
+            operation_recovery_runtime.EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
+        )
+        evidence = exact_drain_worker_failure_evidence(
+            OperationRecoveryError(message)
+        )
+
+        self.assertEqual(evidence["category"], "phase_one_timeout")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        )
+
+    def test_postgres_safe_error_text_bounds_work_before_encoding(self):
+        prefix = "x" * 100 + "\x00\ud800" + "y" * 4898
+        value = prefix + "z" * 5_000_000
+
+        tracemalloc.start()
+        try:
+            result = _postgres_safe_error_text(value)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(len(result), 5000)
+        self.assertNotIn("\x00", result)
+        self.assertEqual(result[100:102], "\ufffd?")
+        self.assertLess(peak, 1_000_000)
+
+    @staticmethod
+    def _initialize_unreserved_control_lifecycle(adapter):
+        adapter._control_backend = None
+        adapter._control_connection_context = None
+        adapter._control_connection = None
+        adapter._control_connection_state = "never-reserved"
+        adapter._control_connection_state_lock = asyncio.Lock()
+        adapter._control_connection_use_lock = asyncio.Lock()
+        return adapter
+
+    @staticmethod
+    def _current_exact_drain_adapter():
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        return ExactDrainClaimAdapter(
+            plan,
+            authorization=recovery_fixtures.exact_drain_authorization(
+                plan,
+                authorized_at=planned_at,
+            ),
+        )
+
+    def test_consumed_v2_authorization_starts_adapter_after_approval_expiry(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        planned_at = now - 86_401
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=plan["expires_at"] - 1,
+        )
+        authorization_bytes = json.dumps(
+            authorization,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            clock=lambda: now,
+        )
+
+        self.assertEqual(
+            adapter._execution_deadline,
+            authorization["authorized_at"]
+            + plan["execution_window"]["calculated_seconds"],
+        )
+        self.assertEqual(
+            json.dumps(
+                authorization,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            authorization_bytes,
+        )
+
+    def test_schema_fifteen_adapter_uses_the_plan_bound_deadlines(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        _reference, grant, plan, _create_plan = fixtures.standing_grant_fixture(
+            created_at=planned_at,
+            expires_at=planned_at + 1_200_000,
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+        )
+        ledger = (
+            recovery_fixtures.recovery_contract.create_exact_drain_grant_ledger(
+                grant,
+                ledger_nonce="1" * 64,
+                created_at=planned_at,
+            )
+        )
+        _ledger, use = (
+            recovery_fixtures.recovery_contract.claim_exact_drain_grant(
+                ledger,
+                plan,
+                expected_ledger_digest=ledger["ledger_digest"],
+                claim_nonce="2" * 64,
+                ledger_nonce="3" * 64,
+                claimed_at=planned_at,
+            )
+        )
+        authorization = (
+            recovery_fixtures.recovery_contract.create_exact_drain_grant_authorization_receipt(
+                plan,
+                use,
+            )
+        )
+
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            clock=lambda: planned_at,
+        )
+
+        self.assertEqual(adapter.phase_one_timeout_seconds, 7_200)
+        self.assertEqual(adapter.operation_attempt_timeout_seconds, 7_200)
+        self.assertEqual(
+            adapter._execution_deadline,
+            authorization["authorized_at"]
+            + plan["execution_window"]["calculated_seconds"],
+        )
+
+    def test_schema_thirteen_and_fourteen_initialize_lease_for_retry_persistence(
+        self,
+    ):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        schema_twelve = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+            schema_version=12,
+        )
+        for schema_version in (13, 14):
+            with self.subTest(schema_version=schema_version):
+                plan = dict(schema_twelve)
+                plan["schema_version"] = schema_version
+                if schema_version == 14:
+                    plan["checkpoint_continuation_handoff"] = (
+                        fixtures._checkpoint_continuation_handoff(
+                            snapshot=plan["live_snapshot"],
+                            created_at=planned_at,
+                        )
+                    )
+                authorization = recovery_fixtures.exact_drain_authorization(
+                    plan,
+                    authorized_at=planned_at,
+                )
+
+                with (
+                    patch(
+                        "hindsight_memory_control_plane.operation_recovery_runtime."
+                        "verify_exact_drain_plan",
+                        return_value=plan,
+                    ),
+                    patch(
+                        "hindsight_memory_control_plane.operation_recovery_runtime."
+                        "verify_exact_drain_authorization_receipt",
+                        return_value=authorization,
+                    ),
+                ):
+                    adapter = ExactDrainClaimAdapter(
+                        plan,
+                        authorization=authorization,
+                        clock=lambda: planned_at,
+                    )
+
+                self.assertEqual(
+                    adapter._execution_deadline,
+                    planned_at + plan["execution_window"]["calculated_seconds"],
+                )
+                self.assertEqual(
+                    adapter._transaction_timeout_seconds,
+                    plan["transaction_timeout_seconds"],
+                )
+                self.assertEqual(
+                    adapter._assert_claim_capable_mutation(), planned_at
+                )
+                retry_at = datetime.fromtimestamp(
+                    planned_at + 1,
+                    timezone.utc,
+                )
+                self.assertEqual(
+                    adapter._validated_reschedule_time(
+                        retry_at,
+                        observed_at=planned_at,
+                    ),
+                    retry_at,
+                )
+
+    def test_schema_fourteen_status_keeps_failure_evidence_payload_free(self):
+        body = operation_recovery_runtime._exact_drain_status_body(
+            plan={
+                "schema_version": 14,
+                "plan_digest": "a" * 64,
+            },
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            selected_operation_count=1,
+            selected_status_counts={"failed": 1},
+            preserved_status_counts={},
+            outside_nonterminal_counts=[],
+            failure_classifications=[
+                {
+                    "cause_family": "provider_execution",
+                    "error_digest": "b" * 64,
+                    "occurrence_count": 1,
+                }
+            ],
+            observed_at=1_785_462_000,
+        )
+
+        self.assertEqual(body["schema_version"], 2)
+        self.assertEqual(
+            body["failure_classifications"][0]["cause_family"],
+            "provider_execution",
+        )
+        self.assertNotIn("error_message", body)
+
+    def test_schema_fourteen_adapter_rejects_expired_handoff_at_current_time(
+        self,
+    ):
+        now = int(time.time())
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        snapshot = fixtures.drain_snapshot(observed_at=now - 100)
+        continuation_handoff = fixtures._checkpoint_continuation_handoff(
+            snapshot=snapshot,
+            created_at=now - 7_200,
+        )
+        plan = fixtures.drain_plan(
+            snapshot=snapshot,
+            created_at=now,
+            schema_version=12,
+        )
+        # Preserve a complete plan shape while presenting a checkpoint that
+        # expired after authorization but before worker admission.
+        plan["schema_version"] = 14
+        plan["created_at"] = now - 7_200
+        plan["expires_at"] = now + 10_000
+        plan["checkpoint_continuation_handoff"] = continuation_handoff
+        plan["recovery_context"] = continuation_handoff[
+            "continuation_context"
+        ]
+        authorized_at = now - 5_000
+        capability = recovery_fixtures.recovery_contract.create_hatchery_capability_receipt(
+            provider_policy_digest="9" * 64,
+            provider_identity_digest="a" * 64,
+            model_digest="b" * 64,
+            observed_at=authorized_at,
+            successful=True,
+        )
+        plan["hatchery_capability_receipt"] = capability
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=authorized_at,
+        )
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_plan",
+                return_value=plan,
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_authorization_receipt",
+                side_effect=lambda value, **kwargs: (
+                    recovery_fixtures.recovery_contract.verify_exact_drain_authorization_receipt(
+                        value,
+                        **kwargs,
+                    )
+                ),
+            ),
+            patch.object(
+                recovery_fixtures.recovery_contract,
+                "verify_exact_drain_plan",
+                return_value=plan,
+            ),
+        ):
+            with self.assertRaisesRegex(OperationRecoveryError, "handoff|expired"):
+                ExactDrainClaimAdapter(
+                    plan,
+                    authorization=authorization,
+                    clock=lambda: now,
+                )
+
+    def test_schema_fourteen_checkpoint_helper_rejects_omitted_committed_row(
+        self,
+    ):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        snapshot = fixtures.drain_snapshot()
+        handoff = fixtures._checkpoint_continuation_handoff(
+            snapshot=snapshot,
+        )
+        continued = handoff["operations"][0]
+        omitted = next(
+            row
+            for row in snapshot["operations"]
+            if row["current_status"] == "pending"
+            and row["operation_type"] == "retain"
+            and row["operation_id"] != continued["operation_id"]
+        )
+
+        def database_row(source, checkpoint):
+            return {
+                "operation_id": source["operation_id"],
+                "operation_type": source["operation_type"],
+                "status": source["current_status"],
+                "retry_count": source["retry_count"],
+                "task_payload_digest": source["task_payload_digest"],
+                "result_metadata_digest": source["result_metadata_digest"],
+                "checkpoint_facts_committed": checkpoint["facts_committed"],
+                "checkpoint_committed_document_count": checkpoint[
+                    "committed_document_count"
+                ],
+                "checkpoint_unit_ids_count": checkpoint["unit_ids_count"],
+                "checkpoint_stage": checkpoint["stage"],
+                "checkpoint_processed": checkpoint["processed"],
+                "checkpoint_total": checkpoint["total"],
+            }
+
+        omitted_checkpoint = {
+            "facts_committed": True,
+            "committed_document_count": 1,
+            "unit_ids_count": 21,
+            "stage": "storing",
+            "processed": 3,
+            "total": 10,
+        }
+        rows = [
+            database_row(continued, continued["checkpoint"]),
+            database_row(omitted, omitted_checkpoint),
+        ]
+
+        class Connection:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch(self, _query, _identifiers):
+                self.calls += 1
+                if self.calls == 1:
+                    return rows
+                return [
+                    {
+                        "operation_id": continued["operation_id"],
+                        "metadata_document_count": 1,
+                        "document_count": 1,
+                        "unit_count": 21,
+                    }
+                ]
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {
+            "schema_version": 14,
+            "checkpoint_continuation_handoff": handoff,
+        }
+        adapter._selected = {
+            continued["operation_id"]: continued,
+            omitted["operation_id"]: omitted,
+        }
+        adapter._identifiers = [
+            uuid.UUID(continued["operation_id"]),
+            uuid.UUID(omitted["operation_id"]),
+        ]
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "omits committed row",
+        ):
+            asyncio.run(
+                adapter._verify_checkpoint_continuation_state(Connection())
+            )
+
+    def test_schema_fourteen_checkpoint_helper_accepts_reused_document_units(
+        self,
+    ):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        snapshot = fixtures.drain_snapshot()
+        handoff = fixtures._checkpoint_continuation_handoff(
+            snapshot=snapshot,
+            unit_count=42,
+        )
+        continued = handoff["operations"][0]
+
+        class Connection:
+            def __init__(self):
+                self.calls = 0
+
+            async def fetch(self, _query, _identifiers):
+                self.calls += 1
+                if self.calls == 1:
+                    return [
+                        {
+                            "operation_id": continued["operation_id"],
+                            "operation_type": "retain",
+                            "status": "pending",
+                            "retry_count": continued["retry_count"],
+                            "task_payload_digest": continued[
+                                "task_payload_digest"
+                            ],
+                            "result_metadata_digest": continued[
+                                "result_metadata_digest"
+                            ],
+                            "checkpoint_facts_committed": True,
+                            "checkpoint_committed_document_count": 1,
+                            "checkpoint_unit_ids_count": 21,
+                            "checkpoint_stage": "storing",
+                            "checkpoint_processed": 3,
+                            "checkpoint_total": 10,
+                        }
+                    ]
+                return [
+                    {
+                        "operation_id": continued["operation_id"],
+                        "metadata_document_count": 1,
+                        "document_count": 1,
+                        "unit_count": 42,
+                    }
+                ]
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {
+            "schema_version": 14,
+            "checkpoint_continuation_handoff": handoff,
+        }
+        adapter._selected = {continued["operation_id"]: continued}
+        adapter._identifiers = [uuid.UUID(continued["operation_id"])]
+
+        asyncio.run(adapter._verify_checkpoint_continuation_state(Connection()))
+
+    def test_legacy_v1_unresumed_adapter_still_rejects_expired_approval(self):
+        fixture = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "legacy_exact_drain_plans.json"
+            ).read_text(encoding="utf-8")
+        )["exact"]
+
+        with self.assertRaisesRegex(OperationRecoveryError, "plan expired"):
+            ExactDrainClaimAdapter(fixture)
+
+    def test_legacy_v1_terminal_reconciliation_bounds_public_claim_waits(self):
+        fixture = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "legacy_exact_drain_plans.json"
+            ).read_text(encoding="utf-8")
+        )["exact"]
+        adapter = ExactDrainClaimAdapter(
+            fixture,
+            resume=True,
+            terminal_reconciliation=True,
+        )
+        adapter._verify_initial_state = AsyncMock()
+
+        class Connection:
+            def __init__(self):
+                self.timeouts = []
+
+            async def execute(self, *_arguments):
+                return "SET"
+
+            async def fetchval(self, query, value):
+                self.timeouts.append((query, value))
+
+        connection = Connection()
+        tasks = asyncio.run(
+            adapter.claim_tasks(
+                connection,
+                "public.async_operations",
+                adapter._worker_id,
+                {},
+                1,
+            )
+        )
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(
+            [value for _query, value in connection.timeouts],
+            ["120000ms", "120000ms", "120000ms"],
+        )
+
+    def test_terminal_reconciliation_constructs_at_execution_lease_boundary(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal status evidence is required",
+        ):
+            ExactDrainClaimAdapter(
+                plan,
+                authorization=authorization,
+                resume=True,
+                terminal_reconciliation=True,
+                clock=lambda: planned_at
+                + plan["execution_window"]["calculated_seconds"],
+            )
+
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            resume=True,
+            terminal_reconciliation=True,
+            terminal_status_evidence={
+                "generation": plan["pre_generation"],
+                "observed_at": planned_at,
+                "status_digest": "6" * 64,
+            },
+            clock=lambda: planned_at
+            + plan["execution_window"]["calculated_seconds"],
+        )
+
+        self.assertTrue(adapter._terminal_reconciliation)
+        self.assertEqual(
+            adapter._execution_deadline,
+            planned_at + plan["execution_window"]["calculated_seconds"],
+        )
+
+    def test_exact_drain_public_claim_rejects_the_execution_lease_boundary(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._execution_deadline = 86_500
+        adapter._clock = lambda: 86_500
+
+        class Connection:
+            async def execute(self, *_args, **_kwargs):
+                raise AssertionError("expired exact drain touched PostgreSQL")
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "execution lease expired",
+        ):
+            asyncio.run(
+                adapter.claim_tasks(
+                    Connection(),
+                    '"public".async_operations',
+                    "exact-worker",
+                    {},
+                    1,
+                )
+            )
+
+    def test_exact_drain_public_claim_bounds_database_waits_to_120_seconds(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._execution_deadline = 86_500
+        adapter._transaction_timeout_seconds = 120
+        adapter._clock = lambda: 100
+        adapter._terminal_reconciliation = False
+        adapter._initial_guard_complete = True
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._selected = {}
+        adapter._started_ids = set()
+        adapter._max_retries = 3
+        adapter._identifiers = []
+        adapter._completion_signalled = False
+        adapter._completion_callback = None
+
+        class Connection:
+            def __init__(self):
+                self.timeouts = []
+
+            async def execute(self, _query, *_arguments):
+                return "SET"
+
+            async def fetchval(self, query, value):
+                self.timeouts.append((query, value))
+
+            async def fetch(self, *_args, **_kwargs):
+                return []
+
+        connection = Connection()
+        asyncio.run(
+            adapter.claim_tasks(
+                connection,
+                '"public".async_operations',
+                "exact-worker",
+                {},
+                1,
+            )
+        )
+
+        self.assertEqual(
+            connection.timeouts,
+            [
+                (
+                    "SELECT pg_catalog.set_config('transaction_timeout', $1, true)",
+                    "120000ms",
+                ),
+                (
+                    "SELECT pg_catalog.set_config('lock_timeout', $1, true)",
+                    "120000ms",
+                ),
+                (
+                    "SELECT pg_catalog.set_config('statement_timeout', $1, true)",
+                    "120000ms",
+                ),
+            ],
+        )
+
+    def test_exact_drain_public_claim_parses_only_capacity_bound_rows(self):
+        first_id = "00000000-0000-4000-8000-000000000001"
+        later_id = "00000000-0000-4000-8000-000000000002"
+
+        class UnchosenPayload(dict):
+            def __iter__(self):
+                raise AssertionError("unchosen task payload was parsed")
+
+            def keys(self):
+                raise AssertionError("unchosen task payload was parsed")
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._worker_digest = hashlib.sha256(b"exact-worker").hexdigest()
+        adapter._terminal_reconciliation = False
+        adapter._initial_guard_complete = True
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._selected = {
+            first_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "a" * 64,
+            },
+            later_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "b" * 64,
+            },
+        }
+        adapter._started_ids = set()
+        adapter._max_retries = 3
+        adapter._identifiers = [first_id, later_id]
+
+        class Connection:
+            async def execute(self, query, *_arguments):
+                return "UPDATE 1" if query.lstrip().startswith("UPDATE") else "SET"
+
+            async def fetch(self, _query, *_arguments):
+                return [
+                    {
+                        "operation_id": first_id,
+                        "operation_type": "retain",
+                        "task_payload": {
+                            "operation_id": first_id,
+                            "bank_id": "engineering",
+                            "type": "batch_retain",
+                        },
+                        "retry_count": 0,
+                        "worker_id_digest": None,
+                        "task_payload_digest": "a" * 64,
+                    },
+                    {
+                        "operation_id": later_id,
+                        "operation_type": "retain",
+                        "task_payload": UnchosenPayload(),
+                        "retry_count": 0,
+                        "worker_id_digest": None,
+                        "task_payload_digest": "b" * 64,
+                    },
+                ]
+
+        claimed = asyncio.run(
+            adapter.claim_tasks(
+                Connection(),
+                '"public".async_operations',
+                "exact-worker",
+                {},
+                1,
+            )
+        )
+
+        self.assertEqual(
+            [str(row["operation_id"]) for row in claimed],
+            [first_id],
+        )
+
+    def test_runtime_guard_rejects_missing_progress_seams(self):
+        class MissingWorkerPoller(_RunCapableWorkerPoller):
+            pass
+
+        with self.assertRaisesRegex(
+            Exception,
+            "required worker progress seam is unavailable",
+        ):
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                MissingWorkerPoller,
+                type("MemoryEngine", (), {}),
+                object(),
+            )
+
+    def test_runtime_guard_rejects_missing_poller_lifecycle_seam(self):
+        class MissingRunWorkerPoller:
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "required worker lifecycle seam is unavailable",
+        ):
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                MissingRunWorkerPoller,
+                type("MemoryEngine", (), {}),
+                object(),
+            )
+
+    def test_runtime_guard_disables_upstream_retain_folding(self):
+        fold_calls = []
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+            async def _fold_retain_peers(self, *_arguments):
+                fold_calls.append(True)
+                return ["outside-plan"]
+
+        class Adapter:
+            _plan = {"progress_schema_version": 1}
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+        )
+
+        self.assertEqual(
+            asyncio.run(
+                WorkerPoller()._fold_retain_peers(
+                    object(),
+                    "public.async_operations",
+                    object(),
+                    {},
+                )
+            ),
+            [],
+        )
+        self.assertEqual(fold_calls, [])
+
+    def test_claim_commit_rejects_folded_operations(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        adapter._selected = {operation_id: {}}
+        task = SimpleNamespace(
+            operation_id=operation_id,
+            folded_operation_ids=[
+                "00000000-0000-4000-8000-000000000002"
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "committed claim folded outside plan",
+        ):
+            adapter.claim_committed([task])
+
+    def test_v8_runtime_guard_records_memory_initialization_failure(self):
+        events = []
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        class MemoryEngine:
+            async def initialize(self):
+                raise RuntimeError("raw startup failure must stay private")
+
+        class Adapter:
+            def __init__(self):
+                self._plan = {"progress_schema_version": 3}
+
+            def record_worker_stage(self, *, status, stage):
+                events.append(("stage", status, stage))
+
+            def record_worker_failure(self, error, *, exit_code):
+                events.append(("failure", type(error).__name__, exit_code))
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "raw startup failure"):
+            asyncio.run(MemoryEngine().initialize())
+
+        self.assertEqual(
+            events,
+            [
+                ("stage", "starting", "worker.memory.initialize"),
+                ("failure", "RuntimeError", 2),
+            ],
+        )
+
+    def test_runtime_guard_records_operational_stage_before_poller_run(self):
+        events = []
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+            async def run(self):
+                events.append("upstream-run")
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain execution lease expired"
+                )
+
+        class MemoryEngine:
+            async def initialize(self):
+                return None
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def __init__(self):
+                self._plan = {"progress_schema_version": 3}
+
+            async def reserve_control_connection(self, _backend):
+                events.append("control-reserved")
+
+            def record_worker_stage(self, *, status, stage):
+                events.append(("stage", status, stage))
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        self.assertIsNone(asyncio.run(WorkerPoller().run()))
+        self.assertEqual(
+            events,
+            [
+                "control-reserved",
+                ("stage", "running", "worker.poller.running"),
+                "upstream-run",
+                "shutdown",
+            ],
+        )
+
+    def test_runtime_guard_schema_scan_accepts_poller_connection_argument(self):
+        events = []
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                connection,
+                schema,
+                reserved_limits,
+                shared_limit,
+            ):
+                events.append(
+                    (
+                        connection,
+                        schema,
+                        reserved_limits,
+                        shared_limit,
+                    )
+                )
+                return []
+
+            async def _claim_batch_for_schema(
+                self,
+                connection,
+                schema,
+                reserved_limits,
+                shared_limit,
+            ):
+                return await self._claim_batch_for_schema_inner(
+                    connection,
+                    schema,
+                    reserved_limits,
+                    shared_limit,
+                )
+
+            async def _scan_active_schemas(self, _connection, _schemas):
+                return set()
+
+            async def run(self):
+                return None
+
+        class MemoryEngine:
+            async def initialize(self):
+                return None
+
+        class Adapter:
+            def __init__(self):
+                self._plan = {"progress_schema_version": 6}
+
+            def claim_committed(self, _tasks):
+                return None
+
+            def abort_after_committed_claim_failure(self):
+                raise AssertionError("claim evidence unexpectedly failed")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            connection = object()
+            poller = WorkerPoller()
+            active = await poller._scan_active_schemas(
+                connection,
+                [None, "public"],
+            )
+            claimed = await poller._claim_batch_for_schema(
+                connection,
+                None,
+                {"retain": 1},
+                1,
+            )
+            return connection, active, claimed
+
+        connection, active, claimed = asyncio.run(exercise())
+        self.assertEqual(active, {None})
+        self.assertEqual(claimed, [])
+        self.assertEqual(
+            events,
+            [(connection, None, {"retain": 1}, 1)],
+        )
+
+    def test_shutdown_bridge_deduplicates_internal_request_after_signal(self):
+        external_handlers = []
+        worker_callbacks = []
+
+        def install_signal_handlers(_loop, handler):
+            external_handlers.append(handler)
+            return True
+
+        worker_main = SimpleNamespace(
+            _install_shutdown_signal_handlers=install_signal_handlers,
+        )
+        bridge = ExactDrainWorkerMainShutdownBridge(worker_main)
+        with bridge:
+            self.assertTrue(
+                worker_main._install_shutdown_signal_handlers(
+                    object(),
+                    lambda: worker_callbacks.append("shutdown"),
+                )
+            )
+            external_handlers[0]()
+            bridge.request()
+            self.assertEqual(worker_callbacks, ["shutdown"])
+            external_handlers[0]()
+            self.assertEqual(
+                worker_callbacks,
+                ["shutdown", "shutdown"],
+            )
+            bridge.request()
+            self.assertEqual(
+                worker_callbacks,
+                ["shutdown", "shutdown"],
+            )
+
+    def test_uvicorn_signal_guard_preserves_worker_main_shutdown_handler(self):
+        signal_bus = {"handler": None}
+        worker_callbacks = []
+        server_callbacks = []
+
+        def install_signal_handlers(_loop, handler):
+            signal_bus["handler"] = handler
+            return True
+
+        class Server:
+            @contextmanager
+            def capture_signals(self):
+                previous_handler = signal_bus["handler"]
+                signal_bus["handler"] = self.handle_exit
+                try:
+                    yield
+                finally:
+                    signal_bus["handler"] = previous_handler
+
+            def handle_exit(self):
+                server_callbacks.append("shutdown")
+
+        worker_main = SimpleNamespace(
+            _install_shutdown_signal_handlers=install_signal_handlers,
+        )
+        bridge = ExactDrainWorkerMainShutdownBridge(worker_main)
+        guard_type = (
+            operation_recovery_runtime.ExactDrainUvicornSignalGuard
+        )
+
+        with bridge, guard_type(Server):
+            self.assertTrue(
+                worker_main._install_shutdown_signal_handlers(
+                    object(),
+                    lambda: worker_callbacks.append("shutdown"),
+                )
+            )
+            with Server().capture_signals():
+                signal_bus["handler"]()
+
+        self.assertEqual(worker_callbacks, ["shutdown"])
+        self.assertEqual(server_callbacks, [])
+
+    def test_startup_recovery_failure_requests_worker_main_shutdown(self):
+        try:
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        worker_main_shutdown = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+            async def recover_own_tasks(self, _backend):
+                raise OperationRecoveryError("startup recovery failed")
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            pass
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=worker_main_shutdown.set,
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._shutdown = asyncio.Event()
+            poller_task = asyncio.create_task(poller.run())
+            try:
+                try:
+                    await asyncio.wait_for(
+                        worker_main_shutdown.wait(),
+                        timeout=0.25,
+                    )
+                    requested = True
+                except asyncio.TimeoutError:
+                    requested = False
+                result = (await asyncio.gather(
+                    poller_task,
+                    return_exceptions=True,
+                ))[0]
+                return requested, result
+            finally:
+                if not poller_task.done():
+                    poller_task.cancel()
+                    await asyncio.gather(
+                        poller_task,
+                        return_exceptions=True,
+                    )
+
+        requested, result = asyncio.run(exercise())
+        self.assertTrue(requested)
+        self.assertIsNone(result)
+
+    def test_runtime_reserves_control_connection_before_polling_and_closes_last(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+            async def reserve_control_connection(self, backend):
+                events.append(("reserve", backend))
+
+            async def close_control_connection(self):
+                events.append(("close", None))
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                events.append(("poll", self._backend))
+                self._shutdown.set()
+
+            async def shutdown_graceful(self, timeout=30.0):
+                events.append(("shutdown", timeout))
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: None,
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            await poller.run()
+            await poller.shutdown_graceful(timeout=0.25)
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            events,
+            [
+                ("reserve", "exact-backend"),
+                ("poll", "exact-backend"),
+                ("shutdown", 0.25),
+                ("close", None),
+            ],
+        )
+
+    def test_reserved_hindsight_connection_terminalizes_exact_row(self):
+        try:
+            from hindsight_api.engine.db.postgresql import PostgresConnection
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api PostgreSQL runtime is unavailable"
+            ) from error
+
+        adapter = self._current_exact_drain_adapter()
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "task_payload_digest": selected["task_payload_digest"],
+            "error_message": None,
+        }
+        statements = []
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class RawConnection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments, **_keywords):
+                return dict(row)
+
+            async def fetch(self, *_arguments, **_keywords):
+                return [
+                    {
+                        "operation_id": selected_id,
+                        "status": (
+                            row["status"]
+                            if selected_id == operation_id
+                            else "pending"
+                        ),
+                        "task_payload_digest": selected_item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for selected_id, selected_item in adapter._selected.items()
+                ]
+
+            async def execute(self, *_arguments, **_keywords):
+                statement = _arguments[0]
+                statements.append(statement)
+                if "UPDATE public.async_operations" in statement:
+                    error_message = _arguments[2]
+                    if "\x00" in error_message:
+                        raise ValueError("PostgreSQL text cannot contain NUL")
+                    row["status"] = "failed"
+                    row["error_message"] = error_message
+                    return "UPDATE 1"
+                return "SET"
+
+        connection = PostgresConnection(RawConnection())
+
+        class Context:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+            try:
+                await adapter.mark_failed(
+                    backend,
+                    operation_id,
+                    "provider\x00request failed",
+                    "public",
+                )
+            finally:
+                await adapter.close_control_connection()
+
+        asyncio.run(exercise())
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error_message"], "provider�request failed")
+        self.assertEqual(
+            statements[0],
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        )
+
+    def test_final_terminal_outcome_requests_completion_without_later_claim(self):
+        events = []
+        adapter = self._current_exact_drain_adapter()
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._selected = {operation_id: selected}
+        adapter._identifiers = [uuid.UUID(operation_id)]
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        adapter._completion_callback = lambda: events.append("shutdown")
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+
+        class ProgressRecorder:
+            _worker_status = "running"
+
+            def task_outcome(self, *_arguments, **_keywords):
+                events.append("progress")
+
+            def worker_stage(self, *, status, stage):
+                events.append((status, stage))
+
+        adapter._progress_recorder = ProgressRecorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": None,
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                events.append("commit")
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def fetch(self, *_arguments):
+                return [
+                    {
+                        "operation_id": selected_id,
+                        "status": (
+                            row["status"]
+                            if selected_id == operation_id
+                            else "pending"
+                        ),
+                        "task_payload_digest": selected_item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for selected_id, selected_item in adapter._selected.items()
+                ]
+
+            async def execute(self, statement, *_arguments):
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        asyncio.run(
+            adapter.mark_failed(
+                Backend(),
+                operation_id,
+                "provider request failed",
+                "public",
+            )
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "commit",
+                "progress",
+                ("running", "worker.shutdown.requested"),
+                "shutdown",
+            ],
+        )
+        self.assertTrue(adapter._completion_signalled)
+
+    def test_terminal_failure_records_closed_cause_and_committed_checkpoint(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 2}
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        progress_directory = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(progress_directory.cleanup)
+        progress_path = Path(progress_directory.name) / "progress.json"
+        adapter._progress_recorder = ExactDrainProgressRecorder(
+            path=progress_path,
+            plan_digest=adapter._plan["plan_digest"],
+            worker_pid=1234,
+            worker_start_time="darwin:1000:1",
+            worker_attempt=1,
+            selected_operations=[
+                {
+                    "operation_id": operation_id,
+                    "operation_type": selected["operation_type"],
+                    "row_digest": selected["row_digest"],
+                }
+            ],
+            progress_schema_version=2,
+        )
+        adapter._progress_recorder.task_stage(
+            operation_id,
+            status="processing",
+            stage="batch_retain.sub_batch.1",
+        )
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": True,
+            "checkpoint_committed_document_count": 1,
+            "checkpoint_unit_ids_count": 29,
+            "checkpoint_stage": "storing",
+            "checkpoint_processed": 14,
+            "checkpoint_total": 14,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def fetch(self, *_arguments):
+                return [
+                    {
+                        "operation_id": selected_id,
+                        "status": (
+                            row["status"]
+                            if selected_id == operation_id
+                            else "pending"
+                        ),
+                        "task_payload_digest": selected_item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for selected_id, selected_item in adapter._selected.items()
+                ]
+
+            async def execute(self, statement, *_arguments):
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        asyncio.run(
+            adapter.mark_failed(
+                Backend(),
+                operation_id,
+                "TimeoutError",
+                "public",
+            )
+        )
+
+        evidence = read_exact_drain_progress(
+            progress_path,
+            plan_digest=adapter._plan["plan_digest"],
+            progress_schema_version=2,
+        )["tasks"][0]
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(evidence["stage"], "failed")
+        self.assertEqual(
+            evidence["failure_stage"],
+            "batch_retain.sub_batch.1",
+        )
+        self.assertEqual(
+            evidence["failure"],
+            {
+                "category": "operation_error",
+                "retryable": False,
+                "http_status": None,
+                "error_digest": hashlib.sha256(b"TimeoutError").hexdigest(),
+            },
+        )
+        self.assertEqual(
+            {
+                key: value
+                for key, value in evidence["checkpoint"].items()
+                if key != "checkpoint_digest"
+            },
+            {
+                "facts_committed": True,
+                "committed_document_count": 1,
+                "unit_ids_count": 29,
+                "stage": "storing",
+                "processed": 14,
+                "total": 14,
+            },
+        )
+        self.assertNotIn("TimeoutError", progress_path.read_text(encoding="utf-8"))
+
+    def test_failure_evidence_classifies_provider_bad_request_without_url_port(self):
+        classify = operation_recovery_runtime._exact_drain_failure_evidence
+        bad_request = classify(
+            "Client error '400 Bad Request' for url 'https://api.example/v1'",
+            retryable=False,
+        )
+        transport = classify(
+            "ConnectError for url 'https://api.example:443/v1'",
+            retryable=True,
+        )
+        openai_bad_request = classify(
+            "BadRequestError: Error code: 400 - invalid request",
+            retryable=False,
+        )
+
+        self.assertEqual(bad_request["category"], "provider_bad_request")
+        self.assertEqual(bad_request["http_status"], 400)
+        self.assertIs(bad_request["retryable"], False)
+        self.assertEqual(transport["category"], "provider_transport")
+        self.assertIsNone(transport["http_status"])
+        self.assertIs(transport["retryable"], True)
+        self.assertEqual(
+            openai_bad_request["category"],
+            "provider_bad_request",
+        )
+        self.assertEqual(openai_bad_request["http_status"], 400)
+
+    def test_schema_five_timeout_failures_have_distinct_closed_categories(self):
+        classify = operation_recovery_runtime._exact_drain_failure_evidence
+
+        queue = classify(
+            "provider_queue_timeout",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        execution = classify(
+            "provider_execution_timeout",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        phase_one = classify(
+            "RetryTaskAt: TimeoutError: operation-recovery exact drain "
+            "phase-one query timed out at retain.phase1.candidates.fuzzy.1/2",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        phase_one_deadline = classify(
+            "exact drain retain phase one exceeded its deadline",
+            retryable=False,
+            progress_schema_version=5,
+        )
+        stored_phase_one_deadline = classify(
+            "OperationRecoveryError: exact drain retain phase one exceeded "
+            "its deadline",
+            retryable=False,
+            progress_schema_version=5,
+        )
+        upstream = classify(
+            "TimeoutError",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        database = classify(
+            "DatabaseError: canceling statement due to statement timeout",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        attempt = classify(
+            operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
+            retryable=False,
+            progress_schema_version=5,
+        )
+
+        self.assertEqual(queue["category"], "provider_queue_timeout")
+        self.assertEqual(execution["category"], "provider_execution_timeout")
+        self.assertEqual(phase_one["category"], "phase_one_timeout")
+        self.assertEqual(
+            phase_one_deadline["category"],
+            "phase_one_timeout",
+        )
+        self.assertEqual(
+            stored_phase_one_deadline["category"],
+            "phase_one_timeout",
+        )
+        self.assertEqual(upstream["category"], "upstream_timeout")
+        self.assertEqual(database["category"], "database_statement_timeout")
+        self.assertEqual(attempt["category"], "operation_attempt_timeout")
+        self.assertTrue(queue["retryable"])
+        self.assertTrue(execution["retryable"])
+        self.assertTrue(phase_one["retryable"])
+        self.assertFalse(phase_one_deadline["retryable"])
+        self.assertTrue(upstream["retryable"])
+        self.assertFalse(attempt["retryable"])
+        for evidence in (
+            queue,
+            execution,
+            phase_one,
+            phase_one_deadline,
+            upstream,
+            database,
+            attempt,
+        ):
+            self.assertIsNone(evidence["http_status"])
+            self.assertEqual(
+                set(evidence),
+                {"category", "retryable", "http_status", "error_digest"},
+            )
+
+    def test_legacy_progress_schemas_keep_timeout_categories_immutable(self):
+        classify = operation_recovery_runtime._exact_drain_failure_evidence
+
+        for progress_schema_version in (1, 2, 3, 4):
+            with self.subTest(progress_schema_version=progress_schema_version):
+                upstream = classify(
+                    "TimeoutError",
+                    retryable=True,
+                    progress_schema_version=progress_schema_version,
+                )
+                database = classify(
+                    "DatabaseError: canceling statement due to statement timeout",
+                    retryable=True,
+                    progress_schema_version=progress_schema_version,
+                )
+                self.assertEqual(upstream["category"], "operation_error")
+                self.assertEqual(database["category"], "operation_error")
+
+                transport = classify(
+                    "request timeout while contacting Hatchery",
+                    retryable=True,
+                    progress_schema_version=progress_schema_version,
+                )
+                self.assertEqual(
+                    transport["category"],
+                    "provider_transport",
+                )
+
+    def test_retry_ceiling_records_the_terminal_disposition(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 2}
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        outcomes = []
+
+        class Recorder:
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append((arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "retry_count": adapter._max_retries,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": "unavailable",
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def execute(self, statement, *_arguments):
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        asyncio.run(
+            adapter.schedule_retry(
+                Backend(),
+                operation_id,
+                None,
+                "ConnectError: provider unavailable",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(outcomes), 1)
+        arguments, evidence = outcomes[0]
+        self.assertEqual(arguments, (operation_id,))
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "retry_ceiling")
+        self.assertIs(evidence["failure"]["retryable"], False)
+
+    def test_schema_five_retry_and_defer_ceiling_preserve_underlying_cause(
+        self,
+    ):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        outcomes = []
+        update_arguments = []
+
+        class Recorder:
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append((arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "retry_count": adapter._max_retries,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": "unavailable",
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def execute(self, statement, *arguments):
+                if "UPDATE public.async_operations" in statement:
+                    update_arguments.append(arguments)
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        asyncio.run(
+            adapter.schedule_retry(
+                Backend(),
+                operation_id,
+                None,
+                "TimeoutError",
+                "public",
+            )
+        )
+
+        self.assertEqual(update_arguments[0][1], "TimeoutError")
+        _arguments, evidence = outcomes[0]
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
+        self.assertIs(evidence["failure"]["retryable"], False)
+
+        row["status"] = "processing"
+        update_arguments.clear()
+        outcomes.clear()
+        asyncio.run(
+            adapter.defer_operation(
+                Backend(),
+                operation_id,
+                None,
+                "ReadTimeoutError",
+                "public",
+            )
+        )
+
+        self.assertEqual(update_arguments[0][1], "ReadTimeoutError")
+        _arguments, evidence = outcomes[0]
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
+        self.assertIs(evidence["failure"]["retryable"], False)
+
+    def test_schema_five_resume_retry_ceiling_preserves_stored_cause(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+        adapter._resume = True
+        adapter._verify_initial_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        operation_id, selected = next(iter(adapter._selected.items()))
+        outcomes = []
+        update_calls = []
+
+        class Recorder:
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append((arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_id": uuid.UUID(operation_id),
+            "operation_type": selected["operation_type"],
+            "retry_count": adapter._max_retries,
+            "task_payload_digest": selected["task_payload_digest"],
+            "error_cause_family": "upstream_timeout",
+            "error_digest": "a" * 64,
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": "unavailable",
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetch(self, *_arguments):
+                return [dict(row)]
+
+            async def execute(self, statement, *arguments):
+                if "UPDATE public.async_operations" in statement:
+                    update_calls.append((statement, arguments))
+                    identifiers = arguments[0]
+                    return f"UPDATE {len(identifiers)}"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        self.assertEqual(asyncio.run(adapter.recover_own_tasks(Backend())), 1)
+
+        exhausted_update, exhausted_arguments = update_calls[-1]
+        self.assertIn("error_message = CASE", exhausted_update)
+        self.assertIn("ELSE error_message", exhausted_update)
+        self.assertEqual(
+            exhausted_arguments[2],
+            operation_recovery_runtime.EXACT_DRAIN_RETRY_CEILING_MESSAGE,
+        )
+        _arguments, evidence = outcomes[-1]
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
+        self.assertEqual(evidence["failure"]["error_digest"], "a" * 64)
+        self.assertIs(evidence["failure"]["retryable"], False)
+
+    def test_schema_five_rejects_empty_direct_failure_causes(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+        operation_id = next(iter(adapter._selected))
+
+        class Backend:
+            def acquire(self):
+                raise AssertionError("empty cause reached PostgreSQL")
+
+        invocations = {
+            "retry": lambda value: adapter.schedule_retry(
+                Backend(), operation_id, None, value, "public"
+            ),
+            "defer": lambda value: adapter.defer_operation(
+                Backend(), operation_id, None, value, "public"
+            ),
+            "fail": lambda value: adapter.mark_failed(
+                Backend(), operation_id, value, "public"
+            ),
+        }
+        for name, invoke in invocations.items():
+            for value in ("", " \n"):
+                with (
+                    self.subTest(name=name, value=repr(value)),
+                    self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "error is invalid|reason is invalid",
+                    ),
+                ):
+                    asyncio.run(invoke(value))
+
+    def test_legacy_direct_failure_cause_validation_remains_compatible(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 4}
+        operation_id = next(iter(adapter._selected))
+        adapter._reschedule_owned_task = AsyncMock()
+        adapter._terminalize_owned_task = AsyncMock()
+        backend = object()
+
+        asyncio.run(
+            adapter.schedule_retry(
+                backend,
+                operation_id,
+                None,
+                "",
+                "public",
+            )
+        )
+        asyncio.run(
+            adapter.defer_operation(
+                backend,
+                operation_id,
+                None,
+                "",
+                "public",
+            )
+        )
+        asyncio.run(
+            adapter.mark_failed(
+                backend,
+                operation_id,
+                "",
+                "public",
+            )
+        )
+
+        self.assertEqual(adapter._reschedule_owned_task.await_count, 2)
+        self.assertEqual(
+            adapter._reschedule_owned_task.await_args_list[0].kwargs[
+                "error_message"
+            ],
+            "",
+        )
+        self.assertIsNone(
+            adapter._reschedule_owned_task.await_args_list[1].kwargs[
+                "error_message"
+            ]
+        )
+        self.assertEqual(
+            adapter._terminalize_owned_task.await_args.kwargs[
+                "error_message"
+            ],
+            "",
+        )
+
+    def test_schema10_retry_and_defer_enforce_the_plan_bound_delay(self):
+        observed_at = int(time.time())
+        maximum_delay = 3_600
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def __init__(self, row):
+                self.row = row
+                self.update_count = 0
+                self.update_arguments = []
+
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(self.row)
+
+            async def execute(self, statement, *arguments):
+                if "UPDATE public.async_operations" in statement:
+                    self.update_count += 1
+                    self.update_arguments.append(arguments)
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return Context(self.connection)
+
+        def case(*, retry_count=0, clock=lambda: observed_at):
+            adapter = self._current_exact_drain_adapter()
+            adapter._clock = clock
+            adapter._verify_unstarted_state = AsyncMock()
+            adapter._configure_mutation_transaction = AsyncMock()
+            operation_id, selected = next(iter(adapter._selected.items()))
+            connection = Connection(
+                {
+                    "operation_type": selected["operation_type"],
+                    "status": "processing",
+                    "worker_id": adapter._worker_id,
+                    "retry_count": retry_count,
+                    "task_payload_digest": selected["task_payload_digest"],
+                    "checkpoint_facts_committed": False,
+                    "checkpoint_committed_document_count": 0,
+                    "checkpoint_unit_ids_count": 0,
+                    "checkpoint_stage": "unavailable",
+                    "checkpoint_processed": 0,
+                    "checkpoint_total": 0,
+                }
+            )
+            return adapter, operation_id, connection, Backend(connection)
+
+        def invoke(name, adapter, operation_id, backend, timestamp):
+            if name == "retry":
+                return adapter.schedule_retry(
+                    backend,
+                    operation_id,
+                    timestamp,
+                    "provider unavailable",
+                    "public",
+                )
+            return adapter.defer_operation(
+                backend,
+                operation_id,
+                timestamp,
+                "capacity",
+                "public",
+            )
+
+        for name in ("retry", "defer"):
+            with self.subTest(name=name, timestamp="non-UTC-boundary"):
+                adapter, operation_id, connection, backend = case()
+                self.assertEqual(
+                    adapter._maximum_retry_delay_seconds,
+                    maximum_delay,
+                )
+                boundary = datetime.fromtimestamp(
+                    observed_at + maximum_delay,
+                    timezone(timedelta(hours=5, minutes=45)),
+                )
+
+                asyncio.run(
+                    invoke(name, adapter, operation_id, backend, boundary)
+                )
+
+                self.assertEqual(connection.update_count, 1)
+                self.assertEqual(
+                    connection.update_arguments[0][1],
+                    boundary.astimezone(timezone.utc),
+                )
+                self.assertIs(
+                    connection.update_arguments[0][1].tzinfo,
+                    timezone.utc,
+                )
+
+            for label, timestamp in {
+                "past": datetime.fromtimestamp(
+                    observed_at - 1,
+                    timezone.utc,
+                ),
+                "immediate": datetime.fromtimestamp(
+                    observed_at,
+                    timezone.utc,
+                ),
+            }.items():
+                with self.subTest(name=name, timestamp=label):
+                    adapter, operation_id, connection, backend = case()
+
+                    asyncio.run(
+                        invoke(name, adapter, operation_id, backend, timestamp)
+                    )
+
+                    self.assertEqual(connection.update_count, 1)
+
+            invalid = {
+                "over-limit": datetime.fromtimestamp(
+                    observed_at + maximum_delay,
+                    timezone.utc,
+                )
+                + timedelta(microseconds=1),
+                "naive": datetime.fromtimestamp(observed_at),
+                "non-datetime": object(),
+            }
+            for label, timestamp in invalid.items():
+                with self.subTest(name=name, timestamp=label):
+                    adapter, operation_id, connection, backend = case()
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "reschedule time is invalid",
+                    ):
+                        asyncio.run(
+                            invoke(
+                                name,
+                                adapter,
+                                operation_id,
+                                backend,
+                                timestamp,
+                            )
+                        )
+
+                    self.assertEqual(connection.update_count, 0)
+
+            with self.subTest(name=name, timestamp="deadline"):
+                adapter, operation_id, connection, backend = case()
+                adapter._execution_deadline = observed_at + maximum_delay // 2
+                deadline = datetime.fromtimestamp(
+                    adapter._execution_deadline,
+                    timezone.utc,
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "reschedule time is invalid",
+                ):
+                    asyncio.run(
+                        invoke(name, adapter, operation_id, backend, deadline)
+                    )
+                self.assertEqual(connection.update_count, 0)
+
+            with self.subTest(name=name, timestamp="before-deadline"):
+                adapter, operation_id, connection, backend = case()
+                adapter._execution_deadline = observed_at + maximum_delay // 2
+                before_deadline = datetime.fromtimestamp(
+                    adapter._execution_deadline,
+                    timezone.utc,
+                ) - timedelta(microseconds=1)
+
+                asyncio.run(
+                    invoke(
+                        name,
+                        adapter,
+                        operation_id,
+                        backend,
+                        before_deadline,
+                    )
+                )
+
+                self.assertEqual(connection.update_count, 1)
+
+            for label, clock_value in {
+                "boolean": True,
+                "not-numeric": "now",
+                "nan": float("nan"),
+                "infinity": float("inf"),
+                "overflowing-integer": 10**1_000,
+            }.items():
+                with self.subTest(name=name, clock=label):
+                    adapter, operation_id, connection, backend = case(
+                        clock=lambda value=clock_value: value
+                    )
+                    timestamp = datetime.fromtimestamp(
+                        observed_at,
+                        timezone.utc,
+                    )
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "clock is invalid",
+                    ):
+                        asyncio.run(
+                            invoke(
+                                name,
+                                adapter,
+                                operation_id,
+                                backend,
+                                timestamp,
+                            )
+                        )
+                    self.assertEqual(connection.update_count, 0)
+
+            with self.subTest(name=name, timestamp="retry-ceiling-none"):
+                adapter, operation_id, connection, backend = case(retry_count=3)
+
+                asyncio.run(invoke(name, adapter, operation_id, backend, None))
+
+                self.assertEqual(connection.update_count, 1)
+
+        class DatetimeSubclass(datetime):
+            def timestamp(self):
+                raise AssertionError("datetime subclass reached timestamp")
+
+        adapter, operation_id, connection, backend = case()
+        hostile = DatetimeSubclass.fromtimestamp(observed_at, timezone.utc)
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "reschedule time is invalid",
+        ):
+            asyncio.run(
+                invoke("retry", adapter, operation_id, backend, hostile)
+            )
+        self.assertEqual(connection.update_count, 0)
+
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        schema10 = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=observed_at),
+            created_at=observed_at,
+        )
+        body = {
+            key: value
+            for key, value in schema10.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        body["schema_version"] = 9
+        body["execution_lease_seconds"] = 86_400
+        schema9 = {
+            **body,
+            "plan_digest": recovery_fixtures.digest(body),
+        }
+        legacy = ExactDrainClaimAdapter(
+            schema9,
+            authorization=recovery_fixtures.exact_drain_authorization(
+                schema9,
+                authorized_at=observed_at,
+            ),
+            clock=lambda: observed_at,
+        )
+        legacy._verify_unstarted_state = AsyncMock()
+        legacy._configure_mutation_transaction = AsyncMock()
+        operation_id, selected = next(iter(legacy._selected.items()))
+        connection = Connection(
+            {
+                "operation_type": selected["operation_type"],
+                "status": "processing",
+                "worker_id": legacy._worker_id,
+                "retry_count": 0,
+                "task_payload_digest": selected["task_payload_digest"],
+                "checkpoint_facts_committed": False,
+                "checkpoint_committed_document_count": 0,
+                "checkpoint_unit_ids_count": 0,
+                "checkpoint_stage": "unavailable",
+                "checkpoint_processed": 0,
+                "checkpoint_total": 0,
+            }
+        )
+        far_future = datetime.fromtimestamp(
+            observed_at + 10 * 86_400,
+            timezone(timedelta(hours=-4)),
+        )
+
+        asyncio.run(
+            legacy.schedule_retry(
+                Backend(connection),
+                operation_id,
+                far_future,
+                "provider unavailable",
+                "public",
+            )
+        )
+
+        self.assertIsNone(legacy._maximum_retry_delay_seconds)
+        self.assertEqual(connection.update_count, 1)
+        self.assertIs(connection.update_arguments[0][1], far_future)
+
+    def test_closed_control_connection_never_falls_back_to_worker_pool(self):
+        adapter = self._current_exact_drain_adapter()
+
+        class Context:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            def acquire(self):
+                self.acquisitions += 1
+                return Context()
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+            await adapter.close_control_connection()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        self.assertEqual(asyncio.run(exercise()), 1)
+
+    def test_malformed_closed_control_lifecycle_never_falls_back(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._control_connection_state = "closed"
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            @asynccontextmanager
+            async def acquire(self):
+                self.acquisitions += 1
+                yield object()
+
+        async def exercise():
+            backend = Backend()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        self.assertEqual(asyncio.run(exercise()), 0)
+
+    def test_missing_control_lifecycle_state_never_falls_back(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._control_backend = None
+        adapter._control_connection_context = None
+        adapter._control_connection = None
+        adapter._control_connection_state_lock = asyncio.Lock()
+        adapter._control_connection_use_lock = asyncio.Lock()
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            @asynccontextmanager
+            async def acquire(self):
+                self.acquisitions += 1
+                yield object()
+
+        async def exercise():
+            backend = Backend()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        self.assertEqual(asyncio.run(exercise()), 0)
+
+    def test_inconsistent_control_lifecycle_never_falls_back(self):
+        malformed = {
+            "unknown-state": ("unknown", None, None, None),
+            "unreserved-with-backend": (
+                "never-reserved",
+                object(),
+                None,
+                None,
+            ),
+            "reserved-without-context": (
+                "reserved",
+                object(),
+                None,
+                object(),
+            ),
+            "closed-with-connection": (
+                "closed",
+                None,
+                None,
+                object(),
+            ),
+            "poisoned-without-context": (
+                "poisoned",
+                object(),
+                None,
+                None,
+            ),
+        }
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            @asynccontextmanager
+            async def acquire(self):
+                self.acquisitions += 1
+                yield object()
+
+        async def exercise(values):
+            adapter = object.__new__(ExactDrainClaimAdapter)
+            (
+                adapter._control_connection_state,
+                adapter._control_backend,
+                adapter._control_connection_context,
+                adapter._control_connection,
+            ) = values
+            adapter._control_connection_state_lock = asyncio.Lock()
+            adapter._control_connection_use_lock = asyncio.Lock()
+            backend = Backend()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        for name, values in malformed.items():
+            with self.subTest(name=name):
+                self.assertEqual(asyncio.run(exercise(values)), 0)
+
+    def test_failed_control_connection_release_stays_poisoned_until_retried(self):
+        adapter = self._current_exact_drain_adapter()
+
+        class Context:
+            def __init__(self):
+                self.exits = 0
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_arguments):
+                self.exits += 1
+                if self.exits == 1:
+                    raise RuntimeError("release failed")
+                return None
+
+        context = Context()
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            def acquire(self):
+                self.acquisitions += 1
+                return context
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+            with self.assertRaisesRegex(RuntimeError, "release failed"):
+                await adapter.close_control_connection()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            await adapter.close_control_connection()
+            return backend.acquisitions, context.exits
+
+        self.assertEqual(asyncio.run(exercise()), (1, 2))
+
+    def test_cancelled_control_connection_close_remains_retryable(self):
+        adapter = self._current_exact_drain_adapter()
+        mutation_entered = asyncio.Event()
+        release_mutation = asyncio.Event()
+
+        class Context:
+            def __init__(self):
+                self.exits = 0
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_arguments):
+                self.exits += 1
+                return None
+
+        context = Context()
+
+        class Backend:
+            def acquire(self):
+                return context
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+
+            async def hold_mutation():
+                async with adapter._mutation_connection(backend):
+                    mutation_entered.set()
+                    await release_mutation.wait()
+
+            mutation = asyncio.create_task(hold_mutation())
+            await mutation_entered.wait()
+            close = asyncio.create_task(adapter.close_control_connection())
+            while adapter._control_connection_state != "closing":
+                await asyncio.sleep(0)
+            close.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close
+            release_mutation.set()
+            await mutation
+            await adapter.close_control_connection()
+            return adapter._control_connection_state, context.exits
+
+        self.assertEqual(asyncio.run(exercise()), ("closed", 1))
+
+    def test_poller_failure_is_consumed_and_surfaces_after_release_failure(self):
+        shutdown_requested = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                raise OperationRecoveryError("startup recovery failed")
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                raise OperationRecoveryError("release failed")
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=shutdown_requested.set,
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            poller_task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(shutdown_requested.wait(), timeout=0.25)
+            try:
+                await poller.shutdown_graceful(timeout=0.25)
+            except OperationRecoveryError as error:
+                shutdown_error = error
+            else:
+                shutdown_error = None
+            poller_result = (await asyncio.gather(
+                poller_task,
+                return_exceptions=True,
+            ))[0]
+            return shutdown_error, poller_result
+
+        shutdown_error, poller_result = asyncio.run(exercise())
+        self.assertIsInstance(shutdown_error, OperationRecoveryError)
+        self.assertEqual(str(shutdown_error), "startup recovery failed")
+        self.assertIsInstance(
+            shutdown_error.__cause__,
+            OperationRecoveryError,
+        )
+        self.assertEqual(str(shutdown_error.__cause__), "release failed")
+
+    def test_shutdown_reports_primary_and_control_connection_failures(self):
+        shutdown_requested = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+            async def close_control_connection(self):
+                raise OperationRecoveryError("control release failed")
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                raise OperationRecoveryError("startup recovery failed")
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                raise OperationRecoveryError("row release failed")
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=shutdown_requested.set,
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            poller_task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(shutdown_requested.wait(), timeout=0.25)
+            try:
+                await poller.shutdown_graceful(timeout=0.25)
+            except BaseException as error:
+                shutdown_error = error
+            else:
+                shutdown_error = None
+            poller_result = (await asyncio.gather(
+                poller_task,
+                return_exceptions=True,
+            ))[0]
+            return shutdown_error, poller_result
+
+        shutdown_error, poller_result = asyncio.run(exercise())
+        self.assertIsInstance(shutdown_error, BaseExceptionGroup)
+        self.assertEqual(
+            [str(error) for error in shutdown_error.exceptions],
+            ["startup recovery failed", "control release failed"],
+        )
+        self.assertIsInstance(
+            shutdown_error.exceptions[0].__cause__,
+            OperationRecoveryError,
+        )
+        self.assertEqual(
+            str(shutdown_error.exceptions[0].__cause__),
+            "row release failed",
+        )
+        self.assertIsNone(poller_result)
+        self.assertIsNone(poller_result)
+
+    def test_premature_poller_return_requests_worker_main_shutdown(self):
+        shutdown_requests = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                return "stopped"
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        poller = WorkerPoller()
+        self.assertIsNone(asyncio.run(poller.run()))
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "poller stopped unexpectedly",
+        ):
+            asyncio.run(poller.shutdown_graceful())
+        self.assertTrue(poller._shutdown.is_set())
+        self.assertEqual(shutdown_requests, [True])
+
+    def test_poller_return_after_shutdown_does_not_request_again(self):
+        shutdown_requests = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+                self._shutdown.set()
+
+            async def run(self):
+                return "stopped"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        poller = WorkerPoller()
+        self.assertEqual(asyncio.run(poller.run()), "stopped")
+        self.assertEqual(shutdown_requests, [])
+
+    def test_poller_cancellation_does_not_request_worker_main_shutdown(self):
+        try:
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        shutdown_requests = []
+        started = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+            async def recover_own_tasks(self, _backend):
+                return 0
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                started.set()
+                await asyncio.Event().wait()
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._shutdown = asyncio.Event()
+            poller._slot_reservations = {}
+            poller._max_slots = 1
+            poller._worker_id = "exact-worker"
+            poller._poll_interval_ms = 250
+            task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(started.wait(), timeout=0.25)
+            task.cancel()
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(shutdown_requests, [])
+        self.assertFalse(hasattr(poller, "_exact_drain_task_errors"))
+
+    def test_runtime_guard_records_claim_only_after_upstream_commit_seam(self):
+        attempts = []
+        committed = []
+        task = type("Task", (), {"operation_id": "operation-1"})()
+
+        class SerializationFailure(RuntimeError):
+            sqlstate = "40001"
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def claim_committed(self, tasks):
+                committed.extend(tasks)
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                schema,
+                reserved_limits,
+                shared_limit,
+            ):
+                attempts.append((schema, reserved_limits, shared_limit))
+                if len(attempts) == 1:
+                    raise SerializationFailure(
+                        "could not serialize access due to concurrent update"
+                    )
+                return [task]
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+        result = asyncio.run(
+            WorkerPoller()._claim_batch_for_schema_inner(None, {}, 1)
+        )
+
+        self.assertEqual(result, [task])
+        self.assertEqual(attempts, [(None, {}, 1), (None, {}, 1)])
+        self.assertEqual(committed, [task])
+
+    def test_exact_terminal_failure_never_uses_upstream_sql_reclaim(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        row = {"status": "processing"}
+        sql_calls = []
+        recovery_calls = []
+        shutdown_requests = []
+
+        class Connection:
+            async def execute(self, query, *_arguments):
+                sql_calls.append(query)
+                row["status"] = "pending"
+                return "UPDATE 1"
+
+            async def fetch(self, query, *_arguments):
+                sql_calls.append(query)
+                return []
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def mark_failed(self, *_arguments):
+                raise RuntimeError("exact terminal write failed")
+
+            async def recover_own_tasks(self, _backend):
+                recovery_calls.append("recover")
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                recovery_calls.append("release")
+                return 0
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def _run_executor(self, _task, _task_type):
+                raise RuntimeError("executor failed")
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = Backend()
+            poller._worker_id = "exact-worker"
+            poller._max_retries = 3
+            poller._shutdown = asyncio.Event()
+            poller._active_tasks = {}
+            task = ClaimedTask(
+                operation_id="operation-1",
+                task_dict={
+                    "type": "retain",
+                    "operation_type": "retain",
+                    "bank_id": "engineering",
+                },
+                schema=None,
+            )
+            holder = SimpleNamespace(stage="queued.retain")
+            await poller._execute_task_inner(task, holder)
+            await poller.recover_own_tasks()
+            await poller.release_own_tasks()
+
+        asyncio.run(exercise())
+        self.assertEqual(sql_calls, [])
+        self.assertEqual(row, {"status": "processing"})
+        self.assertEqual(recovery_calls, ["recover", "release"])
+        self.assertEqual(shutdown_requests, [True])
+
+    def test_transient_terminal_failure_consumes_exact_retry_budget(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            async def schedule_retry(
+                self,
+                backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            ):
+                events.append(
+                    (
+                        "retry",
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+
+            async def mark_failed(self, *arguments):
+                events.append(("failed", *arguments))
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+        )
+
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-1",
+                "canceling statement due to statement timeout",
+                "public",
+            )
+        )
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-2",
+                "entity payload is invalid",
+                "public",
+            )
+        )
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-3",
+                "401 unauthorized while opening provider connection",
+                "public",
+            )
+        )
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-4",
+                "provider capacity exhausted after failover",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(events), 4)
+        self.assertEqual(events[0][:3], ("retry", "exact-backend", "operation-1"))
+        self.assertEqual(
+            events[0][4:],
+            ("canceling statement due to statement timeout", "public"),
+        )
+        self.assertEqual(
+            events[1],
+            (
+                "failed",
+                "exact-backend",
+                "operation-2",
+                "entity payload is invalid",
+                "public",
+            ),
+        )
+        self.assertEqual(
+            events[2],
+            (
+                "failed",
+                "exact-backend",
+                "operation-3",
+                "401 unauthorized while opening provider connection",
+                "public",
+            ),
+        )
+        self.assertEqual(
+            events[3][:3], ("retry", "exact-backend", "operation-4")
+        )
+        self.assertEqual(
+            events[3][4:],
+            ("provider capacity exhausted after failover", "public"),
+        )
+
+    def test_serialization_abort_retries_terminal_persistence_without_shutdown(self):
+        attempts = []
+        failures = []
+        shutdown_requests = []
+
+        class SerializationFailure(RuntimeError):
+            sqlstate = "40001"
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            async def schedule_retry(
+                self,
+                backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            ):
+                attempts.append(
+                    (
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+                if len(attempts) == 1:
+                    raise SerializationFailure(
+                        "could not serialize access due to concurrent update"
+                    )
+
+            def record_upstream_failure(self, *arguments, **keywords):
+                failures.append((arguments, keywords))
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-1",
+                "canceling statement due to statement timeout",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(failures, [])
+        self.assertEqual(shutdown_requests, [])
+
+    def test_swallowed_exact_terminal_failures_surface_after_public_shutdown(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        for failure_mode in ("terminal-write", "post-commit-progress"):
+            with self.subTest(failure_mode=failure_mode):
+                row = {"status": "processing"}
+                events = []
+                sql_calls = []
+                shutdown_requested = asyncio.Event()
+                sibling_quiesced = asyncio.Event()
+                expected_error = (
+                    "exact terminal write failed"
+                    if failure_mode == "terminal-write"
+                    else "terminal progress recorder failed"
+                )
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self, _sql_calls=sql_calls):
+                        _sql_calls.append("acquire")
+                        raise AssertionError("upstream SQL reclaim executed")
+                        yield
+
+                class Adapter(_ControlConnectionAdapterMixin):
+                    def record_upstream_stage(
+                        self,
+                        operation_id,
+                        stage,
+                        _events=events,
+                    ):
+                        _events.append(("stage", operation_id, stage))
+
+                    def record_upstream_failure(
+                        self,
+                        operation_id,
+                        *,
+                        stage,
+                        category,
+                        retryable,
+                        error_message,
+                        _events=events,
+                    ):
+                        _events.append(
+                            (
+                                "failure",
+                                operation_id,
+                                stage,
+                                category,
+                                retryable,
+                                type(error_message).__name__,
+                            )
+                        )
+
+                    async def mark_completed(
+                        self,
+                        _backend,
+                        operation_id,
+                        _schema,
+                        _events=events,
+                    ):
+                        _events.append(("completed", operation_id))
+
+                    async def mark_failed(
+                        self,
+                        *_arguments,
+                        _failure_mode=failure_mode,
+                        _row=row,
+                        _events=events,
+                        _expected_error=expected_error,
+                    ):
+                        if _failure_mode == "post-commit-progress":
+                            _row["status"] = "failed"
+                            _events.append(("terminal", "committed"))
+                        raise RuntimeError(_expected_error)
+
+                    async def release_own_tasks(
+                        self,
+                        _backend,
+                        _sibling_quiesced=sibling_quiesced,
+                        _events=events,
+                        _row=row,
+                    ):
+                        if not _sibling_quiesced.is_set():
+                            raise AssertionError(
+                                "exact release preceded sibling quiescence"
+                            )
+                        _events.append(("release", _row["status"]))
+                        if _row["status"] == "processing":
+                            _row["status"] = "pending"
+                            return 1
+                        return 0
+
+                class PostgreSQLOps:
+                    pass
+
+                class WorkerPoller(UpstreamWorkerPoller):
+                    async def _run_executor(
+                        self,
+                        task,
+                        _task_type,
+                        _sibling_quiesced=sibling_quiesced,
+                        _events=events,
+                    ):
+                        if task.operation_id == "operation-a":
+                            raise RuntimeError("executor failed")
+                        try:
+                            await self._shutdown.wait()
+                        finally:
+                            _sibling_quiesced.set()
+                            _events.append(("sibling", "quiesced"))
+
+                    async def _cleanup_task(
+                        self,
+                        operation_id,
+                        operation_type,
+                        _events=events,
+                    ):
+                        _events.append(("cleanup", operation_id))
+                        await super()._cleanup_task(
+                            operation_id,
+                            operation_type,
+                        )
+
+                class MemoryEngine:
+                    pass
+
+                def request_shutdown(
+                    _events=events,
+                    _shutdown_requested=shutdown_requested,
+                ):
+                    _events.append(("shutdown", "requested"))
+                    _shutdown_requested.set()
+
+                install_exact_drain_runtime_guards(
+                    PostgreSQLOps,
+                    WorkerPoller,
+                    MemoryEngine,
+                    Adapter(),
+                    request_worker_shutdown=request_shutdown,
+                )
+
+                async def exercise(
+                    _shutdown_requested=shutdown_requested,
+                    _expected_error=expected_error,
+                ):
+                    poller = object.__new__(WorkerPoller)
+                    poller._backend = Backend()
+                    poller._worker_id = "exact-worker"
+                    poller._shutdown = asyncio.Event()
+                    poller._in_flight_lock = asyncio.Lock()
+                    poller._in_flight_count = 0
+                    poller._in_flight_by_type = {}
+                    poller._active_tasks = {}
+                    sibling = ClaimedTask(
+                        operation_id="operation-b",
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                    failing = ClaimedTask(
+                        operation_id="operation-a",
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                    await poller.execute_task(sibling)
+                    await asyncio.sleep(0)
+                    await poller.execute_task(failing)
+                    try:
+                        await asyncio.wait_for(
+                            _shutdown_requested.wait(),
+                            timeout=0.5,
+                        )
+                        self.assertTrue(poller._shutdown.is_set())
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            _expected_error,
+                        ):
+                            await poller.shutdown_graceful(timeout=0.25)
+                        self.assertEqual(
+                            await poller._claim_batch_for_schema_inner(
+                                None,
+                                {},
+                                1,
+                            ),
+                            [],
+                        )
+                    finally:
+                        for info in list(poller._active_tasks.values()):
+                            if not info.bg_task.done():
+                                info.bg_task.cancel()
+                        await asyncio.gather(
+                            *[
+                                info.bg_task
+                                for info in poller._active_tasks.values()
+                            ],
+                            return_exceptions=True,
+                        )
+
+                asyncio.run(exercise())
+                self.assertEqual(sql_calls, [])
+                self.assertEqual(
+                    [event for event in events if event[0] == "shutdown"],
+                    [("shutdown", "requested")],
+                )
+                self.assertLess(
+                    events.index(("shutdown", "requested")),
+                    events.index(("cleanup", "operation-a")),
+                )
+                self.assertLess(
+                    events.index(("sibling", "quiesced")),
+                    next(
+                        index
+                        for index, event in enumerate(events)
+                        if event[0] == "release"
+                    ),
+                )
+                self.assertEqual(
+                    row["status"],
+                    (
+                        "pending"
+                        if failure_mode == "terminal-write"
+                        else "failed"
+                    ),
+                )
+                self.assertIn(
+                    (
+                        "failure",
+                        "operation-a",
+                        "failure.terminal-state",
+                        "terminal_state_persistence",
+                        False,
+                        "RuntimeError",
+                    ),
+                    events,
+                )
+
+    def test_phase_one_shutdown_waits_for_plan_bound_statement_cancellation(self):
+        shutdown_requests = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+            phase_one_statement_timeout_seconds = 0.05
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates.fuzzy.1/2"
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.02)
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=lambda: shutdown_requests.append(True),
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retain phase one exceeded its deadline",
+                ):
+                    await poller._execute_task_inner(
+                        SimpleNamespace(operation_id="operation-1"),
+                        SimpleNamespace(stage="queued.retain"),
+                    )
+
+            asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertEqual(shutdown_requests, [True])
+
+    def test_public_shutdown_waits_for_plan_bound_phase_one_quiescence(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        row = {"status": "processing"}
+        task_quiesced = asyncio.Event()
+        shutdown_requested = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+            phase_one_statement_timeout_seconds = 0.6
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def recover_own_tasks(self, _backend):
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                if not task_quiesced.is_set():
+                    raise AssertionError("claim released before task quiescence")
+                row["status"] = "pending"
+                return 1
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                if getattr(self, "_test_delivered", False):
+                    return []
+                self._test_delivered = True
+                return [
+                    ClaimedTask(
+                        operation_id="operation-1",
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                ]
+
+            async def _log_progress_if_due(self):
+                return None
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates.fuzzy.1/2"
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.55)
+                    task_quiesced.set()
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=shutdown_requested.set,
+            )
+
+            async def exercise():
+                poller = object.__new__(WorkerPoller)
+                poller._backend = "exact-backend"
+                poller._worker_id = "exact-worker"
+                poller._shutdown = asyncio.Event()
+                poller._poll_interval_ms = 1
+                poller._slot_reservations = {}
+                poller._max_slots = 1
+                poller._in_flight_lock = asyncio.Lock()
+                poller._in_flight_count = 0
+                poller._in_flight_by_type = {}
+                poller._active_tasks = {}
+                poller_task = asyncio.create_task(poller.run())
+                await asyncio.wait_for(shutdown_requested.wait(), timeout=1.0)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retain phase one exceeded its deadline",
+                ):
+                    await poller.shutdown_graceful(timeout=0.0)
+                await asyncio.wait_for(poller_task, timeout=1.0)
+
+            with patch(
+                "hindsight_api.worker.poller._CANCEL_DRAIN_TIMEOUT",
+                0.005,
+            ):
+                asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertTrue(task_quiesced.is_set())
+        self.assertEqual(row, {"status": "pending"})
+
+    def test_external_shutdown_waits_for_phase_one_quiescence(self):
+        nested_quiesced = asyncio.Event()
+        release_observations = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 60.0
+            phase_one_statement_timeout_seconds = 0.05
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_observations.append(nested_quiesced.is_set())
+                return 1
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.blocked"
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.02)
+                    nested_quiesced.set()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def shutdown_graceful(self, timeout=30.0):
+                self._shutdown.set()
+                tasks = [
+                    info.bg_task
+                    for info in self._active_tasks.values()
+                ]
+                _done, pending = await asyncio.wait(tasks, timeout=timeout)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=0.005)
+                await self.release_own_tasks()
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=lambda: None,
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                operation = SimpleNamespace(operation_id="operation-1")
+                holder = SimpleNamespace(stage="queued.retain")
+                outer = asyncio.create_task(
+                    poller._execute_task_inner(operation, holder)
+                )
+                poller._active_tasks = {
+                    operation.operation_id: SimpleNamespace(bg_task=outer)
+                }
+                await asyncio.sleep(0)
+                await poller.shutdown_graceful(timeout=0.0)
+                await asyncio.gather(outer, return_exceptions=True)
+
+            asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertEqual(release_observations, [True])
+
+    def test_public_shutdown_never_releases_a_nonquiescent_phase_one_task(self):
+        shutdown_requests = []
+        nested_tasks = []
+        release_observations = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 60.0
+            phase_one_statement_timeout_seconds = 0.05
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_observations.append(
+                    [task.done() for task in nested_tasks]
+                )
+                return 1
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.blocked"
+                nested_tasks.append(asyncio.current_task())
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.Event().wait()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def shutdown_graceful(self, timeout=30.0):
+                self._shutdown.set()
+                tasks = [
+                    info.bg_task
+                    for info in self._active_tasks.values()
+                ]
+                _done, pending = await asyncio.wait(tasks, timeout=timeout)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=0.01)
+                await self.release_own_tasks()
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=lambda: shutdown_requests.append(True),
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                operation = SimpleNamespace(operation_id="operation-1")
+                holder = SimpleNamespace(stage="queued.retain")
+                outer = asyncio.create_task(
+                    poller._execute_task_inner(operation, holder)
+                )
+                poller._active_tasks = {
+                    operation.operation_id: SimpleNamespace(bg_task=outer)
+                }
+                try:
+                    await asyncio.sleep(0)
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "claim release is disabled after failed quiescence",
+                    ):
+                        await poller.shutdown_graceful(timeout=0.0)
+                finally:
+                    for task in nested_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *nested_tasks,
+                        return_exceptions=True,
+                    )
+                    if not outer.done():
+                        outer.cancel()
+                    await asyncio.gather(outer, return_exceptions=True)
+
+            asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertEqual(release_observations, [])
+
+    def test_cancelled_exact_terminal_mutation_does_not_request_shutdown(self):
+        shutdown_requests = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def mark_failed(self, *_arguments):
+                raise asyncio.CancelledError
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, task, _holder):
+                await self._mark_failed(
+                    task.operation_id,
+                    "cancelled",
+                    None,
+                )
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            with self.assertRaises(asyncio.CancelledError):
+                await poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1"),
+                    SimpleNamespace(stage="queued.retain"),
+                )
+            self.assertFalse(poller._shutdown.is_set())
+            self.assertFalse(
+                hasattr(poller, "_exact_drain_task_errors")
+            )
+
+        asyncio.run(exercise())
+        self.assertEqual(shutdown_requests, [])
+
+    def test_shutdown_serializes_with_a_committing_claim(self):
+        events = []
+        claim_entered = asyncio.Event()
+        allow_claim_commit = asyncio.Event()
+        task = type("Task", (), {"operation_id": "operation-1"})()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def claim_committed(self, tasks):
+                events.append(("committed", list(tasks)))
+
+            async def release_own_tasks(self, _backend):
+                events.append(("released", [task]))
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                claim_entered.set()
+                await allow_claim_commit.wait()
+                return [task]
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                self._shutdown.set()
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            claim = asyncio.create_task(
+                poller._claim_batch_for_schema_inner(None, {}, 1)
+            )
+            await asyncio.wait_for(claim_entered.wait(), timeout=1.0)
+            shutdown = asyncio.create_task(
+                poller.shutdown_graceful(timeout=0.25)
+            )
+            await asyncio.wait_for(poller._shutdown.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            self.assertFalse(shutdown.done())
+            allow_claim_commit.set()
+            self.assertEqual(await claim, [])
+            await shutdown
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            events,
+            [
+                ("committed", [task]),
+                ("released", [task]),
+            ],
+        )
+
+    def test_public_claim_does_not_swallow_post_commit_progress_failure(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        task = type("Task", (), {"operation_id": operation_id})()
+        recorder = Mock()
+        recorder.task_stage.side_effect = RuntimeError("progress failed")
+        aborts = []
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._selected = {operation_id: {}}
+        adapter._started_ids = set()
+        adapter._pending_progress_stages = {}
+        adapter._progress_recorder = recorder
+        adapter._completion_callback = lambda: aborts.append(True)
+        adapter.reserve_control_connection = AsyncMock()
+        adapter.close_control_connection = AsyncMock()
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return [task]
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                try:
+                    return await self._claim_batch_for_schema_inner(
+                        schema, reserved, shared
+                    )
+                except Exception:
+                    return []
+
+            async def claim_batch(self):
+                return await self._claim_batch_for_schema(None, {}, 1)
+
+            async def run(self):
+                while not self._shutdown.is_set():
+                    try:
+                        await self.claim_batch()
+                    except Exception:
+                        await asyncio.sleep(0)
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            adapter,
+            request_worker_shutdown=lambda: None,
+        )
+
+        poller = WorkerPoller()
+        asyncio.run(asyncio.wait_for(poller.run(), timeout=1))
+        self.assertEqual(adapter._started_ids, {operation_id})
+        self.assertTrue(poller._shutdown.is_set())
+        self.assertEqual(aborts, [True])
+
+    def test_runtime_guard_projects_upstream_stage_holder_changes(self):
+        stages = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def record_upstream_stage(self, operation_id, stage):
+                stages.append((operation_id, stage))
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, task, holder):
+                holder.stage = "retain.phase1.resolve"
+                await asyncio.sleep(0.6)
+                holder.stage = "llm.codex.retain.attempt=1/1"
+                return "done"
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            task = type("Task", (), {"operation_id": "operation-1"})()
+            holder = type("Holder", (), {"stage": "queued.retain"})()
+            return await WorkerPoller()._execute_task_inner(task, holder)
+
+        self.assertEqual(asyncio.run(exercise()), "done")
+        self.assertEqual(
+            stages,
+            [
+                ("operation-1", "queued.retain"),
+                ("operation-1", "retain.phase1.resolve"),
+                ("operation-1", "llm.codex.retain.attempt=1/1"),
+            ],
+        )
+
+    def test_runtime_guard_bounds_retain_phase_one_after_breadcrumb(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            task = type("Task", (), {"operation_id": "operation-1"})()
+            holder = type("Holder", (), {"stage": "queued.retain"})()
+            return await WorkerPoller()._execute_task_inner(task, holder)
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retain phase one exceeded its deadline",
+        ):
+            asyncio.run(exercise())
+        self.assertEqual(events, ["shutdown", "cancelled"])
+
+    def test_schema_eleven_phase_one_deadline_survives_llm_breadcrumb(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.3
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.resolve"
+                await asyncio.sleep(0.26)
+                holder.stage = "llm.codex.retain.attempt=1/1"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            return await WorkerPoller()._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retain phase one exceeded its deadline",
+        ):
+            asyncio.run(exercise())
+        self.assertEqual(events, ["shutdown", "cancelled"])
+
+    def test_schema_eleven_operation_attempt_deadline_bounds_all_stages(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.01
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase2.insert_facts"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            return await WorkerPoller()._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "operation attempt exceeded its deadline",
+        ):
+            asyncio.run(exercise())
+        self.assertEqual(events, ["shutdown", "cancelled"])
+
+    def test_schema_twelve_operation_deadline_retries_after_quiescence(self):
+        events = []
+        retries = []
+
+        class SerializationFailure(RuntimeError):
+            sqlstate = "40001"
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.01
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(
+                self,
+                backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            ):
+                retries.append(
+                    (
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+                if len(retries) == 1:
+                    raise SerializationFailure(
+                        "could not serialize access due to concurrent update"
+                    )
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase2.insert_facts"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            result = await poller._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1", schema=None),
+                SimpleNamespace(stage="queued.retain"),
+            )
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(events, ["cancelled"])
+        self.assertEqual(len(retries), 2)
+        self.assertEqual(retries[0], retries[1])
+        backend, operation_id, retry_at, error_message, schema = retries[0]
+        self.assertEqual(backend, "exact-backend")
+        self.assertEqual(operation_id, "operation-1")
+        self.assertIsNotNone(retry_at.tzinfo)
+        self.assertEqual(
+            error_message,
+            operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
+        )
+        self.assertIsNone(schema)
+
+    def test_schema_twelve_deadline_retries_after_translated_cancellation(self):
+        retries = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.01
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *arguments):
+                retries.append(arguments)
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as error:
+                    raise OperationRecoveryError(
+                        "upstream translated cancellation"
+                    ) from error
+
+        shutdowns = []
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdowns.append(True),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            result = await poller._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1", schema="public"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(shutdowns, [])
+        self.assertEqual(len(retries), 1)
+
+    def test_schema_twelve_completed_task_before_deadline_wins(self):
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.5
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *_arguments):
+                raise AssertionError("completed task was retried")
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                return "completed"
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: None,
+        )
+
+        def completed_task(coroutine):
+            coroutine.close()
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("completed")
+            return future
+
+        async def exercise():
+            with (
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.asyncio.create_task",
+                    side_effect=completed_task,
+                ),
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.time.monotonic",
+                    side_effect=[10.0, 10.25],
+                ),
+            ):
+                poller = WorkerPoller()
+                result = await poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1", schema=None),
+                    SimpleNamespace(stage="retain.phase2.insert_facts"),
+                )
+                return poller, result
+
+        poller, result = asyncio.run(exercise())
+        self.assertEqual(result, "completed")
+        self.assertFalse(poller._shutdown.is_set())
+
+    def test_schema_twelve_completed_task_after_deadline_is_retried(self):
+        retries = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.5
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *arguments):
+                retries.append(arguments)
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                return "completed"
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: None,
+        )
+
+        def completed_task(coroutine):
+            coroutine.close()
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("completed")
+            return future
+
+        async def exercise():
+            with (
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.asyncio.create_task",
+                    side_effect=completed_task,
+                ),
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.time.monotonic",
+                    side_effect=[10.0, 11.0],
+                ),
+            ):
+                poller = WorkerPoller()
+                result = await poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1", schema=None),
+                    SimpleNamespace(stage="retain.phase2.insert_facts"),
+                )
+                return poller, result
+
+        poller, result = asyncio.run(exercise())
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(
+            retries[0][3],
+            operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
+        )
+
+    def test_schema_twelve_phase_one_deadline_retries_after_quiescence(self):
+        retries = []
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.01
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *arguments):
+                retries.append(arguments)
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            result = await poller._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1", schema="public"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(events, ["cancelled"])
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0][0:2], ("exact-backend", "operation-1"))
+        self.assertEqual(
+            retries[0][3],
+            operation_recovery_runtime.EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE,
+        )
+        self.assertEqual(retries[0][4], "public")
+
+    def test_schema_twelve_nonquiescence_stays_fail_closed_when_shutdown_fails(
+        self,
+    ):
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.0
+        try:
+            for shutdown_case in ("unavailable", "raises"):
+                with self.subTest(shutdown_case=shutdown_case):
+                    retries = []
+                    releases = []
+
+                    class Adapter(_ControlConnectionAdapterMixin):
+                        operation_attempt_timeout_seconds = 0.001
+                        operation_attempt_timeout_disposition = (
+                            "task-retry-after-quiescence"
+                        )
+                        phase_one_nested_stage_prefixes = ("llm.",)
+
+                        def record_upstream_stage(
+                            self,
+                            _operation_id,
+                            _stage,
+                        ):
+                            return None
+
+                        async def schedule_retry(self, *arguments):
+                            retries.append(arguments)
+
+                        async def release_own_tasks(self, _backend):
+                            releases.append(True)
+                            return 1
+
+                    class WorkerPoller(_RunCapableWorkerPoller):
+                        _backend = "exact-backend"
+
+                        def __init__(self):
+                            self._shutdown = asyncio.Event()
+
+                        async def _claim_batch_for_schema_inner(
+                            self,
+                            *_arguments,
+                        ):
+                            return []
+
+                        async def _claim_batch_for_schema(
+                            self,
+                            schema,
+                            reserved,
+                            shared,
+                        ):
+                            return await self._claim_batch_for_schema_inner(
+                                schema,
+                                reserved,
+                                shared,
+                            )
+
+                        async def _execute_task_inner(self, _task, _holder):
+                            ignored = False
+                            while True:
+                                try:
+                                    await asyncio.Event().wait()
+                                except asyncio.CancelledError:
+                                    if ignored:
+                                        raise
+                                    ignored = True
+
+                    def raising_shutdown():
+                        raise RuntimeError("shutdown bridge failed")
+
+                    install_exact_drain_runtime_guards(
+                        type("PostgreSQLOps", (), {}),
+                        WorkerPoller,
+                        type("MemoryEngine", (), {}),
+                        Adapter(),
+                        request_worker_shutdown=(
+                            None
+                            if shutdown_case == "unavailable"
+                            else raising_shutdown
+                        ),
+                    )
+
+                    async def exercise():
+                        poller = WorkerPoller()
+                        task = SimpleNamespace(
+                            operation_id="operation-1",
+                            schema="public",
+                        )
+                        holder = SimpleNamespace(stage="queued.retain")
+                        with self.assertRaisesRegex(
+                            OperationRecoveryError,
+                            "did not quiesce",
+                        ) as raised:
+                            await poller._execute_task_inner(task, holder)
+                        self.assertIsNotNone(raised.exception.__cause__)
+                        with self.assertRaisesRegex(
+                            OperationRecoveryError,
+                            "claim release is disabled",
+                        ):
+                            await poller.release_own_tasks()
+
+                    asyncio.run(exercise())
+                    self.assertEqual(retries, [])
+                    self.assertEqual(releases, [])
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+
+    def test_phase_one_timeout_never_releases_before_task_quiescence(self):
+        release_calls = []
+        stages = []
+        failures = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, operation_id, stage):
+                stages.append((operation_id, stage))
+
+            def record_upstream_failure(
+                self,
+                operation_id,
+                *,
+                stage,
+                category,
+                retryable,
+                error_message,
+            ):
+                failures.append(
+                    (
+                        operation_id,
+                        stage,
+                        category,
+                        retryable,
+                        type(error_message).__name__,
+                    )
+                )
+
+            async def release_own_tasks(self, _backend):
+                release_calls.append(True)
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.cooccurrence"
+                ignored = False
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        if ignored:
+                            raise
+                        ignored = True
+
+        class MemoryEngine:
+            pass
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.0
+        try:
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+                request_worker_shutdown=lambda: release_calls.append(
+                    "shutdown"
+                ),
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                task = type("Task", (), {"operation_id": "operation-1"})()
+                holder = type("Holder", (), {"stage": "queued.retain"})()
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "did not quiesce",
+                ):
+                    await poller._execute_task_inner(task, holder)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "claim release is disabled",
+                ):
+                    await poller.release_own_tasks()
+
+            asyncio.run(exercise())
+            self.assertEqual(release_calls, ["shutdown"])
+            self.assertEqual(
+                failures,
+                [
+                    (
+                        "operation-1",
+                        "failure.nonquiescent",
+                        "nonquiescent_shutdown",
+                        False,
+                        "OperationRecoveryError",
+                    )
+                ],
+            )
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+
+    def test_public_shutdown_never_releases_a_child_ignoring_cancellation(self):
+        release_calls = []
+        shutdown_requested = asyncio.Event()
+        child_tasks = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_calls.append(True)
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.cooccurrence"
+                child_tasks.append(asyncio.current_task())
+                ignored = False
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        if ignored:
+                            raise
+                        ignored = True
+
+            async def shutdown_graceful(self, timeout=30.0):
+                self._shutdown.set()
+                tasks = [info.bg_task for info in self._active_tasks.values()]
+                _done, pending = await asyncio.wait(tasks, timeout=timeout)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=0.1)
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+                request_worker_shutdown=shutdown_requested.set,
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                task = type("Task", (), {"operation_id": "operation-1"})()
+                holder = type("Holder", (), {"stage": "queued.retain"})()
+                execution = asyncio.create_task(
+                    poller._execute_task_inner(task, holder)
+                )
+                poller._active_tasks = {
+                    task.operation_id: SimpleNamespace(bg_task=execution),
+                }
+                await asyncio.wait_for(shutdown_requested.wait(), timeout=1.0)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "claim release is disabled",
+                ):
+                    await poller.shutdown_graceful(timeout=0.0)
+                for child in child_tasks:
+                    if child is not None and not child.done():
+                        child.cancel()
+                if child_tasks:
+                    await asyncio.gather(*child_tasks, return_exceptions=True)
+
+            asyncio.run(exercise())
+            self.assertEqual(release_calls, [])
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+
+    def test_phase_one_deadline_quiesces_shuts_down_and_releases_owned_row(self):
+        try:
+            from hindsight_api.worker import main as worker_main_module
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        events = []
+        row = {"status": "processing"}
+        task_quiesced = asyncio.Event()
+        worker_main_shutdown = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, stage):
+                events.append(("stage", stage))
+
+            async def recover_own_tasks(self, _backend):
+                events.append(("recover", row["status"]))
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                if not task_quiesced.is_set():
+                    raise AssertionError("owned row released before task quiescence")
+                if row["status"] != "processing":
+                    return 0
+                row["status"] = "pending"
+                events.append(("release", "pending"))
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                if any(event[0] == "release" for event in events):
+                    raise AssertionError("claim attempted after exact release")
+                if not getattr(self, "_test_delivered", False):
+                    self._test_delivered = True
+                    events.append(("claim", row["status"]))
+                    return [
+                        ClaimedTask(
+                            operation_id="operation-1",
+                            task_dict={
+                                "type": "retain",
+                                "operation_type": "retain",
+                                "bank_id": "engineering",
+                            },
+                            schema=None,
+                        )
+                    ]
+                return []
+
+            async def _log_progress_if_due(self):
+                return None
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.cooccurrence"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    task_quiesced.set()
+                events.append(("provider", "after-quiescence"))
+
+        class MemoryEngine:
+            pass
+
+        shutdown_bridge = ExactDrainWorkerMainShutdownBridge(
+            worker_main_module
+        )
+
+        async def exercise():
+            loop = asyncio.get_running_loop()
+            installed = worker_main_module._install_shutdown_signal_handlers(
+                loop,
+                worker_main_shutdown.set,
+            )
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._worker_id = "exact-worker"
+            poller._shutdown = asyncio.Event()
+            poller._poll_interval_ms = 1
+            poller._slot_reservations = {}
+            poller._max_slots = 1
+            poller._in_flight_lock = asyncio.Lock()
+            poller._in_flight_count = 0
+            poller._in_flight_by_type = {}
+            poller._active_tasks = {}
+            try:
+                poller_task = asyncio.create_task(poller.run())
+                await asyncio.wait_for(
+                    worker_main_shutdown.wait(),
+                    timeout=1.0,
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retain phase one exceeded its deadline",
+                ):
+                    await poller.shutdown_graceful(timeout=0.25)
+                await asyncio.wait_for(poller_task, timeout=1.0)
+                await asyncio.sleep(0)
+                return poller
+            finally:
+                if installed:
+                    loop.remove_signal_handler(signal.SIGINT)
+                    loop.remove_signal_handler(signal.SIGTERM)
+
+        with shutdown_bridge:
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+                request_worker_shutdown=shutdown_bridge.request,
+            )
+            poller = asyncio.run(exercise())
+        self.assertTrue(poller._shutdown.is_set())
+        self.assertEqual(row["status"], "pending")
+        self.assertIn(("release", "pending"), events)
+        self.assertNotIn(("provider", "after-quiescence"), events)
+
+    def test_phase_one_deadline_quiesces_sibling_before_owned_row_release(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        rows = {
+            "operation-a": "processing",
+            "operation-b": "processing",
+        }
+        quiesced = {operation_id: asyncio.Event() for operation_id in rows}
+        events = []
+        worker_main_shutdown = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def recover_own_tasks(self, _backend):
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                if not all(event.is_set() for event in quiesced.values()):
+                    raise AssertionError(
+                        "owned rows released while a sibling task could write"
+                    )
+                for operation_id in rows:
+                    rows[operation_id] = "pending"
+                events.append("release")
+                return 2
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                if self._shutdown.is_set():
+                    raise AssertionError("claim attempted after shutdown")
+                if getattr(self, "_test_delivered", False):
+                    return []
+                self._test_delivered = True
+                return [
+                    ClaimedTask(
+                        operation_id=operation_id,
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                    for operation_id in rows
+                ]
+
+            async def _log_progress_if_due(self):
+                return None
+
+            async def _execute_task_inner(self, task, holder):
+                if task.operation_id == "operation-a":
+                    holder.stage = "retain.phase1.cooccurrence"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    quiesced[task.operation_id].set()
+                events.append(("provider", task.operation_id))
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=worker_main_shutdown.set,
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._worker_id = "exact-worker"
+            poller._shutdown = asyncio.Event()
+            poller._poll_interval_ms = 1
+            poller._slot_reservations = {}
+            poller._max_slots = 2
+            poller._in_flight_lock = asyncio.Lock()
+            poller._in_flight_count = 0
+            poller._in_flight_by_type = {}
+            poller._active_tasks = {}
+            poller_task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(
+                worker_main_shutdown.wait(),
+                timeout=1.0,
+            )
+            self.assertNotIn("release", events)
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "retain phase one exceeded its deadline",
+            ):
+                await poller.shutdown_graceful(timeout=30.0)
+            await asyncio.wait_for(poller_task, timeout=1.0)
+
+        asyncio.run(exercise())
+        self.assertEqual(rows, {
+            "operation-a": "pending",
+            "operation-b": "pending",
+        })
+        self.assertEqual(events, ["release"])
+
+    def test_phase_one_recorder_failure_shuts_down_releases_then_surfaces(self):
+        events = []
+        shutdown_requested = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 30.0
+
+            def record_upstream_stage(self, _operation_id, stage):
+                events.append(("stage", stage))
+                if stage == "retain.phase1.candidates":
+                    raise RuntimeError("progress recorder failed")
+
+            async def release_own_tasks(self, _backend):
+                events.append(("release", "owned"))
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                events.append(("claim", "upstream"))
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append(("child", "quiesced"))
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                self._shutdown.set()
+                tasks = [info.bg_task for info in self._active_tasks.values()]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: (
+                events.append(("shutdown", "requested")),
+                shutdown_requested.set(),
+            ),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            task = type("Task", (), {"operation_id": "operation-1"})()
+            holder = type("Holder", (), {"stage": "queued.retain"})()
+            execution = asyncio.create_task(
+                poller._execute_task_inner(task, holder)
+            )
+            poller._active_tasks = {
+                task.operation_id: SimpleNamespace(bg_task=execution),
+            }
+            await asyncio.wait_for(shutdown_requested.wait(), timeout=1.0)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "progress recorder failed",
+            ):
+                await poller.shutdown_graceful(timeout=0.25)
+            self.assertEqual(
+                await poller._claim_batch_for_schema_inner(None, {}, 1),
+                [],
+            )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            [event for event in events if event[0] == "shutdown"],
+            [("shutdown", "requested")],
+        )
+        self.assertLess(
+            events.index(("shutdown", "requested")),
+            events.index(("child", "quiesced")),
+        )
+        self.assertLess(
+            events.index(("child", "quiesced")),
+            events.index(("release", "owned")),
+        )
+        self.assertNotIn(("claim", "upstream"), events)
+
+    def test_escaped_upstream_failure_quiesces_sibling_before_release(self):
+        events = []
+        shutdown_requested = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def record_upstream_stage(self, _operation_id, stage):
+                events.append(("stage", stage))
+
+            async def release_own_tasks(self, _backend):
+                events.append(("release", "owned"))
+                return 2
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, task, holder):
+                holder.stage = "executor.retain"
+                if task.operation_id == "operation-a":
+                    raise RuntimeError("exact retry mutation failed")
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append(("child", task.operation_id))
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                self._shutdown.set()
+                await asyncio.sleep(0)
+                tasks = [info.bg_task for info in self._active_tasks.values()]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: (
+                events.append(("shutdown", "requested")),
+                shutdown_requested.set(),
+            ),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            holder_a = SimpleNamespace(stage="queued.retain")
+            holder_b = SimpleNamespace(stage="queued.retain")
+            task_a = SimpleNamespace(operation_id="operation-a")
+            task_b = SimpleNamespace(operation_id="operation-b")
+            execution_a = asyncio.create_task(
+                poller._execute_task_inner(task_a, holder_a)
+            )
+            execution_b = asyncio.create_task(
+                poller._execute_task_inner(task_b, holder_b)
+            )
+            poller._active_tasks = {
+                task_a.operation_id: SimpleNamespace(bg_task=execution_a),
+                task_b.operation_id: SimpleNamespace(bg_task=execution_b),
+            }
+            try:
+                await asyncio.wait_for(shutdown_requested.wait(), timeout=0.5)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "exact retry mutation failed",
+                ):
+                    await poller.shutdown_graceful(timeout=0.25)
+            finally:
+                for execution in (execution_a, execution_b):
+                    if not execution.done():
+                        execution.cancel()
+                await asyncio.gather(
+                    execution_a,
+                    execution_b,
+                    return_exceptions=True,
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            [event for event in events if event[0] == "shutdown"],
+            [("shutdown", "requested")],
+        )
+        self.assertLess(
+            events.index(("child", "operation-b")),
+            events.index(("release", "owned")),
+        )
+
+    def test_normal_task_cancellation_does_not_request_worker_shutdown(self):
+        shutdown_requests = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                await asyncio.Event().wait()
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            task = asyncio.create_task(
+                poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1"),
+                    SimpleNamespace(stage="queued.retain"),
+                )
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(exercise())
+        self.assertEqual(shutdown_requests, [])
+
+    def test_sigterm_runs_the_exact_release_seam(self):
+        try:
+            import hindsight_api.worker.main  # noqa: F401
+            import hindsight_api.worker.poller  # noqa: F401
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+        script = textwrap.dedent(
+            f"""
+            import asyncio
+            import sys
+
+            sys.path.insert(0, {str(LIB)!r})
+            from hindsight_memory_control_plane.operation_recovery_runtime import install_exact_drain_runtime_guards
+            from hindsight_api.worker.main import _install_shutdown_signal_handlers
+            from hindsight_api.worker.poller import WorkerPoller as UpstreamWorkerPoller
+
+            released = []
+
+            class Adapter:
+                async def reserve_control_connection(self, _backend):
+                    return None
+
+                async def close_control_connection(self):
+                    return None
+
+                async def release_own_tasks(self, backend):
+                    released.append(backend)
+                    return 2
+
+            class PostgreSQLOps:
+                pass
+
+            class WorkerPoller(UpstreamWorkerPoller):
+                pass
+
+            class MemoryEngine:
+                pass
+
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+            )
+
+            async def exercise():
+                poller = object.__new__(WorkerPoller)
+                poller._backend = "exact-backend"
+                poller._worker_id = "exact-worker"
+                poller._shutdown = asyncio.Event()
+                poller._in_flight_lock = asyncio.Lock()
+                poller._in_flight_count = 0
+                poller._active_tasks = {{}}
+                shutdown = asyncio.Event()
+                loop = asyncio.get_running_loop()
+                if not _install_shutdown_signal_handlers(loop, shutdown.set):
+                    raise RuntimeError("signal handlers unavailable")
+                print("READY", flush=True)
+                await shutdown.wait()
+                await poller.shutdown_graceful(timeout=0.01)
+                print(f"RELEASED={{released!r}}", flush=True)
+
+            asyncio.run(exercise())
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready = []
+            reader = threading.Thread(
+                target=lambda: ready.append(process.stdout.readline())
+            )
+            reader.daemon = True
+            reader.start()
+            reader.join(timeout=10)
+            self.assertFalse(reader.is_alive(), "worker never reported READY")
+            self.assertEqual(ready[0].strip(), "READY")
+            os.kill(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("RELEASED=['exact-backend']", stdout)
+
+    def test_exact_drain_resume_reconciles_terminal_progress(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        recorder = Mock()
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        adapter._plan = {
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {
+            operation_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "a" * 64,
+                "row_digest": "b" * 64,
+            }
+        }
+        adapter._preserved = {}
+        adapter._resume = True
+        adapter._terminal_reconciliation = True
+        adapter._worker_digest = "c" * 64
+        adapter._started_ids = set()
+        adapter._progress_recorder = recorder
+
+        class Connection:
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+        row = {
+            "operation_id": operation_id,
+            "operation_type": "retain",
+            "task_payload_digest": "a" * 64,
+            "worker_id_digest": "c" * 64,
+            "status": "completed",
+        }
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_generation",
+                new=AsyncMock(return_value="systalyze:public:124"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_safe_operation_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "live_row_digest",
+                return_value="d" * 64,
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(Connection()))
+
+        recorder.task_stage.assert_not_called()
+        adapter._flush_pending_progress_stages()
+        recorder.task_stage.assert_called_once_with(
+            operation_id,
+            status="completed",
+            stage="resume-completed",
+        )
+        row["status"] = "pending"
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_generation",
+                new=AsyncMock(return_value="systalyze:public:124"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_safe_operation_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "live_row_digest",
+                return_value="d" * 64,
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "terminal reconciliation state differs",
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(Connection()))
+
+    def test_terminal_public_claim_binds_prelaunch_generation_and_status(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        adapter._plan = {
+            "plan_digest": "1" * 64,
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {
+            operation_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "a" * 64,
+                "row_digest": "b" * 64,
+            }
+        }
+        adapter._preserved = {}
+        adapter._identifiers = []
+        adapter._resume = True
+        adapter._terminal_reconciliation = True
+        adapter._worker_id = "exact-worker"
+        adapter._worker_digest = "c" * 64
+        adapter._started_ids = set()
+        adapter._progress_recorder = None
+        adapter._pending_progress_stages = {}
+        adapter._transaction_timeout_seconds = None
+        adapter._execution_deadline = None
+        adapter._initial_guard_complete = False
+        adapter._terminal_reconciliation_ready = False
+        adapter._completion_signalled = False
+        adapter._completion_callback = None
+        status_body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-status",
+            "plan_digest": "1" * 64,
+            "generation_before": "systalyze:public:123",
+            "generation_after": "systalyze:public:123",
+            "selected_operation_count": 1,
+            "selected_status_counts": {"completed": 1},
+            "preserved_status_counts": {},
+            "outside_nonterminal_counts": [],
+            "observed_at": 1_000,
+        }
+        adapter._terminal_status_evidence = {
+            "generation": "systalyze:public:123",
+            "observed_at": 1_000,
+            "status_digest": recovery_fixtures.digest(status_body),
+        }
+
+        class Connection:
+            async def execute(self, *_arguments):
+                return "SET"
+
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+            async def fetch(self, *_arguments):
+                return []
+
+        row = {
+            "operation_id": operation_id,
+            "operation_type": "retain",
+            "task_payload_digest": "a" * 64,
+            "worker_id_digest": "c" * 64,
+            "status": "completed",
+        }
+
+        async def claim(generation):
+            with (
+                patch(
+                    "hindsight_memory_control_plane.operation_recovery_runtime."
+                    "read_generation",
+                    new=AsyncMock(return_value=generation),
+                ),
+                patch(
+                    "hindsight_memory_control_plane.operation_recovery_runtime."
+                    "read_safe_operation_rows",
+                    new=AsyncMock(return_value=[row]),
+                ),
+                patch(
+                    "hindsight_memory_control_plane.operation_recovery_runtime."
+                    "live_row_digest",
+                    return_value="d" * 64,
+                ),
+            ):
+                return await adapter.claim_tasks(
+                    Connection(),
+                    "public.async_operations",
+                    "exact-worker",
+                    {},
+                    1,
+                )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal generation evidence differs",
+        ):
+            asyncio.run(claim("systalyze:public:124"))
+
+        row["status"] = "failed"
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal status evidence differs",
+        ):
+            asyncio.run(claim("systalyze:public:123"))
+
+    def test_schema_twelve_terminal_reconciliation_binds_failure_causes(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        classifications = [
+            {
+                "cause_family": "upstream_timeout",
+                "error_digest": "a" * 64,
+                "occurrence_count": 1,
+            }
+        ]
+        adapter._plan = {
+            "schema_version": 12,
+            "plan_digest": "1" * 64,
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {
+            operation_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "b" * 64,
+                "row_digest": "c" * 64,
+            }
+        }
+        adapter._preserved = {}
+        adapter._identifiers = [uuid.UUID(operation_id)]
+        adapter._resume = True
+        adapter._terminal_reconciliation = True
+        adapter._worker_digest = "d" * 64
+        adapter._started_ids = set()
+        adapter._pending_progress_stages = {}
+        status_body = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-status",
+            "plan_digest": "1" * 64,
+            "generation_before": "systalyze:public:123",
+            "generation_after": "systalyze:public:123",
+            "selected_operation_count": 1,
+            "selected_status_counts": {"failed": 1},
+            "preserved_status_counts": {},
+            "outside_nonterminal_counts": [],
+            "failure_classifications": classifications,
+            "observed_at": 1_000,
+        }
+        adapter._terminal_status_evidence = {
+            "generation": "systalyze:public:123",
+            "observed_at": 1_000,
+            "status_digest": recovery_fixtures.digest(status_body),
+        }
+
+        class Connection:
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+            async def fetch(self, *_arguments):
+                return []
+
+        row = {
+            "operation_id": operation_id,
+            "operation_type": "retain",
+            "task_payload_digest": "b" * 64,
+            "worker_id_digest": "d" * 64,
+            "status": "failed",
+        }
+        read_classifications = AsyncMock(return_value=classifications)
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_generation",
+                new=AsyncMock(return_value="systalyze:public:123"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_safe_operation_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_failure_classifications",
+                new=read_classifications,
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "live_row_digest",
+                return_value="e" * 64,
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(Connection()))
+
+        read_classifications.assert_awaited_once()
+
+    def test_terminal_reconciliation_rechecks_before_every_no_work_claim(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._terminal_reconciliation = True
+        adapter._terminal_reconciliation_ready = False
+        adapter._initial_guard_complete = True
+        adapter._verify_initial_state = AsyncMock(
+            side_effect=OperationRecoveryError(
+                "operation-recovery terminal reconciliation state differs"
+            )
+        )
+        connection = SimpleNamespace(
+            execute=AsyncMock(return_value="SET"),
+            fetch=AsyncMock(),
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal reconciliation state differs",
+        ):
+            asyncio.run(
+                adapter.claim_tasks(
+                    connection,
+                    '"public".async_operations',
+                    "exact-worker",
+                    {},
+                    1,
+                )
+            )
+
+        adapter._verify_initial_state.assert_awaited_once_with(connection)
+        connection.fetch.assert_not_awaited()
+        self.assertFalse(adapter._terminal_reconciliation_ready)
+
+    def test_expired_terminal_reconciliation_claims_no_tasks_or_provider_work(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+        completed = []
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            resume=True,
+            terminal_reconciliation=True,
+            terminal_status_evidence={
+                "generation": plan["pre_generation"],
+                "observed_at": planned_at,
+                "status_digest": "6" * 64,
+            },
+            completion_callback=lambda: completed.append(True),
+            clock=lambda: planned_at
+            + plan["execution_window"]["calculated_seconds"]
+            + 1,
+        )
+        adapter._verify_initial_state = AsyncMock()
+
+        class Connection:
+            def __init__(self):
+                self.statements = []
+                self.timeouts = []
+
+            async def execute(self, statement, *_arguments):
+                self.statements.append(statement)
+                return "SET"
+
+            async def fetchval(self, statement, value):
+                self.timeouts.append((statement, value))
+
+            async def fetch(self, *_arguments, **_keywords):
+                raise AssertionError("terminal reconciliation selected claim rows")
+
+        connection = Connection()
+        tasks = asyncio.run(
+            adapter.claim_tasks(
+                connection,
+                '"public".async_operations',
+                adapter._worker_id,
+                {},
+                1,
+            )
+        )
+        adapter.claim_committed(tasks)
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(
+            connection.statements,
+            ["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"],
+        )
+        self.assertEqual(len(connection.timeouts), 3)
+        adapter._verify_initial_state.assert_awaited_once_with(connection)
+        self.assertEqual(completed, [True])
+
+    def test_expired_terminal_reconciliation_recovery_is_read_only(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            resume=True,
+            terminal_reconciliation=True,
+            terminal_status_evidence={
+                "generation": plan["pre_generation"],
+                "observed_at": planned_at,
+                "status_digest": "6" * 64,
+            },
+            clock=lambda: planned_at
+            + plan["execution_window"]["calculated_seconds"]
+            + 1,
+        )
+        adapter._verify_initial_state = AsyncMock()
+
+        statements = []
+
+        class Connection:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+            async def fetchval(self, *_arguments):
+                return None
+
+            async def fetch(self, *_arguments, **_keywords):
+                raise AssertionError("terminal reconciliation recovered rows")
+
+            async def execute(self, statement, *_arguments, **_keywords):
+                statements.append(statement)
+                if statement != "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE":
+                    raise AssertionError("terminal reconciliation mutated rows")
+                return "SET"
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        recovered = asyncio.run(adapter.recover_own_tasks(Backend()))
+
+        self.assertEqual(recovered, 0)
+        adapter._verify_initial_state.assert_awaited_once()
+        self.assertEqual(
+            statements,
+            ["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"],
+        )
+
+    def test_terminal_reconciliation_rejects_public_task_mutations(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._terminal_reconciliation = True
+        adapter._execution_deadline = 86_500
+        adapter._clock = lambda: 100
+
+        class Backend:
+            def acquire(self):
+                raise AssertionError("terminal reconciliation acquired PostgreSQL")
+
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        invocations = {
+            "retry": lambda: adapter.schedule_retry(
+                Backend(), operation_id, object(), "provider failure", "public"
+            ),
+            "defer": lambda: adapter.defer_operation(
+                Backend(), operation_id, object(), "capacity", "public"
+            ),
+            "complete": lambda: adapter.mark_completed(
+                Backend(), operation_id, "public"
+            ),
+            "fail": lambda: adapter.mark_failed(
+                Backend(), operation_id, "provider failure", "public"
+            ),
+        }
+        for name, invoke in invocations.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "terminal reconciliation cannot mutate",
+                ),
+            ):
+                asyncio.run(invoke())
+
+    def test_exact_drain_public_mutation_seams_configure_timeouts_before_reads(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class Configured(RuntimeError):
+            pass
+
+        statements = []
+
+        class Connection:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+            async def execute(self, statement, *_arguments, **_keywords):
+                statements.append(statement)
+                return "SET"
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        invocations = {
+            "recover": lambda adapter: adapter.recover_own_tasks(Backend()),
+            "release": lambda adapter: adapter.release_own_tasks(Backend()),
+            "retry": lambda adapter: adapter.schedule_retry(
+                Backend(), operation_id, object(), "failure", "public"
+            ),
+            "defer": lambda adapter: adapter.defer_operation(
+                Backend(), operation_id, object(), "capacity", "public"
+            ),
+            "complete": lambda adapter: adapter.mark_completed(
+                Backend(), operation_id, "public"
+            ),
+            "fail": lambda adapter: adapter.mark_failed(
+                Backend(), operation_id, "failure", "public"
+            ),
+        }
+        for name, invoke in invocations.items():
+            with self.subTest(name=name):
+                adapter = object.__new__(ExactDrainClaimAdapter)
+                adapter._resume = True
+                adapter._terminal_reconciliation = False
+                adapter._execution_deadline = None
+                adapter._selected = {
+                    operation_id: {
+                        "operation_type": "retain",
+                        "task_payload_digest": "a" * 64,
+                    }
+                }
+                adapter._configure_mutation_transaction = AsyncMock(
+                    side_effect=Configured
+                )
+                self._initialize_unreserved_control_lifecycle(adapter)
+
+                with self.assertRaises(Configured):
+                    asyncio.run(invoke(adapter))
+
+                adapter._configure_mutation_transaction.assert_awaited_once()
+
+        self.assertEqual(
+            statements,
+            [
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                for _name in invocations
+            ],
+        )
+
+    def test_exact_drain_release_uses_one_post_lease_cleanup_deadline(self):
+        now = [100]
+        configured = []
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._terminal_reconciliation = False
+        adapter._execution_deadline = 100
+        adapter._transaction_timeout_seconds = 120
+        adapter._cleanup_deadline = None
+        adapter._clock = lambda: now[0]
+        adapter._worker_id = "exact-worker"
+        adapter._selected = {}
+        adapter._started_ids = set()
+        adapter._initial_guard_complete = True
+        adapter._verify_unstarted_state = AsyncMock()
+        self._initialize_unreserved_control_lifecycle(adapter)
+
+        class Connection:
+            @asynccontextmanager
+            async def transaction(self, **_arguments):
+                yield
+
+            async def fetchval(self, query, value):
+                configured.append((query, value))
+
+            async def fetch(self, *_args, **_kwargs):
+                return []
+
+            async def execute(self, *_args, **_kwargs):
+                return "UPDATE 0"
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        self.assertEqual(asyncio.run(adapter.release_own_tasks(Backend())), 0)
+        now[0] = 150
+        self.assertEqual(asyncio.run(adapter.release_own_tasks(Backend())), 0)
+
+        self.assertEqual(configured[0][1], "120000ms")
+        self.assertEqual(configured[3][1], "70000ms")
+        self.assertEqual(adapter._cleanup_deadline, 220)
+
+    def test_exact_drain_interpreter_evidence_resolves_version_alias_parent(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            root = Path(directory).resolve(strict=True)
+            canonical = root / "cpython-3.13.14" / "bin"
+            canonical.mkdir(parents=True)
+            interpreter = canonical / "python3.13"
+            interpreter.write_bytes(b"trusted-interpreter")
+            interpreter.chmod(0o500)
+            alias = root / "cpython-3.13"
+            alias.symlink_to(canonical.parent, target_is_directory=True)
+
+            venv = root / "venv"
+            (venv / "bin").mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+            (venv / "bin" / "python").symlink_to(
+                alias / "bin" / "python3.13"
+            )
+            (venv / "bin" / "python3").symlink_to("python")
+            worker = venv / "bin" / "hindsight-worker"
+            worker.write_text(
+                f"#!{venv / 'bin' / 'python3'}\n",
+                encoding="utf-8",
+            )
+            worker.chmod(0o500)
+
+            evidence = _exact_drain_interpreter_evidence(
+                exact_drain_worker_interpreter_path(worker)
+            )
+
+        self.assertEqual(evidence["resolved_path"], str(interpreter))
+        self.assertEqual(
+            evidence["resolved_parent_alias_path"],
+            str(alias / "bin" / "python3.13"),
+        )
+        self.assertEqual(
+            evidence["resolved_sha256"],
+            hashlib.sha256(b"trusted-interpreter").hexdigest(),
+        )
+
+    def test_exact_drain_resume_allows_only_a_bound_expired_plan(self):
+        verified = {
+            "plan_digest": "a" * 64,
+            "selected_operations": [],
+            "live_snapshot": {"operations": []},
+            "worker_max_retries": 3,
+        }
+        with patch(
+            "hindsight_memory_control_plane.operation_recovery_runtime."
+            "verify_exact_drain_plan",
+            return_value=verified,
+        ) as verify:
+            ExactDrainClaimAdapter({}, resume=True)
+        verify.assert_called_once_with({}, allow_expired=True)
+
+    def test_exact_drain_resume_keeps_the_original_authorization_deadline(self):
+        verified = {
+            "schema_version": 2,
+            "plan_digest": "a" * 64,
+            "selected_operations": [],
+            "live_snapshot": {"operations": []},
+            "worker_max_retries": 3,
+            "execution_lease_seconds": 86_400,
+            "transaction_timeout_seconds": 120,
+        }
+        authorization = {"authorized_at": 100}
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_plan",
+                return_value=verified,
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_authorization_receipt",
+                return_value=authorization,
+            ),
+        ):
+            started = ExactDrainClaimAdapter(
+                {},
+                authorization=authorization,
+                clock=lambda: 200,
+            )
+            resumed = ExactDrainClaimAdapter(
+                {},
+                authorization=authorization,
+                clock=lambda: 300,
+                resume=True,
+            )
+
+        self.assertEqual(started._execution_deadline, 86_500)
+        self.assertEqual(resumed._execution_deadline, 86_500)
+
+    def test_exact_drain_initial_guard_rejects_the_wrong_database_identity(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp/expected-pg-data",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {}
+
+        class WrongDatabase:
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp/other-pg-data",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime.read_generation",
+                new=AsyncMock(return_value="systalyze:public:123"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime.read_safe_operation_rows",
+                new=AsyncMock(return_value=[]),
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "database identity differs",
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(WrongDatabase()))
+
+    def test_exact_drain_guards_disable_global_startup_and_parent_mutations(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            async def claim_tasks(self, *arguments, **keywords):
+                events.append(("claim", arguments, keywords))
+                return ["selected"]
+
+            async def recover_own_tasks(self, backend):
+                events.append(("exact-recovery", backend))
+                return 0
+
+            async def release_own_tasks(self, backend):
+                events.append(("exact-release", backend))
+                return 2
+
+            async def schedule_retry(
+                self, backend, operation_id, retry_at, error_message, schema
+            ):
+                events.append(
+                    (
+                        "exact-retry",
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+
+            async def defer_operation(
+                self, backend, operation_id, exec_date, reason, schema
+            ):
+                events.append(
+                    (
+                        "exact-defer",
+                        backend,
+                        operation_id,
+                        exec_date,
+                        reason,
+                        schema,
+                    )
+                )
+
+            async def mark_completed(self, backend, operation_id, schema):
+                events.append(
+                    ("exact-complete", backend, operation_id, schema)
+                )
+
+            async def mark_failed(
+                self, backend, operation_id, error_message, schema
+            ):
+                events.append(
+                    (
+                        "exact-fail",
+                        backend,
+                        operation_id,
+                        error_message,
+                        schema,
+                    )
+                )
+
+        class PostgreSQLOps:
+            async def claim_tasks(self, *arguments, **keywords):
+                raise AssertionError("upstream claim seam remained active")
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _connection,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(
+                self,
+                connection,
+                schema,
+                reserved,
+                shared,
+            ):
+                return await self._claim_batch_for_schema_inner(
+                    connection,
+                    schema, reserved, shared
+                )
+
+            async def _scan_active_schemas(self, _connection, schemas):
+                events.append(("upstream-scan", schemas))
+                return set(schemas)
+
+            async def recover_own_tasks(self):
+                events.append(("global-recovery",))
+                return 99
+
+            async def release_own_tasks(self):
+                events.append(("global-release",))
+                return 99
+
+            async def _maybe_update_parent_operation(self, *arguments):
+                events.append(("poller-parent", arguments))
+
+        class MemoryEngine:
+            async def _get_backend(self):
+                return "exact-backend"
+
+            async def _maybe_update_parent_operation(self, *arguments):
+                events.append(("engine-parent", arguments))
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            claimed = await PostgreSQLOps().claim_tasks(
+                "connection",
+                "public.async_operations",
+                "worker",
+                {},
+                1,
+            )
+            active = await WorkerPoller()._scan_active_schemas(
+                "connection",
+                ["tenant-a", None, "tenant-b"]
+            )
+            recovered = await WorkerPoller().recover_own_tasks()
+            released = await WorkerPoller().release_own_tasks()
+            retried = await WorkerPoller()._schedule_retry(
+                "operation", "retry-at", "safe-error", None
+            )
+            deferred = await WorkerPoller()._defer_operation(
+                "operation", "exec-date", "safe-reason", "public"
+            )
+            completed = await WorkerPoller()._mark_completed(
+                "operation", None
+            )
+            failed = await WorkerPoller()._mark_failed(
+                "operation", "safe-error", "public"
+            )
+            engine_completed = await MemoryEngine()._mark_operation_completed(
+                "operation"
+            )
+            engine_failed = await MemoryEngine()._mark_operation_failed(
+                "operation", "safe-error", "safe-traceback"
+            )
+            consolidation_completed = await MemoryEngine()._mark_operation_completed_and_fire_webhook(
+                "operation",
+                "engineering",
+                "completed",
+                {"observations_created": 1},
+                "public",
+            )
+            consolidation_failed = await MemoryEngine()._mark_operation_completed_and_fire_webhook(
+                "operation",
+                "engineering",
+                "failed",
+                None,
+                "public",
+                "consolidation failure",
+            )
+            poller_parent = await WorkerPoller()._maybe_update_parent_operation(
+                "child",
+                None,
+                "connection",
+            )
+            engine_parent = await MemoryEngine()._maybe_update_parent_operation(
+                "child",
+                "connection",
+            )
+            return (
+                claimed,
+                active,
+                recovered,
+                released,
+                retried,
+                deferred,
+                completed,
+                failed,
+                engine_completed,
+                engine_failed,
+                consolidation_completed,
+                consolidation_failed,
+                poller_parent,
+                engine_parent,
+            )
+
+        (
+            claimed,
+            active,
+            recovered,
+            released,
+            retried,
+            deferred,
+            completed,
+            failed,
+            engine_completed,
+            engine_failed,
+            consolidation_completed,
+            consolidation_failed,
+            poller_parent,
+            engine_parent,
+        ) = asyncio.run(exercise())
+        self.assertEqual(claimed, ["selected"])
+        self.assertEqual(active, {None})
+        self.assertEqual(recovered, 0)
+        self.assertEqual(released, 2)
+        self.assertIn(("exact-release", "exact-backend"), events)
+        self.assertNotIn(("global-release",), events)
+        self.assertIsNone(retried)
+        self.assertIsNone(deferred)
+        self.assertIsNone(completed)
+        self.assertIsNone(failed)
+        self.assertIsNone(engine_completed)
+        self.assertIsNone(engine_failed)
+        self.assertIsNone(consolidation_completed)
+        self.assertIsNone(consolidation_failed)
+        self.assertIn(
+            (
+                "exact-retry",
+                "exact-backend",
+                "operation",
+                "retry-at",
+                "safe-error",
+                None,
+            ),
+            events,
+        )
+        self.assertIn(
+            ("exact-complete", "exact-backend", "operation", None),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-fail",
+                "exact-backend",
+                "operation",
+                "safe-error",
+                "public",
+            ),
+            events,
+        )
+        self.assertIn(
+            ("exact-complete", "exact-backend", "operation", None),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-fail",
+                "exact-backend",
+                "operation",
+                "safe-error\n\nTraceback:\nsafe-traceback",
+                None,
+            ),
+            events,
+        )
+        self.assertIn(
+            ("exact-complete", "exact-backend", "operation", "public"),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-fail",
+                "exact-backend",
+                "operation",
+                "consolidation failure",
+                "public",
+            ),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-defer",
+                "exact-backend",
+                "operation",
+                "exec-date",
+                "safe-reason",
+                "public",
+            ),
+            events,
+        )
+        self.assertIsNone(poller_parent)
+        self.assertIsNone(engine_parent)
+        self.assertEqual(
+            [event[0] for event in events],
+            [
+                "claim",
+                "exact-recovery",
+                "exact-release",
+                "exact-retry",
+                "exact-defer",
+                "exact-complete",
+                "exact-fail",
+                "exact-complete",
+                "exact-fail",
+                "exact-complete",
+                "exact-fail",
+            ],
+        )
+
+    def test_live_identity_accepts_verified_unix_socket_connection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary).resolve()
+
+            class UnixConnection:
+                async def fetchrow(self, query):
+                    if (
+                        "current_setting('port')::integer AS port"
+                        not in query
+                        or "inet_server_port()" in query
+                    ):
+                        raise AssertionError(
+                            "live identity must read the configured server port"
+                        )
+                    return {
+                        "database": "hindsight",
+                        "database_user": "hindsight",
+                        "data_directory": str(data_dir),
+                        "port": 5432,
+                        "address": None,
+                        "system_identifier": "7659746962107358086",
+                    }
+
+            asyncio.run(
+                assert_connected_live_database(
+                    UnixConnection(),
+                    {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": str(data_dir),
+                        "port": 5432,
+                    },
+                    expected_system_identifier="7659746962107358086",
+                )
+            )
+
+    def test_live_identity_rejects_tcp_connection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary).resolve()
+
+            class TcpConnection:
+                async def fetchrow(self, query):
+                    return {
+                        "database": "hindsight",
+                        "database_user": "hindsight",
+                        "data_directory": str(data_dir),
+                        "port": 5432,
+                        "address": "127.0.0.1",
+                        "system_identifier": "7659746962107358086",
+                    }
+
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "does not match the pinned live pg0 identity",
+            ):
+                asyncio.run(
+                    assert_connected_live_database(
+                        TcpConnection(),
+                        {
+                            "database": "hindsight",
+                            "user": "hindsight",
+                            "data_dir": str(data_dir),
+                            "port": 5432,
+                        },
+                        expected_system_identifier="7659746962107358086",
+                    )
+                )
+
+    def test_snapshot_is_repeatable_read_readonly_and_payload_free(self):
+        connection = FakeConnection()
+        before, after, rows = asyncio.run(
+            read_snapshot(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                operation_ids=[
+                    "00000000-0000-4000-8000-000000000001"
+                ],
+            )
+        )
+
+        self.assertEqual(before, "systalyze:public:123")
+        self.assertEqual(after, before)
+        self.assertEqual(
+            connection.transaction_arguments,
+            {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(connection.generation_reads, 2)
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("task_payload", rows[0])
+        self.assertNotIn("error_message", rows[0])
+        query, arguments = connection.fetch_calls[0]
+        self.assertEqual(arguments[0], "engineering")
+        self.assertIn("sha256(convert_to(task_payload::text", query)
+        self.assertIn("sha256(convert_to(error_message", query)
+
+    def test_safe_query_never_projects_raw_payload_or_error(self):
+        select_list = SAFE_OPERATION_QUERY.split("FROM {schema}.async_operations")[0]
+        self.assertNotIn("task_payload AS", select_list)
+        self.assertNotIn("error_message AS", select_list)
+        self.assertNotIn("worker_id AS", select_list)
+        self.assertIn("task_payload_digest", select_list)
+        self.assertIn("worker_id_digest", select_list)
+        self.assertIn("error_digest", select_list)
+
+    def test_failure_classifier_returns_only_closed_payload_free_causes(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class Connection:
+            def __init__(self):
+                self.fetch_calls = []
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return [
+                    {
+                        "cause_family": "unknown",
+                        "error_digest": "b" * 64,
+                        "occurrence_count": 1,
+                    },
+                    {
+                        "cause_family": "upstream_timeout",
+                        "error_digest": "a" * 64,
+                        "occurrence_count": 2,
+                    },
+                ]
+
+        connection = Connection()
+        evidence = asyncio.run(
+            read_failure_classifications(
+                connection,
+                schema="public",
+                operation_ids=[operation_id],
+            )
+        )
+
+        self.assertEqual(
+            evidence,
+            [
+                {
+                    "cause_family": "unknown",
+                    "error_digest": "b" * 64,
+                    "occurrence_count": 1,
+                },
+                {
+                    "cause_family": "upstream_timeout",
+                    "error_digest": "a" * 64,
+                    "occurrence_count": 2,
+                },
+            ],
+        )
+        query, arguments = connection.fetch_calls[0]
+        self.assertEqual(arguments[0], "engineering")
+        self.assertEqual(str(arguments[1][0]), operation_id)
+        select_list = query.split("FROM \"public\".async_operations")[0]
+        self.assertNotIn("error_message AS", select_list)
+        self.assertIn("cause_family", select_list)
+        self.assertIn("error_digest", select_list)
+        self.assertIn("occurrence_count", query)
+        self.assertIn("database_statement_timeout", query)
+        self.assertIn("provider_execution_timeout", query)
+        self.assertIn("upstream_timeout", query)
+
+    def test_failure_classifier_precedence_matches_progress_classifier(self):
+        cases = (
+            (
+                "400 unauthorized request timeout",
+                "provider_authentication",
+            ),
+            (
+                "client error 400: quota exhausted",
+                "provider_capacity",
+            ),
+            (
+                "status 400: request timeout",
+                "provider_bad_request",
+            ),
+            (
+                "DatabaseError: statement timeout; status 400",
+                "database_statement_timeout",
+            ),
+            (
+                "TimeoutError: connection unavailable",
+                "upstream_timeout",
+            ),
+            (
+                "ConnectionError: provider unavailable",
+                "provider_transport",
+            ),
+            (
+                "OperationRecoveryError: provider_queue_timeout\n\n"
+                "Traceback: request timeout after 401 response",
+                "provider_queue_timeout",
+            ),
+            (
+                "wrapped provider_execution_timeout failure",
+                "provider_execution_timeout",
+            ),
+            (
+                "OperationRecoveryError: operation-recovery exact drain "
+                "operation attempt exceeded its deadline\n\nTraceback: timeout",
+                "operation_attempt_timeout",
+            ),
+            (
+                "OperationRecoveryError: exact drain retain phase one "
+                "exceeded its deadline\n\nTraceback: timeout",
+                "phase_one_timeout",
+            ),
+            ("server error '400'", "provider_bad_request"),
+            ("status_code='400'", "provider_bad_request"),
+            ("status-400", "provider_bad_request"),
+            ("status.400", "provider_bad_request"),
+            ("status_400", "provider_bad_request"),
+            ("error-400", "provider_bad_request"),
+            ("error_400", "provider_bad_request"),
+            ("error 4000 rows timed out", "upstream_timeout"),
+            ("ReadTimeoutError", "upstream_timeout"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                evidence = (
+                    operation_recovery_runtime._exact_drain_failure_evidence(
+                        message,
+                        retryable=True,
+                        progress_schema_version=5,
+                    )
+                )
+                self.assertEqual(evidence["category"], expected)
+
+        ordered_sql_outcomes = tuple(
+            f"THEN '{category}'"
+            for category in (
+                "operation_attempt_deadline",
+                "phase_one_deadline",
+                "database_statement_timeout",
+                "provider_queue_timeout",
+                "provider_execution_timeout",
+                "provider_authentication",
+                "provider_capacity",
+                "provider_bad_request",
+                "upstream_timeout",
+                "provider_transport",
+            )
+        )
+        self.assertEqual(
+            [FAILURE_CLASSIFICATION_QUERY.index(item) for item in ordered_sql_outcomes],
+            sorted(
+                FAILURE_CLASSIFICATION_QUERY.index(item)
+                for item in ordered_sql_outcomes
+            ),
+        )
+
+    def test_legacy_failure_classifier_remains_frozen(self):
+        cases = (
+            ("bad request", "operation_error"),
+            ("client error", "operation_error"),
+            ("client error 400: quota exhausted", "provider_bad_request"),
+            ("Client error '400 Unauthorized'", "provider_bad_request"),
+            ("unauthorized statement timeout", "provider_authentication"),
+            ("request timed out", "operation_error"),
+            ("TimeoutError", "operation_error"),
+            ("statement timeout", "operation_error"),
+            ("status 400", "provider_bad_request"),
+        )
+        for progress_schema_version in (1, 2, 3, 4):
+            for message, expected in cases:
+                with self.subTest(
+                    progress_schema_version=progress_schema_version,
+                    message=message,
+                ):
+                    evidence = (
+                        operation_recovery_runtime._exact_drain_failure_evidence(
+                            message,
+                            retryable=True,
+                            progress_schema_version=progress_schema_version,
+                        )
+                    )
+                    self.assertEqual(evidence["category"], expected)
+
+    def test_failure_classifier_rejects_open_or_malformed_output(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class Connection:
+            async def fetch(self, *_arguments):
+                return [
+                    {
+                        "cause_family": "raw_exception_text",
+                        "error_digest": "a" * 64,
+                        "occurrence_count": 1,
+                    }
+                ]
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "failure classification is invalid",
+        ):
+            asyncio.run(
+                read_failure_classifications(
+                    Connection(),
+                    schema="public",
+                    operation_ids=[operation_id],
+                )
+            )
+
+        self.assertNotIn("error_message AS", FAILURE_CLASSIFICATION_QUERY)
+
+    def test_global_queue_blockers_share_the_apply_guard_and_are_payload_free(self):
+        class BlockerConnection(FakeConnection):
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return [
+                    {
+                        "operation_id": (
+                            "00000000-0000-4000-8000-000000000099"
+                        ),
+                        "bank_id": "another-bank",
+                        "operation_type": "another-operation",
+                        "status": "pending",
+                        "created_at": "2026-07-29T12:00:00.000000Z",
+                        "updated_at": "2026-07-29T13:00:00.000000Z",
+                        "completed_at": None,
+                        "retry_count": 1,
+                        "next_retry_at": None,
+                        "worker_id_present": True,
+                        "worker_id_digest": "6" * 64,
+                        "claimed_at": "2026-07-29T12:30:00.000000Z",
+                        "task_payload_present": True,
+                        "task_payload_digest": "7" * 64,
+                        "in_reference_cohort": False,
+                        "in_reference_selected_set": False,
+                        "blocker_reason": "claimed_pending",
+                    }
+                ]
+
+        connection = BlockerConnection()
+        before, after, rows = asyncio.run(
+            read_global_queue_blockers(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                reference_cohort_operation_ids=[
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                ],
+                reference_selected_operation_ids=[
+                    "00000000-0000-4000-8000-000000000002"
+                ],
+            )
+        )
+
+        self.assertEqual((before, after), (
+            "systalyze:public:123",
+            "systalyze:public:123",
+        ))
+        self.assertEqual(
+            connection.transaction_arguments,
+            {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(rows[0]["bank_id"], "another-bank")
+        self.assertEqual(rows[0]["operation_type"], "another-operation")
+        query, arguments = connection.fetch_calls[0]
+        self.assertEqual(
+            [[str(value) for value in group] for group in arguments],
+            [
+                ["00000000-0000-4000-8000-000000000002"],
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                ],
+            ],
+        )
+        self.assertEqual(connection.generation_reads, 2)
+        self.assertIn(QUEUE_BLOCKER_PREDICATE, query)
+        self.assertIn(QUEUE_BLOCKER_PREDICATE, GLOBAL_QUEUE_BLOCKER_QUERY)
+        self.assertEqual(QUEUE_BLOCKER_GUARD_CONTRACT_VERSION, 1)
+        self.assertEqual(len(QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST), 64)
+        select_list = GLOBAL_QUEUE_BLOCKER_QUERY.split(
+            "FROM {schema}.async_operations"
+        )[0]
+        self.assertNotIn("task_payload AS", select_list)
+        self.assertNotIn("error_message", select_list)
+        self.assertNotIn("worker_id AS", select_list)
+        self.assertIn("task_payload_digest", select_list)
+        self.assertIn("worker_id_digest", select_list)
+
+    def test_global_queue_blocker_generation_reads_bracket_the_snapshot(self):
+        class BracketConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.in_transaction = False
+                self.events = []
+
+            @asynccontextmanager
+            async def transaction(self, **arguments):
+                self.transaction_arguments = arguments
+                self.in_transaction = True
+                self.events.append("transaction_enter")
+                try:
+                    yield
+                finally:
+                    self.events.append("transaction_exit")
+                    self.in_transaction = False
+
+            async def fetchrow(self, query, *arguments):
+                self.assert_generation_outside_transaction()
+                self.events.append("generation")
+                return await super().fetchrow(query, *arguments)
+
+            async def fetch(self, query, *arguments):
+                if not self.in_transaction:
+                    raise AssertionError("blocker query must use a snapshot")
+                self.events.append("blockers")
+                return await super().fetch(query, *arguments)
+
+            def assert_generation_outside_transaction(self):
+                if self.in_transaction:
+                    raise AssertionError(
+                        "generation reads must bracket the snapshot"
+                    )
+
+        connection = BracketConnection()
+        asyncio.run(
+            read_global_queue_blockers(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                reference_cohort_operation_ids=[
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                ],
+                reference_selected_operation_ids=[
+                    "00000000-0000-4000-8000-000000000002"
+                ],
+            )
+        )
+
+        self.assertEqual(
+            connection.events,
+            [
+                "generation",
+                "transaction_enter",
+                "blockers",
+                "transaction_exit",
+                "generation",
+            ],
+        )
+
+    def test_global_queue_blocker_rejects_invalid_reference_sets(self):
+        invalid_sets = (
+            (
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000001",
+                ],
+                ["00000000-0000-4000-8000-000000000001"],
+                "contains duplicates",
+            ),
+            (
+                ["00000000-0000-4000-8000-000000000001"],
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000001",
+                ],
+                "contains duplicates",
+            ),
+            (
+                ["00000000-0000-4000-8000-000000000001"],
+                [],
+                "is empty",
+            ),
+            (
+                ["00000000-0000-4000-8000-000000000001"],
+                ["00000000-0000-4000-8000-000000000002"],
+                "not a cohort subset",
+            ),
+        )
+        for cohort_ids, selected_ids, message in invalid_sets:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                OperationRecoveryError,
+                message,
+            ):
+                asyncio.run(
+                    read_global_queue_blockers(
+                        FakeConnection(),
+                        profile_id="systalyze",
+                        schema="public",
+                        reference_cohort_operation_ids=cohort_ids,
+                        reference_selected_operation_ids=selected_ids,
+                    )
+                )
+
+    def test_claim_release_evidence_is_generation_bound_and_payload_free(self):
+        operation_id = "00000000-0000-4000-8000-000000000099"
+
+        class ClaimEvidenceConnection(FakeConnection):
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return [
+                    {
+                        "operation_id": operation_id,
+                        "bank_id": "codex",
+                        "operation_type": "retain",
+                        "status": "failed",
+                        "created_at": "2026-07-29T12:00:00.000000Z",
+                        "updated_at": "2026-07-29T13:00:00.000000Z",
+                        "completed_at": "2026-07-29T13:00:00.000000Z",
+                        "retry_count": 2,
+                        "next_retry_at": None,
+                        "worker_id_present": True,
+                        "worker_id_digest": "6" * 64,
+                        "claimed_at": "2026-07-29T12:30:00.000000Z",
+                        "task_payload_present": True,
+                        "task_payload_digest": "7" * 64,
+                        "in_reference_cohort": False,
+                        "in_reference_selected_set": False,
+                        "blocker_reason": "claimed_failed",
+                        "nonclaim_state_digest": "8" * 64,
+                    }
+                ]
+
+        connection = ClaimEvidenceConnection()
+        cohort_only_id = "00000000-0000-4000-8000-000000000002"
+        before, after, rows = asyncio.run(
+            read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=[operation_id],
+                reference_cohort_operation_ids=[operation_id, cohort_only_id],
+                reference_selected_operation_ids=[operation_id],
+                expected_generation="systalyze:public:123",
+            )
+        )
+
+        self.assertEqual((before, after), (
+            "systalyze:public:123",
+            "systalyze:public:123",
+        ))
+        self.assertEqual(
+            connection.transaction_arguments,
+            {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(rows[0]["nonclaim_state_digest"], "8" * 64)
+        self.assertEqual(connection.generation_reads, 2)
+        _query, arguments = connection.fetch_calls[0]
+        self.assertEqual([str(value) for value in arguments[0]], [operation_id])
+        self.assertEqual(
+            [str(value) for value in arguments[1]],
+            [operation_id, cohort_only_id],
+        )
+        self.assertEqual([str(value) for value in arguments[2]], [operation_id])
+        select_list = CLAIM_RELEASE_EVIDENCE_QUERY.split(
+            "FROM {schema}.async_operations"
+        )[0]
+        self.assertNotIn("task_payload AS", select_list)
+        self.assertNotIn("error_message AS", select_list)
+        self.assertNotIn("worker_id AS", select_list)
+        self.assertIn("nonclaim_state_digest", select_list)
+
+    def test_claim_release_evidence_rejects_generation_or_row_set_drift(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class GenerationDriftConnection(FakeConnection):
+            async def fetchrow(self, query, *arguments):
+                self.generation_reads += 1
+                return {
+                    "generation": 122 + self.generation_reads,
+                    "missing_trigger_count": 0,
+                    "reserved_guard_count": 0,
+                }
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "generation changed during claim-release planning",
+        ):
+            asyncio.run(
+                read_claim_release_evidence(
+                    GenerationDriftConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=[operation_id],
+                    reference_cohort_operation_ids=[],
+                    reference_selected_operation_ids=[],
+                    expected_generation="systalyze:public:123",
+                )
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "claim-release row set changed",
+        ):
+            asyncio.run(
+                read_claim_release_evidence(
+                    FakeConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=[
+                        "00000000-0000-4000-8000-000000000002"
+                    ],
+                    reference_cohort_operation_ids=[],
+                    reference_selected_operation_ids=[],
+                    expected_generation="systalyze:public:123",
+                )
+            )
+
+        invalid_selected_sets = (
+            ([operation_id], [operation_id, operation_id]),
+            ([], [operation_id]),
+            (
+                [operation_id, "00000000-0000-4000-8000-000000000098"],
+                ["00000000-0000-4000-8000-000000000098"],
+            ),
+        )
+        for cohort_ids, selected_ids in invalid_selected_sets:
+            with self.subTest(
+                cohort_ids=cohort_ids,
+                selected_ids=selected_ids,
+            ), self.assertRaisesRegex(
+                OperationRecoveryError,
+                "operation ID set is invalid",
+            ):
+                asyncio.run(
+                    read_claim_release_evidence(
+                        FakeConnection(),
+                        profile_id="systalyze",
+                        schema="public",
+                        operation_ids=[operation_id],
+                        reference_cohort_operation_ids=cohort_ids,
+                        reference_selected_operation_ids=selected_ids,
+                        expected_generation="systalyze:public:123",
+                    )
+                )
+
+    def test_apply_allows_bound_claim_on_selected_terminal_row(self):
+        before = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 2,
+            "next_retry_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": hashlib.sha256(
+                b"orphaned-worker"
+            ).hexdigest(),
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": "c" * 64,
+        }
+        after = {
+            **before,
+            "status": "pending",
+            "updated_at": "2026-07-30T16:00:00.000000Z",
+            "completed_at": None,
+            "retry_count": 0,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "error_category": "none",
+            "error_digest": None,
+        }
+
+        class ApplyConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.fetchval_results = [123, 0, 124]
+                self.fetch_results = [[before], [after]]
+                self.execute_call = None
+                self.deadline_settings = []
+
+            async def fetchval(self, query, *arguments):
+                if "set_config" in query:
+                    self.deadline_settings.append((query, arguments))
+                    return arguments[-1]
+                if "SELECT EXISTS" in query:
+                    self.assert_selected_ids = arguments
+                    return False
+                return self.fetchval_results.pop(0)
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return self.fetch_results.pop(0)
+
+            async def execute(self, query, *arguments):
+                self.execute_call = (query, arguments)
+                return "UPDATE 1"
+
+        selected = {
+            "operation_id": before["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": live_row_digest(before),
+            "task_payload_digest": before["task_payload_digest"],
+        }
+        connection = ApplyConnection()
+        generation_before, generation_after = asyncio.run(
+            apply_requeue_transaction(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                plan={
+                    "pre_generation": "systalyze:public:123",
+                    "selected_operations": [selected],
+                    "expires_at": int(time.time()) + 60,
+                },
+            )
+        )
+
+        self.assertEqual(generation_before, "systalyze:public:123")
+        self.assertEqual(generation_after, "systalyze:public:124")
+        self.assertEqual(
+            [str(value) for value in connection.assert_selected_ids[0]],
+            [before["operation_id"]],
+        )
+        update, arguments = connection.execute_call
+        self.assertIn("SET status = 'pending'", update)
+        self.assertIn("retry_count = 0", update)
+        self.assertNotIn("task_payload =", update)
+        self.assertNotIn("result_metadata =", update)
+        self.assertEqual(arguments[1], "engineering")
+        self.assertEqual(
+            sum(
+                "transaction_timeout" in query
+                for query, _arguments in connection.deadline_settings
+            ),
+            1,
+        )
+
+    def test_apply_rejects_expired_plan_before_database_reads(self):
+        connection = FakeConnection()
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "requeue plan expired",
+        ):
+            asyncio.run(
+                apply_requeue_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan={
+                        "pre_generation": "systalyze:public:123",
+                        "selected_operations": [],
+                        "expires_at": int(time.time()) - 1,
+                    },
+                )
+            )
+        self.assertEqual(connection.generation_reads, 0)
+
+    def test_apply_rechecks_expiry_after_selected_rows_are_locked(self):
+        before = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 2,
+            "next_retry_at": None,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": "c" * 64,
+        }
+
+        class DelayedConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.fetchval_results = [123, 0, False]
+                self.execute_calls = []
+
+            async def fetchval(self, query, *arguments):
+                if "set_config" in query:
+                    return arguments[-1]
+                return self.fetchval_results.pop(0)
+
+            async def fetch(self, query, *arguments):
+                return [before]
+
+            async def execute(self, query, *arguments):
+                self.execute_calls.append((query, arguments))
+                return "UPDATE 1"
+
+        selected = {
+            "operation_id": before["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": live_row_digest(before),
+            "task_payload_digest": before["task_payload_digest"],
+        }
+        connection = DelayedConnection()
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime.time.time",
+                side_effect=[100.0, 100.0, 101.0],
+            ),
+            self.assertRaisesRegex(OperationRecoveryError, "expired"),
+        ):
+            asyncio.run(
+                apply_requeue_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan={
+                        "pre_generation": "systalyze:public:123",
+                        "selected_operations": [selected],
+                        "expires_at": 101,
+                    },
+                )
+            )
+        self.assertEqual(connection.execute_calls, [])
+
+    def test_apply_rolls_back_when_plan_expires_before_commit(self):
+        before = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 2,
+            "next_retry_at": "2026-07-29T13:05:00.000000Z",
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": "c" * 64,
+        }
+        after = {
+            **before,
+            "status": "pending",
+            "updated_at": "2026-07-30T16:00:00.000000Z",
+            "completed_at": None,
+            "retry_count": 0,
+            "next_retry_at": None,
+            "error_category": "none",
+            "error_digest": None,
+        }
+
+        class ExpiringConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.fetchval_results = [123, 0, False, 124]
+                self.fetch_results = [[before], [after]]
+                self.committed = False
+                self.rolled_back = False
+                self.deadline_settings = []
+
+            @asynccontextmanager
+            async def transaction(self, **arguments):
+                self.transaction_arguments = arguments
+                try:
+                    yield
+                except Exception:
+                    self.rolled_back = True
+                    raise
+                else:
+                    self.committed = True
+
+            async def fetchval(self, query, *arguments):
+                if "set_config" in query:
+                    self.deadline_settings.append((query, arguments))
+                    return arguments[-1]
+                return self.fetchval_results.pop(0)
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return self.fetch_results.pop(0)
+
+            async def execute(self, query, *arguments):
+                return "UPDATE 1"
+
+        selected = {
+            "operation_id": before["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": live_row_digest(before),
+            "task_payload_digest": before["task_payload_digest"],
+        }
+        connection = ExpiringConnection()
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime.time.time",
+                side_effect=[100.0, 100.0, 100.0, 100.0, 101.0],
+            ),
+            self.assertRaisesRegex(OperationRecoveryError, "expired"),
+        ):
+            asyncio.run(
+                apply_requeue_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan={
+                        "pre_generation": "systalyze:public:123",
+                        "selected_operations": [selected],
+                        "expires_at": 101,
+                    },
+                )
+            )
+        self.assertFalse(connection.committed)
+        self.assertTrue(connection.rolled_back)
+
+    def test_apply_rejects_every_incomplete_retry_postcondition(self):
+        before = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 2,
+            "next_retry_at": "2026-07-29T13:05:00.000000Z",
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": "c" * 64,
+        }
+        valid_after = {
+            **before,
+            "status": "pending",
+            "updated_at": "2026-07-30T16:00:00.000000Z",
+            "completed_at": None,
+            "retry_count": 0,
+            "next_retry_at": None,
+            "error_category": "none",
+            "error_digest": None,
+        }
+
+        class PostconditionConnection(FakeConnection):
+            def __init__(self, after):
+                super().__init__()
+                self.fetchval_results = [123, 0, False, 124]
+                self.fetch_results = [[before], [after]]
+
+            async def fetchval(self, query, *arguments):
+                if "set_config" in query:
+                    return arguments[-1]
+                return self.fetchval_results.pop(0)
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return self.fetch_results.pop(0)
+
+            async def execute(self, query, *arguments):
+                return "UPDATE 1"
+
+        selected = {
+            "operation_id": before["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": live_row_digest(before),
+            "task_payload_digest": before["task_payload_digest"],
+        }
+        violations = {
+            "completed_at": {"completed_at": "2026-07-29T13:00:00.000000Z"},
+            "next_retry_at": {"next_retry_at": "2026-07-29T13:05:00.000000Z"},
+            "error_message": {
+                "error_category": "provider_capacity",
+                "error_digest": "c" * 64,
+            },
+            "updated_at": {
+                "updated_at": before["updated_at"],
+            },
+        }
+        for label, changed_fields in violations.items():
+            with self.subTest(postcondition=label):
+                connection = PostconditionConnection({**valid_after, **changed_fields})
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "post-state differs",
+                ):
+                    asyncio.run(
+                        apply_requeue_transaction(
+                            connection,
+                            profile_id="systalyze",
+                            schema="public",
+                            bank_id="engineering",
+                            plan={
+                                "pre_generation": "systalyze:public:123",
+                                "selected_operations": [selected],
+                                "expires_at": int(time.time()) + 60,
+                            },
+                        )
+                    )
+
+    def test_post_abort_retry_postcondition_reads_the_selected_row(self):
+        before = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 3,
+            "next_retry_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": "d" * 64,
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": "c" * 64,
+        }
+        after = {
+            **before,
+            "status": "pending",
+            "updated_at": "2026-07-30T16:00:00.000000Z",
+            "completed_at": None,
+            "retry_count": 0,
+            "next_retry_at": None,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "error_category": "none",
+            "error_digest": None,
+        }
+        preserved = {
+            **before,
+            "operation_id": "00000000-0000-4000-8000-000000000002",
+            "status": "pending",
+            "updated_at": "2026-07-29T13:30:00.000000Z",
+            "completed_at": None,
+            "retry_count": 1,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+        }
+
+        class PostAbortConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.fetchval_results = [123, 0, False, 124]
+                self.fetch_results = [
+                    [before, preserved],
+                    [after, preserved],
+                ]
+
+            async def fetchval(self, query, *arguments):
+                if "set_config" in query:
+                    return arguments[-1]
+                return self.fetchval_results.pop(0)
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return self.fetch_results.pop(0)
+
+            async def execute(self, query, *arguments):
+                return "UPDATE 1"
+
+        selected = {
+            "operation_id": before["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": live_row_digest(before),
+            "task_payload_digest": before["task_payload_digest"],
+        }
+        plan = {
+            "pre_generation": "systalyze:public:123",
+            "selected_operations": [selected],
+            "live_snapshot": {
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "row_digest": live_row_digest(before),
+                    },
+                    {
+                        "operation_id": preserved["operation_id"],
+                        "row_digest": live_row_digest(preserved),
+                    },
+                ]
+            },
+            "retry_recovery": {
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "retry_count_before": 3,
+                        "retry_count_after": 0,
+                        "reset_applied": True,
+                    }
+                ]
+            },
+            "reference_worker_id_digest": before["worker_id_digest"],
+            "transaction_timeout_seconds": 120,
+            "expires_at": int(time.time()) + 60,
+        }
+        for schema_version in (10, 11, 13):
+            with (
+                self.subTest(schema_version=schema_version),
+                patch.object(
+                    operation_recovery_runtime,
+                    "verify_post_abort_recovery_plan",
+                    side_effect=lambda value: value,
+                ),
+            ):
+                generations = asyncio.run(
+                    apply_post_abort_recovery_transaction(
+                        PostAbortConnection(),
+                        profile_id="systalyze",
+                        schema="public",
+                        bank_id="engineering",
+                        plan={**plan, "schema_version": schema_version},
+                    )
+                )
+                self.assertEqual(
+                    generations,
+                    ("systalyze:public:123", "systalyze:public:124"),
+                )
+
+        mixed_plan = {
+            **plan,
+            "schema_version": 11,
+            "reference_plan": {"schema_version": 15},
+            "live_snapshot": {
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "current_status": before["status"],
+                        "retry_count": before["retry_count"],
+                        "row_digest": live_row_digest(before),
+                    },
+                    {
+                        "operation_id": preserved["operation_id"],
+                        "current_status": preserved["status"],
+                        "retry_count": preserved["retry_count"],
+                        "row_digest": live_row_digest(preserved),
+                    },
+                ]
+            },
+            "retry_recovery": {
+                "schema_version": 2,
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "expected_status": "failed",
+                        "retry_count_before": 3,
+                        "retry_count_after": 0,
+                        "reset_applied": True,
+                    },
+                    {
+                        "operation_id": preserved["operation_id"],
+                        "expected_status": "pending",
+                        "retry_count_before": 1,
+                        "retry_count_after": 1,
+                        "reset_applied": False,
+                    },
+                ],
+            },
+        }
+        with patch.object(
+            operation_recovery_runtime,
+            "verify_post_abort_recovery_plan",
+            side_effect=lambda value: value,
+        ):
+            generations = asyncio.run(
+                apply_post_abort_recovery_transaction(
+                    PostAbortConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=mixed_plan,
+                )
+            )
+        self.assertEqual(
+            generations,
+            ("systalyze:public:123", "systalyze:public:124"),
+        )
+
+    def test_rollback_reconciles_claimed_selected_preimage(self):
+        restored = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 2,
+            "next_retry_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": hashlib.sha256(
+                b"orphaned-worker"
+            ).hexdigest(),
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": hashlib.sha256(
+                b"provider capacity exhausted"
+            ).hexdigest(),
+        }
+        selected = {
+            "operation_id": restored["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": "c" * 64,
+            "task_payload_digest": restored["task_payload_digest"],
+        }
+        preimage = {
+            "operation_id": restored["operation_id"],
+            "status": "failed",
+            "error_message": "provider capacity exhausted",
+            "completed_at": restored["completed_at"],
+            "next_retry_at": None,
+            "worker_id": "orphaned-worker",
+            "claimed_at": restored["claimed_at"],
+            "retry_count": 2,
+            "updated_at": restored["updated_at"],
+            "task_payload_digest": restored["task_payload_digest"],
+        }
+
+        class ReconcileConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.execute_calls = []
+
+            async def fetchval(self, query, *arguments):
+                return 125
+
+            async def fetch(self, query, *arguments):
+                return [restored]
+
+            async def execute(self, query, *arguments):
+                self.execute_calls.append((query, arguments))
+                return "UPDATE 1"
+
+        connection = ReconcileConnection()
+        before, after = asyncio.run(
+            rollback_requeue_transaction(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                plan={"selected_operations": [selected]},
+                application={
+                    "post_generation": "systalyze:public:124"
+                },
+                rollback_record={
+                    "pre_generation": "systalyze:public:124",
+                    "post_generation": "systalyze:public:125",
+                },
+                preimage=[preimage],
+            )
+        )
+
+        self.assertEqual(before, "systalyze:public:124")
+        self.assertEqual(after, "systalyze:public:125")
+        self.assertEqual(connection.execute_calls, [])
+
+        restored["worker_id_digest"] = hashlib.sha256(
+            b"different-worker"
+        ).hexdigest()
+        drifted = ReconcileConnection()
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "rollback post-state differs",
+        ):
+            asyncio.run(
+                rollback_requeue_transaction(
+                    drifted,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan={"selected_operations": [selected]},
+                    application={
+                        "post_generation": "systalyze:public:124"
+                    },
+                    rollback_record={
+                        "pre_generation": "systalyze:public:124",
+                        "post_generation": "systalyze:public:125",
+                    },
+                    preimage=[preimage],
+                )
+            )
+        self.assertEqual(drifted.execute_calls, [])
+
+    def test_connect_authenticates_only_over_exact_unix_peer_pid(self):
+        class Connected:
+            async def close(self):
+                return None
+
+        class FakeAsyncpg:
+            async def connect(self, **arguments):
+                loop = asyncio.get_running_loop()
+                transport, _protocol = await loop.create_unix_connection(
+                    asyncio.Protocol,
+                    str(
+                        Path(arguments["host"])
+                        / f".s.PGSQL.{arguments['port']}"
+                    ),
+                )
+                transport.close()
+                await asyncio.sleep(0)
+                return Connected()
+
+        async def exercise(expected_pid):
+            with tempfile.TemporaryDirectory(
+                dir="/private/tmp",
+                prefix="hindsight-peer-test-",
+            ) as directory:
+                socket_path = str(Path(directory) / ".s.PGSQL.55439")
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(socket_path)
+                listener.listen(1)
+
+                def close_client():
+                    client, _address = listener.accept()
+                    try:
+                        while client.recv(4096):
+                            pass
+                    finally:
+                        client.close()
+
+                thread = threading.Thread(target=close_client)
+                thread.start()
+                try:
+                    return await connect_verified_local_postgres(
+                        FakeAsyncpg(),
+                        {
+                            "pid": expected_pid,
+                            "socket_dir": directory,
+                            "socket_path": socket_path,
+                            "port": 55439,
+                            "user": "hindsight",
+                            "database": "hindsight",
+                        },
+                        password="test-only",
+                        readonly=True,
+                    )
+                finally:
+                    await asyncio.sleep(0)
+                    listener.close()
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
+
+        connection = asyncio.run(exercise(os.getpid()))
+        asyncio.run(connection.close())
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "peer PID differs",
+        ):
+            asyncio.run(exercise(os.getpid() + 1))
+
+    def test_postgres_peer_accepts_stable_postmaster_child(self):
+        def info(*, ppid=41, started_at=101, usec=7, name=b"postgres"):
+            value = operation_recovery_runtime._DarwinProcBsdInfo()
+            value.pbi_pid = 42
+            value.pbi_ppid = ppid
+            value.pbi_uid = 501
+            value.pbi_start_tvsec = started_at
+            value.pbi_start_tvusec = usec
+            value.pbi_comm = name
+            return value
+
+        binding = {"pid": 41, "started_at": 100}
+        with (
+            patch.object(
+                operation_recovery_runtime,
+                "_darwin_process_bsd_info",
+                side_effect=(info(), info()),
+            ),
+            patch.object(operation_recovery_runtime.os, "geteuid", return_value=501),
+        ):
+            self.assertTrue(postgres_peer_pid_matches(42, binding))
+
+        with (
+            patch.object(
+                operation_recovery_runtime,
+                "_darwin_process_bsd_info",
+                side_effect=(info(), info(usec=8)),
+            ),
+            patch.object(operation_recovery_runtime.os, "geteuid", return_value=501),
+        ):
+            self.assertFalse(postgres_peer_pid_matches(42, binding))
+
+
+if __name__ == "__main__":
+    unittest.main()

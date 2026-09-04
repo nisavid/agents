@@ -1376,6 +1376,7 @@ def _sanitized_controller_environment(
 def start_bridge_process(
     *,
     executable: str,
+    python_executable: str | None = None,
     state_dir: str | Path,
     bridge_socket: str | Path,
     broker_socket: str | Path,
@@ -1390,6 +1391,18 @@ def start_bridge_process(
 
     if re.fullmatch(r"[0-9a-f]{64}", handle or "") is None:
         raise BridgeError("HANDLE_INVALID")
+    validated_python_executable: str | None = None
+    if python_executable is not None:
+        if not isinstance(python_executable, str):
+            raise BridgeError("PYTHON_EXECUTABLE_INVALID")
+        python_path = Path(python_executable)
+        if (
+            not python_path.is_absolute()
+            or not python_path.is_file()
+            or not os.access(python_path, os.X_OK)
+        ):
+            raise BridgeError("PYTHON_EXECUTABLE_INVALID")
+        validated_python_executable = python_executable
     read_descriptor, write_descriptor = os.pipe()
     try:
         arguments = bridge_process_arguments(
@@ -1402,6 +1415,8 @@ def start_bridge_process(
             harness_id=harness_id,
             lifetime_seconds=lifetime_seconds,
         )
+        if validated_python_executable is not None:
+            arguments = [validated_python_executable, "-I", *arguments]
         process = subprocess.Popen(
             arguments,
             stdin=subprocess.DEVNULL,
@@ -1414,6 +1429,9 @@ def start_bridge_process(
                 os.environ if environment is None else environment
             ),
         )
+    except OSError as error:
+        os.close(write_descriptor)
+        raise BridgeError("BRIDGE_START_FAILED") from error
     except BaseException:
         os.close(write_descriptor)
         raise

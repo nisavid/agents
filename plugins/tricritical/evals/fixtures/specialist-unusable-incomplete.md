@@ -1,1 +1,0 @@
-Review a byte-identical frozen migration candidate. The consequence surface required a persistence/migration specialist, but that isolated specialist returned only “looks fine” with no evidence or causal analysis, making the report unusable. The three standard critics returned usable reports. Produce the review synthesis without a hidden retry loop.

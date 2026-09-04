@@ -1,5 +1,11 @@
 # Cross-repository implementation handoff
 
+> Historical record. The current document lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/research/2026-08-24-cross-repository-implementation-handoff.md).
+> [Agents issue #41](https://github.com/nisavid/agents/issues/41) owns current
+> cross-repository coordination; this copy is not an active implementation or
+> release route.
+
 Status: recovery-execution checkpoint. This document settles the working
 ownership map and execution order; it is not a release receipt, a qualification
 decision, a migration authorization, or a security review.

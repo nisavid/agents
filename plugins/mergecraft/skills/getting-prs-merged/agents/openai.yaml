@@ -1,4 +1,0 @@
-interface:
-  display_name: Get PRs Merged
-  short_description: Drive an authorized PR through merge closeout.
-  default_prompt: Use $mergecraft:getting-prs-merged to drive this PR through merge closeout.

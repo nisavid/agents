@@ -1,1 +1,0 @@
-The canonical repository tag resolves to source commit A, while the released artifact was built from source commit B. Both records are authentic, but they are not equivalent. No local dependency files have been modified.

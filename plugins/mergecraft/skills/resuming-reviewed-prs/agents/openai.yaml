@@ -1,4 +1,0 @@
-interface:
-  display_name: Resume Reviewed PRs
-  short_description: Recover a reviewed PR's exact state and next owner.
-  default_prompt: Use $mergecraft:resuming-reviewed-prs to resume this reviewed PR safely.

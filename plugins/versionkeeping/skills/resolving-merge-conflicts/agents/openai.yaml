@@ -1,4 +1,0 @@
-interface:
-  display_name: Resolve Merge Conflicts
-  short_description: Interpret conflicts and prepare authorized resolutions safely.
-  default_prompt: Use $versionkeeping:resolving-merge-conflicts to interpret and resolve this active Git conflict safely.

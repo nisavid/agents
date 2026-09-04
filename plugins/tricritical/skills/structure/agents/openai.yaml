@@ -1,4 +1,0 @@
-interface:
-  display_name: "Structure Review"
-  short_description: "Inspect structure and simplification."
-  default_prompt: "Use $tricritical:structure to inspect structure and simplification."

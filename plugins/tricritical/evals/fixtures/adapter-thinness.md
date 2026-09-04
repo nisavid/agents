@@ -1,1 +1,0 @@
-Create the Claude adapter for persona `Oathfinder`, whose only semantic target is the public skill identity `intent`. The shared intent skill already owns the review-input boundary, role policy, and rubric. Return the complete adapter file that forwards the supplied task to that one literal skill target while leaving all semantic policy in the public skill.

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Choose Agent Models"
-  short_description: "Select models and reasoning effort safely"
-  default_prompt: "Use $rolecasting:choosing-agent-models to select the model and reasoning effort for this delegated task."

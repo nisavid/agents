@@ -1,4 +1,0 @@
-interface:
-  display_name: Work With Graphite Stacks
-  short_description: Manage Graphite topology and draft transport.
-  default_prompt: Use $mergecraft:graphite to manage this Graphite stack.

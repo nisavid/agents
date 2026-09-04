@@ -1,1 +1,0 @@
-Adjudicate two evidenced frozen-source findings. One is a one-line missing authority check that exposes every tenant’s private export and is hard to detect or recover from. The other needs a 120-line refactor to correct a duplicated debug label that has no runtime or user impact. Calibrate realistic severity and required proof without using fix size as the ranking signal.

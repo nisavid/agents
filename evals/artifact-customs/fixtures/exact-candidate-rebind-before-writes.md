@@ -1,1 +1,0 @@
-Assessment initially selected digest A. Before any write, a registry refresh reveals that the requested release now resolves to digest B. The allowed maintenance update may proceed only after rebinding every source, artifact, metadata, license, and conformance record to the exact candidate that will be written.

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Intent Review"
-  short_description: "Inspect contract and scope."
-  default_prompt: "Use $tricritical:intent to inspect the contract and intent."

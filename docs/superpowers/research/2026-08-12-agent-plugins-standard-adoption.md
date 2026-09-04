@@ -1,5 +1,10 @@
 # Agent Plugins Standard Adoption Research
 
+> Historical record. The current document lives in
+> [`nisavid/provingkit`](https://github.com/nisavid/provingkit/blob/main/docs/superpowers/research/2026-08-12-agent-plugins-standard-adoption.md).
+> This copy preserves evidence tied to the former repository layout; it is not
+> an active package, validation, or release route.
+
 Status: research checkpoint; implementation and release versions remain
 unsettled
 

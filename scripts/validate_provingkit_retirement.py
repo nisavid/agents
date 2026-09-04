@@ -31,6 +31,7 @@ REQUIRED_REAL_DIRECTORIES = (
     *PRESERVED_OWNER_PATHS,
     Path("docs/superpowers/research"),
     Path("docs/superpowers/specs"),
+    Path("docs/plugin-system"),
 )
 
 ALLOWED_ROOT_SCRIPTS = {Path("scripts/validate_provingkit_retirement.py")}
@@ -48,6 +49,15 @@ def require(condition: bool, message: str) -> None:
 
 def path_present(path: Path) -> bool:
     return path.exists() or path.is_symlink()
+
+
+def is_real_directory(repository: Path, relative: Path) -> bool:
+    current = repository
+    for component in relative.parts:
+        current /= component
+        if not current.is_dir() or current.is_symlink():
+            return False
+    return True
 
 
 def files_below(repository: Path, relative_root: Path) -> set[Path]:
@@ -74,9 +84,8 @@ def validate_retirement(repository: Path) -> None:
         )
 
     for relative in REQUIRED_REAL_DIRECTORIES:
-        path = repository / relative
         require(
-            path.is_dir() and not path.is_symlink(),
+            is_real_directory(repository, relative),
             f"path must be a real directory: {relative.as_posix()}",
         )
 

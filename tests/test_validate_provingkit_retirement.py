@@ -124,6 +124,29 @@ class ProvingkitRetirementTests(unittest.TestCase):
                     f"path must be a real directory: {relative}", completed.stderr
                 )
 
+    def test_directory_alias_ancestors_are_rejected(self) -> None:
+        for ancestor, required in (
+            (".scratch", ".scratch/chatgpt-airgap-unlock"),
+            ("tooling", "tooling/chatgpt-ffs"),
+            ("docs", "docs/superpowers/research"),
+            ("docs/superpowers", "docs/superpowers/research"),
+            ("docs/plugin-system", "docs/plugin-system"),
+        ):
+            with self.subTest(ancestor=ancestor), tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory)
+                self.prepare_valid_fixture(repository)
+                original = repository / ancestor
+                target = repository / f"aliased-{Path(ancestor).name}"
+                original.rename(target)
+                original.symlink_to(target, target_is_directory=True)
+
+                completed = self.run_validator(repository)
+
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn(
+                    f"path must be a real directory: {required}", completed.stderr
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

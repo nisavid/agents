@@ -2109,12 +2109,12 @@ kind/version in this table:
 | `CLOCK_ENVELOPE` | `AuthorityGateClockEnvelopeSlotKey` | `AuthorityGateClockEnvelopeValue`; exact `hindsight-postgresql-clock-envelope/1` reference |
 | `DEPLOYMENT_ATTESTATION` | `AuthorityGateDeploymentAttestationSlotKey` | `AuthorityGateDeploymentAttestationValue`; exact `hindsight-postgresql-deployment-attestation/1` reference |
 | `DEPLOYMENT_POLICY` | `AuthorityGateDeploymentPolicySlotKey` | `AuthorityGateDeploymentPolicyValue`; exact `hindsight-postgresql-deployment-admission-policy/1` reference |
-| `EVIDENCE_TIER_RESULT` | `AuthorityGateEvidenceTierResultSlotKey` | `AuthorityGateEvidenceTierResultValue`; exact `hindsight-postgresql-evidence-tier-result/1` reference |
+| `EVIDENCE_TIER_RESULT` | `AuthorityGateEvidenceTierResultSlotKey`; exactly `(claim_id, tier)`, with no `subject_revision` | `AuthorityGateEvidenceTierResultValue`; exact `hindsight-postgresql-evidence-tier-result/1` reference |
 | `LEGACY_FENCE` | `AuthorityGateLegacyFenceSlotKey` | `AuthorityGateLegacyFenceValue`; exact `hindsight-compatibility-origin-fence-manifest-binding/1` or `hindsight-compatibility-active-fence-manifest-adoption/1` reference |
 | `LINEAGE_HEAD` | `AuthorityGateLineageHeadSlotKey` | `AuthorityGateLineageHeadValue`; digest of exact `M` bytes |
 | `OPERATION_ACCOUNTING` | `AuthorityGateOperationAccountingSlotKey` | `OPERATION_ACCOUNTING_STATE` whose plan equals the key |
 | `OPERATION_AUTHORITY` | `AuthorityGateOperationAuthoritySlotKey` | `AuthorityGateOperationAuthorityValue`; exact `hindsight-postgresql-operation-authorization-receipt/1` reference |
-| `OPERATION_GRANT` | `AuthorityGateOperationGrantSlotKey` | `AuthorityGateOperationGrantValue`; exact `hindsight-postgresql-operation-grant/1` reference |
+| `OPERATION_GRANT` | `AuthorityGateOperationGrantSlotKey`; exactly `grant_id`, never a plan reference | `AuthorityGateOperationGrantValue`; exact `hindsight-postgresql-operation-grant/1` reference |
 | `OPERATION_WORK_RESERVATION` | `AuthorityGateOperationWorkReservationSlotKey` | `AuthorityGateOperationWorkReservationValue`; exact `hindsight-postgresql-operation-work-reservation/1` reference |
 | `OPERATION_WORK_START` | `AuthorityGateOperationWorkStartSlotKey` | `AuthorityGateOperationWorkStartValue`; exact `hindsight-postgresql-operation-work-start/1` reference |
 | `OPERATION_WORK_COMMITTED_RESULT` | `AuthorityGateOperationWorkCommittedResultSlotKey` | `AuthorityGateOperationWorkCommittedResultValue`; exact `hindsight-postgresql-operation-work-committed-result/1` reference |
@@ -2127,10 +2127,14 @@ kind/version in this table:
 
 For every present reference, the complete body resolves and its internal plan,
 work identity, target, surface, epoch, claim, tier, or predecessor fields equal
-the slot key. A grammar-valid value from another slot class, a reference with
-another kind or version, a mismatched key body, a hidden value under `ABSENT`,
-or the right value under a recomputed key for another class invalidates the
-fixture. Fixture setup, production projection, and the independent oracle each
+the slot key. In particular, an operation-grant value's body `grant_id` equals
+the key's `grant_id`, and an evidence-tier-result value's body `claim_id` and
+`tier` equal the key's `(claim_id, tier)`. The result body's
+`subject_revision` is current state carried by the value, not part of that slot
+key. A grammar-valid value from another slot class, a reference with another
+kind or version, a mismatched key body, a hidden value under `ABSENT`, or the
+right value under a recomputed key for another class invalidates the fixture.
+Fixture setup, production projection, and the independent oracle each
 reconstruct the same per-class variant; none decodes a generic slot bag.
 
 Campaign and evidence-record stimuli, tools, procedures, limits, oracle
@@ -2739,9 +2743,12 @@ REVOKE_OPERATION_AUTHORITY(
 READ_CURRENT_OPERATION_AUTHORITY(plan)
 ```
 
-The grant slot is keyed by `grant_id`; the authority slot is keyed by the exact
-plan reference. Issuance moves the latter only through `ABSENT -> PLAN_ISSUED
--> APPROVED -> AUTHORIZED`. Each transition authenticates the session
+The grant slot is keyed by `grant_id`; `ISSUE_OPERATION_GRANT`,
+`REVOKE_OPERATION_GRANT`, and every protected stage lookup derive that exact
+key from the complete grant body or named `grant_id`, never from an
+`OperationPlan` reference. The authority slot remains keyed by the exact plan
+reference. Issuance moves the latter only through `ABSENT -> PLAN_ISSUED ->
+APPROVED -> AUTHORIZED`. Each transition authenticates the session
 principal against the matching body principal, resolves every complete typed
 body, checks the expected current references, and commits the immutable body
 and current pointer atomically. The approval's `operator_principal`, the
@@ -3333,8 +3340,12 @@ AuthorityGatePublicationEpochSlotKey := {
 AuthorityGateClaimTierSlotKey := {
   "claim_id": ClaimId,
   "key_kind": "CLAIM_TIER",
-  "subject_revision": EvidenceRef,
   "tier": "DESIGN" | "IMPLEMENTATION" | "RELEASE" | "DEPLOYMENT"
+}
+
+AuthorityGateGrantSlotKey := {
+  "grant_id": Id,
+  "key_kind": "GRANT"
 }
 
 AuthorityGatePlanSlotKey := {
@@ -3374,7 +3385,7 @@ AuthorityGateOperationAccountingSlotKey := AuthorityGatePlanSlotKey &
                                            {"slot_class": "OPERATION_ACCOUNTING"}
 AuthorityGateOperationAuthoritySlotKey := AuthorityGatePlanSlotKey &
                                           {"slot_class": "OPERATION_AUTHORITY"}
-AuthorityGateOperationGrantSlotKey := AuthorityGatePlanSlotKey &
+AuthorityGateOperationGrantSlotKey := AuthorityGateGrantSlotKey &
                                       {"slot_class": "OPERATION_GRANT"}
 AuthorityGateOperationWorkReservationSlotKey :=
   AuthorityGateOperationWorkSlotKey &
@@ -4948,7 +4959,10 @@ pointers atomically. No login receives `EXECUTE` on that routine, and no
 callable interface accepts a proposed `EvidenceTierResult`, verdict, or
 replacement current-result pointer. The read interface takes only the exact
 claim and tier key and returns the one protected current reference; its caller
-cannot choose among stored results.
+cannot choose among stored results. Registration and evaluator replacement use
+that same `(claim_id, tier)` key. They resolve `subject_revision` only while
+constructing the referenced result body and never create a revision-keyed
+alternate current pointer.
 `OBSERVE_EVIDENCE_TIME` accepts no timestamp and cannot issue
 `EVIDENCE_COMPLETE`. For either admitted start phase, it derives the protected
 registration time or conservative qualified-clock upper bound, stores one
@@ -5126,8 +5140,10 @@ The `hindsight_journal_evidence_owner` registrar holds exactly one current
 protected value; a caller cannot supply it to evaluation or replace it outside
 `SET_CURRENT_EVIDENCE_SUBJECT`. Through that interface, the evidence-authority
 login can atomically replace the value while preserving its prior value as
-immutable history; the interface cannot create or alter a campaign, run,
-evidence record, verdict, or result. An evidence campaign begins when
+immutable history. The evaluator then replaces the one current result slot for
+each affected `(claim_id, tier)`; the changed subject does not allocate another
+slot. The interface cannot create or alter a campaign, run, evidence record,
+verdict, or result. An evidence campaign begins when
 `REGISTER_EVIDENCE_CAMPAIGN` accepts one complete canonical
 `EvidenceCampaign/v1` whose tier and subject equal those current protected
 values. Before any campaign body exists for a required claim and tier, its
@@ -5650,6 +5666,9 @@ replay, and changed bytes conflict. Acceptance of a run result or supersession
 atomically recomputes every affected result and replaces its protected current
 pointer without altering an earlier body. Record invalidation and subject
 change do the same for their complete affected pointer sets in one transaction.
+The current pointer key is only `(claim_id, tier)`: `subject_revision` remains
+part of each immutable result body's identity but never partitions current
+slots.
 
 For claim `K`, tier `T`, protected current subject `S`, unique selected
 campaign `C`, and exact ordered prerequisite sequence `P`, the result body's
@@ -6514,6 +6533,39 @@ digests. Both families exercise every scalar boundary, set and sequence order,
 escape rule, trailing LF, wrong-family serializer, and one-field perturbation
 through `EV-VEC` and `OR-ID`.
 
+The successor family includes exact current-slot-key vectors. In the displays
+below, `\n` denotes the required single final LF. For grant ID `grant-101`, the
+complete operation-grant key bytes are:
+
+```text
+{"grant_id":"grant-101","key_kind":"GRANT","slot_class":"OPERATION_GRANT"}\n
+```
+
+Their SHA-256 digest is
+`807df48bf75a769ddbee70db12efaba51c766dd49d6a1df83ddf8aa140dc855f`.
+For claim `JAC-EVL-01` at tier `IMPLEMENTATION`, the complete
+current-tier-result key bytes are:
+
+```text
+{"claim_id":"JAC-EVL-01","key_kind":"CLAIM_TIER","slot_class":"EVIDENCE_TIER_RESULT","tier":"IMPLEMENTATION"}\n
+```
+
+Their SHA-256 digest is
+`6f1d59f8d9d4a81c393cd4664e167a817ddeedf1311a7c1c1bb8c259143f7671`.
+Each vector binds the displayed key body, those exact bytes, and that digest.
+Independent one-field negatives change `grant_id`, `claim_id`, `tier`,
+`key_kind`, `slot_class`, or `slot_key_digest` and recompute every affected
+outer body. Separate invalid-shape vectors substitute the former plan-shaped
+grant key or add `subject_revision` to the current-tier-result key. Setup,
+preflight, and `OR-ID` must reject each as a key mismatch or as missing and
+extra current state.
+
+The legitimate subject-replacement vector retains the earlier campaign and
+result body, changes the assessed `subject_revision`, derives one new `STALE`
+result value, and replaces the same `(claim_id, tier)` pointer. Its before and
+after key bytes and `slot_key_digest` are identical, and complete-state
+enumeration contains exactly one current slot for that pair.
+
 The successor vectors include paired registries whose claim IDs and planned
 runs are identical while one canonical definition obligation, required-tier
 binding, predicate run, oracle requirement, or expected tagged field differs;
@@ -6882,13 +6934,13 @@ every body and pointer outside the allowed delta remained unchanged.
 | Historical-corpus-plan registration | Recompute the exact required-category, reader, artifact-kind/schema/variant, boundary, generator, seed, budget, shrink, and policy coverage projection from the closed registry and plan before accepting its authenticated plan-acceptance body. Each row carries one exact member-to-tool execution binding whose embedded member includes the dependency role, artifact kind, artifact schema, reference-plan schema, protocol family/version, variant, wire contract, derived reader contract ID, source revision, and member digest, and whose tool contracts and immutable implementation implement that member. At corpus-plan acceptance, campaign registration, every historical run registration, and tier evaluation, reconstruct the exact `FrozenReaderRegistry/v1` body, including the kindless `requeue-plan` member and exact member count, and require its digest, member-vector digest, body reference, complete member projection, and one-to-one execution-binding projection to equal the plan. Reject zero, stale, narrowed, reordered, differently expanded, dropped, or altered registry values; a wrong kind/version, member count, contract ID, tool, or source revision; a row attached to another member or execution; inline parent parsing of the requeue plan; or collapse of two tuples that differ in any selector. Any mismatch prevents registration and `PASS`. |
 | First exact campaign registration | Accept one immutable root only when the subject is current and the complete planned-run expansion, including every tool, acquisition procedure, limit, oracle, and expected projection, equals the preaccepted plan or closed matrix. Recursively resolve every tool, procedure, generator, and nested typed contract body and recompute each digest from its complete canonical bytes before comparing the plan. Exact concurrent retries converge on one body; changed bytes conflict. |
 | Campaign with an empty, omitted, extra, duplicated, reordered, late-bound, unresolved, digest-mismatched, or wrong-class run requirement or nested contract body | Reject campaign registration and preserve the prior root, current result, and every evidence body. A caller-supplied tool, procedure, input, output, invocation, or step contract discovered after execution cannot repair it. |
-| Authority-gate fixture setup or execution | Resolve only the planned run's exact `AuthorityGateConformancePrestate/v1` and `AuthorityGateFixtureState/v1`. Before setup and again before execution, enumerate every gate-reachable seeded row, current slot, explicit absence, lineage value, clock/envelope value, capability, revocation, and accounting value and require exact equality with the canonical fixture body. Reject an opaque artifact, missing or extra state, duplicate key, tagged-value mismatch, cross-schema reference, or different prestate in any evidence record, failure, run result, or oracle projection. Create no live authority. |
+| Authority-gate fixture setup or execution | Resolve only the planned run's exact `AuthorityGateConformancePrestate/v1` and `AuthorityGateFixtureState/v1`. Before setup and again before execution, enumerate every gate-reachable seeded row, current slot, explicit absence, lineage value, clock/envelope value, capability, revocation, and accounting value and require exact equality with the canonical fixture body. Enumerate operation-grant slots only by `grant_id` and current-tier-result slots only by `(claim_id, tier)`. Reject an opaque artifact, missing or extra state, duplicate key, plan-shaped grant key, revision-keyed tier-result slot, tagged-value mismatch, cross-schema reference, or different prestate in any evidence record, failure, run result, or oracle projection. Create no live authority. |
 | Exact run-result registration | Recompute every nested evidence record against its planned run. For deployment, require the complete ordered acquisition-body sequence and exact acquisition/projection/procedure/run/oracle equalities; the registrar creates no acquisition observation. Exact concurrent retries converge on one body; changed bytes conflict. Atomically append the accepted body, derive the claim-local tier result, and replace only the affected current pointers. |
 | Campaign started with any required result missing, invalid, nonexecuted, omitted, unexplained, aborted, shortened, over budget, generator-failed, or unreproducible | Derive `FAIL`, never `OPEN` or `PASS`. Later passing results cannot hide that required outcome. |
 | One or more valid deciding records recompute to `FAIL` while every other record passes | Derive `FAIL` regardless of record order, retry order, or number of passing records. No caller-supplied aggregate verdict can override failure dominance. |
 | Record invalidation | Accept only an authenticated, unexpired `EvidenceRecordInvalidation/v1` backed by the exact independently confirmed invalidity finding for that nonfailing record. Retain every body; remove the record from validity for its complete ordered claim set; atomically recompute every affected result and current pointer; and derive `FAIL` wherever the required record is now missing. Refuse a subset invalidation, invalidation of a valid deciding `FAIL`, a mismatched reference, or an unproved defect. |
 | Campaign supersession | Accept only an authenticated contiguous edge from the exact current claim-local result to a separately registered current-subject replacement campaign. Preserve the prior campaign and result. Recompute solely from the replacement; never merge evidence. Exact retries converge, while a stale, skipped, cyclic, cross-claim, cross-tier, or second concurrent edge conflicts and cannot select the proposed replacement. |
-| Current subject replacement | Atomically preserve the prior subject and result, install the new subject, and replace every affected current pointer with the exact independently derived `STALE` result. A new-subject campaign remains unselected until valid supersession. |
+| Current subject replacement | Atomically preserve the prior subject and result, install the new subject, and replace every affected `(claim_id, tier)` current pointer with the exact independently derived `STALE` result. The changed revision creates no parallel current slot. A new-subject campaign remains unselected until valid supersession. |
 | Run registration, invalidation, supersession, or subject replacement racing current-pointer recomputation | Commit either the complete old state or the complete new state. No observer may see a new accepted body with an old affected pointer, a new pointer without its exact body, a partial claim set, or a caller-selected result. |
 | Prerequisite-result replacement | Recompute every dependent `EvidenceTierState/v1` with the complete exact ordered prerequisite references and atomically replace its current result pointer, even for `PASS` to a different current `PASS`. A non-`PASS` prerequisite derives `PREREQUISITE_BLOCKED`; unchanged claim-local evidence cannot retain the old dependent pointer, and the changed state digest is not a same-key conflict. |
 | Operation grant, plan, approval, authorization, or revocation | Only the matching isolated authenticated principal may perform its keyed transition. Resolve the complete typed action binding, including exact grant, retry, reconciliation, budget, protected ciphertext, source plaintext, restore payload and conversion, cohort membership, target, and epoch inputs; require the grant, plan, approval, and authorization receipt to carry the same nonextendable deadline; require the expected current slot; advance only through the closed lifecycle; and exact-replay identical bytes. A skipped state, stale expected reference, mismatched deadline, cross-key body, mixed principal, ambient default, reinstatement, or second revocation conflicts. Every stage locks both current unrevoked slots through commit. After durable timely `R`, `M` does not resample the shared deadline. |
@@ -6923,9 +6975,14 @@ absences by `(relation, row_key_digest)`, lineage values by target-reference
 bytes and surface digest, and clock, capability, revocation, and accounting
 values by `value_id`, subject-reference bytes, or plan-reference bytes as
 applicable. Every current slot uses its exact per-class key body, presence
-state, value variant, and referenced kind/version. Every queried
-missing row has one explicit absence marker, and no key may be both present and
-absent. Each accounting value's outer plan equals `state.plan`; each revocation
+state, value variant, and referenced kind/version. Operation-grant selectors
+use only `grant_id`; current-tier-result selectors use only `(claim_id, tier)`,
+even when the referenced result becomes `STALE` after a subject change. A
+plan-shaped grant selector, a `subject_revision`-bearing tier-result selector,
+or parallel tier-result selectors for old and new revisions are extra state.
+Every queried missing row has one explicit absence marker, and no key may be
+both present and absent. Each accounting value's outer plan equals
+`state.plan`; each revocation
 state is `CURRENT` with `revocation="NONE"` or `REVOKED` with the exact typed
 revocation body. Clock bounds satisfy lower at or below upper and resolve the
 named envelope. Capability and session-witness strings are canonical unpadded

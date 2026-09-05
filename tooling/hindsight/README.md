@@ -33,6 +33,186 @@ Reusable Hindsight control-plane code, local-stack tooling, agent skills, policy
 - [Journal compatibility and cutover](docs/journal-compatibility-design.md) for
   frozen historical readers, exact legacy dispositions, authenticated cutover
   manifests, and the narrow legacy-predecessor rollback bridge.
+- [Durable journal acceptance evidence](docs/journal-acceptance-evidence.md) for
+  the tiered claim registry, exact successor bytes and clock arithmetic,
+  apply/rollback matrices, historical fixtures, and profile qualification bar.
+
+The journal design remains nonruntime work. Its acceptance contract requires
+typed authority references and an authenticated immutable campaign plan that
+stores the literal release tier and complete deterministic
+cell/case/seed/allocation/stimulus expansion, run IDs, and ordered oracle lists.
+Every referenced procedure, tool, and generator resolves immutable typed input,
+output, invocation, or step contract bodies recursively; planning and oracle
+verification recompute their complete LF-inclusive canonical body digests
+instead of accepting digest placeholders.
+A closed canonical claim-registry body carries every exact typed claim
+definition and complete executable predicate body. A separate closed canonical
+deployment-matrix body binds those same definitions and predicates to exact
+profile and target scopes and complete ordered runs. Their LF-inclusive
+SHA-256 identities let either plan family be expanded and evaluated without an
+implementation-owned predicate or run table.
+A closed composite basis supplies mixed ordinary and historical implementation
+evidence without merging separately selected campaigns. Historical coverage
+retains each complete reader selector tuple, and each tier state binds its exact
+ordered prerequisite results. Before a stage can consume admission, the exact
+deployment policy and attestation must
+remain current, the attestation's complete deployment partition must remain
+`PASS`, and its qualification receipt's complete design, implementation, and
+release partitions and their prerequisite references must remain current
+`PASS`.
+The initial `macos-local-postgresql-v1` profile is exactly same-host local and
+uses closed OS, PostgreSQL, storage, filesystem, hardware, boot,
+virtualization, and clock configuration bodies plus a protected live
+projection. Both host operating-system references, the PostgreSQL host's
+PostgreSQL and storage references, and both stable boot-configuration
+references must equal the profile's corresponding top-level components. The
+actual boot identity is never in the profile: every qualification clock epoch,
+qualified run binding, live projection, and deployment attestation binds its
+exact current clock-envelope boot identity. Its endpoint binds the complete
+effective canonical PostgreSQL Unix-socket-directory sequence. The initial
+profile requires exactly one absolute normalized member with its configured
+path, symlink-resolved path, and device/file identity; the endpoint embeds that
+member and derives one complete pathname ending in
+`.s.PGSQL.<configured-port>`. Relative, dotted, repeated-separator,
+noncanonical trailing-slash, symlink-retargeted, added, removed, reordered, or
+identity-drifted directories, TCP, a directory-only endpoint, remote, managed,
+or otherwise drifted
+endpoints are separate unsupported deployments. The profile, qualification
+chain, and deployment attestation also share one exact closed closure-policy reference;
+compatibility cases copy its positive finite limits and derive every deadline
+with checked integer-nanosecond arithmetic and the separately rounded full
+resolution margin `q + ceil(q*n/d)`. Pre-expiry observer invalidation permits
+only same-ordinal takeover; abandonment requires a qualified conservative lower
+bound at or beyond reservation expiry.
+Each operation plan binds its action-specific grant, retry, reconciliation,
+and budget inputs. Every immutable `OperationWorkRequest/v1` first receives one
+uncharged, side-effect-free committed-result preflight. A byte-identical
+committed result replays without a write. Only unresolved work reaches
+protected plan-scoped accounting, which atomically either commits one charged
+reservation or one separately request-keyed, nonauthorizing pre-reservation
+refusal. Each reservation binds the same request and one closed stage-attempt,
+verification-attempt, transaction-resolution, ambiguity-query, or
+reconciliation identity, including exact forward or recovery mode and recovery
+request. It has one durable `RESERVED -> STARTED` transition with one canonical
+`TransactionIdentity/v1`, followed by the acceptance contract's terminal
+atomic `STARTED -> COMMITTED` result binding. Every reconciliation names an
+exact `ReconciliationSubject/v1`; publication qualification reconciliation
+names the exact reserved and started `R` attempt and transaction, never an
+evidence campaign or run. Resolutions, observations, terminal results, and
+protected comparisons recompute those same identities. A recovered stage
+commits its recovery advancement observation as the reservation's sole result,
+with `result_body` pointing to the stage body. Conclusive noncommit instead
+uses a separately reserved and charged reconciliation that atomically records
+the original typed terminal noncommit result, closes the original and
+resolution, and only then permits a new fully charged attempt. Publication
+`UNPROVEN` is a later, distinct reconciliation result: it may reserve only
+after that original `R` slot is already `COMMITTED`, and it binds the exact
+preexisting `CONCLUSIVE_NONCOMMIT` committed result, terminal result,
+reservation, start, transaction, work identity, and digest. Before terminal
+conditions, the same close preserves the ordinary replacement-`R` path. A
+crashed resolution, including the `UNPROVEN` reconciliation itself, must be
+closed independently within the same finite reconciliation limits.
+When a transaction resolution or ambiguity query proves that its original
+transaction committed, it closes its own reservation with the exact typed
+`OperationWorkTransactionResolutionOutcome/v1` or
+`OperationWorkAmbiguityQueryOutcome/v1`. That outcome binds both transactions
+and the already committed original result, replays byte-identically, and
+inserts no duplicate stage or recovery observation.
+Abort, restart, lost acknowledgement, or a new request ID cannot refund or
+reset the accounting. Isolated authenticated principals issue and revoke grants,
+plans, approvals, and authorization through keyed transitions; stages have no
+ambient authority. Operation grant, plan, approval, authorization receipt,
+`J`, `P`, and `R` share one equal nonextendable expiry. `J` and `P` require a same-transaction
+qualified pre-stage observation whose conservative `U` is strictly earlier;
+equality is late. This is a protected start decision, not a macOS scheduling,
+commit, or acknowledgement bound. A durable timely `R` crystallizes the shared
+expiry decision for `M`; `M` does not resample that deadline, but still enforces
+the grant, plan, approval, and authorization receipt's exact current unrevoked
+identities. Independently timed deployment, evidence, clock, capability,
+identity, and epoch gates retain their current-time expiry checks. `J` is
+canonicalized only after its protected observation is derived under lock.
+Every rollback-preimage binding is immutable and nonauthorizing before plan
+issuance. Its typed protected ciphertext and exact bytes must already occupy a
+digest-and-length-verified PostgreSQL candidate row. The matching `J`
+atomically adopts both the approved binding and byte row into authoritative
+protected journal state. The closed `TargetMutationImage/v1` projects the
+complete target state with exact relation, row, column, PostgreSQL value,
+selected-cohort, preserved-cohort, membership, ordering, and current-generation
+semantics. Production and independent readers reconstruct that complete body.
+The exact generation-free `TargetApplyPayload/v1` in an apply plan contains
+the complete desired selected postimage. Its selected membership matches the
+locked before image and retained restore payload; apply preserves the locked
+preserved cohort, substitutes only those plan-bound selected values, increments
+generation once, and derives its after image. No later query, procedure, or
+default may supply apply values.
+The separate `TargetRestorePayload/v1` contains only selected content to
+restore and no generation or preserved state. Its binding fixes the source
+wire bytes, typed source, exact conversion, and payload. Successor sources are
+LF-terminated payload bodies; historical sources retain their no-LF bytes,
+decode as `LegacyRestoreContent/v1`, and convert field by field. Rollback locks
+the current before image, preserves its protected cohort, replaces only the
+selected content, increments generation once, and derives the after image.
+PostgreSQL retains the source and payload through verified rollback or
+separately authorized retirement; private files are nonauthoritative exports
+or backups.
+One closed successor-canonical lineage-key body, including its LF, derives the
+SHA-256 key used by deployment, compatibility, every stage, and verification.
+`FRESH` admission proves the fixed target-surface fence slot is empty; any
+occupied slot requires `COMPATIBILITY`, immutable epoch-independent persistent
+legacy-fence evidence, and an atomic current handoff for the proposed epoch. A
+later attested epoch can replace that handoff without repeating a fence effect
+or reopening a writer. A proposed publication epoch remains
+`RESERVED_FENCED` until its one-time combined manifest, genesis, witness, and
+active-pointer commit. Reservation and attestation issuance are one atomic
+transition with an exact current selector; a conclusively aborted epoch becomes
+permanent `ABANDONED_FENCED` and is never reused. A separate policy authority
+compare-and-sets only the named target-surface policy slot, immediately making
+attestations for its displaced slot reference noncurrent. The admission role
+derives every attestation issue time from a fresh protected qualified-clock
+observation and admits only deployment evidence whose oldest exact protected
+acquisition observation is strictly younger than the policy's maximum age.
+Registration, completion, signing, aggregation, and retry cannot refresh that
+age. The protected profiler and admission finalizer independently enumerate
+and canonicalize the complete typed role-grant set and writer inventory,
+including inherited, `PUBLIC`, ownership, default-privilege,
+function-mediated, background, replication, and service paths; any omitted,
+extra, duplicate, unresolved, or unclassifiable path fails closed.
+It also authors and revokes deployment attestations and clock
+envelopes, fences incarnations, authors activation proposals, and performs
+metadata-only fence adoption. It cannot set policy,
+finalize qualification, consume an activation proposal, receive the
+capability, or activate an epoch; the dedicated continuity-client adapter
+alone consumes a proposal and calls combined activation. Recovery observations
+are immutable, queryable, and nonauthorizing. Each observation's sole primary
+stable key is its charged reservation; aggregate, request, code, stage, and
+transition fields cannot collapse distinct reservations. Retryable verification
+observations exclude invariant and target-identity failures, which are
+terminal. An expected deployment refusal that exactly matches its oracle is a
+passing negative test; only an unexpected or mismatched result fails that run.
+Evidence completion time and immutable result registration are one atomic
+protected operation. Public synthetic history stays exhaustive for the finite
+registry; its historical corpus digest must equal the recomputed frozen
+compatibility reader-registry digest at plan acceptance, campaign and run
+registration, and tier evaluation. The registry includes the authenticated
+kindless `requeue-plan` dependency member and its exact member count. Each
+member has one immutable reader-execution binding from the complete selector,
+wire contract, derived reader contract ID, and pinned source revision to the
+exact `READER` tool contracts and implementation; corpus plans, cells, runs,
+reader outputs, and oracle projections carry and revalidate that binding. A
+separate finite controlled-private or sanitized-real partition is also
+required. Each real run carries one typed
+binding from plan and stimulus through run and private package, including its
+governing policies and authenticated private-store acquisition or sanitization
+provenance; public synthetic bytes cannot replace it. Controlled evidence is
+disclosed only through the mode-bearing bounded projection, package commitment,
+and exact current authenticated independent-review receipt, using mutually
+isolated registrar, reviewer, and exporter principals. Every authority-gated
+conformance cell uses an isolated `authority=NONE` prestate whose closed typed
+fixture enumerates every reachable seeded row, current slot, explicit absence,
+lineage, clock/envelope, capability, revocation, and accounting value. Setup,
+execution, and conformance evidence reject unenumerated or differently bound
+state, and fixture bytes can never enter a live pointer, receipt, attestation,
+epoch, or stage.
 
 ## Harness authority
 

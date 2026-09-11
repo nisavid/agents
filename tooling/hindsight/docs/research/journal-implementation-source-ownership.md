@@ -23,6 +23,75 @@ shape are the digest-bound issue-107 proposal overlay. They do not inherit the
 accepted revision; accepted 90108 FW03 retains its incarnation-proof
 parameter.
 
+## Issue-108 integration decisions
+
+The following decisions close the remaining integration frontier for [Define
+journal mutation and compatibility integration](https://github.com/nisavid/agents/issues/108).
+They choose ownership and composition; they do not authorize implementation,
+qualification, deployment, candidate assembly, or live recovery.
+
+### Source identity
+
+The issue-107 proposal overlay is accepted as an additional, immutable source
+contract identified by its proposal artifact digest. It does not silently
+replace the accepted 90108 source roster. An adapter must declare the source
+contract/incarnation it implements and reject an unknown or mismatched source
+identity before mutation. In particular, the proposal's IA11, conditional
+FW02/FW03 admission, protected-result partition, acknowledgement/readback,
+retained-lock race, and no-proof `FW03(reservation)` remain distinct from the
+90108 FW03 form, which retains its incarnation-proof operand.
+
+### Authoritative target boundary
+
+The adapter owns one protected transaction on the activation-bound PostgreSQL
+session. That transaction contains the authoritative target compare-and-set,
+the protected `M` receipt, the new generation, and the canonical lineage
+record. It must run through the accepted protected-entrypoint-first runner,
+with the required lock order, durability setup, commit handling, and separate
+authoritative acknowledgement read.
+
+Outbox publication, ANN/index work, metadata, hooks, cache work, and
+maintenance are not implicitly part of `M`. Each must be assigned explicitly
+to either a same-transaction operation with its own contract or a post-commit
+non-authoritative handoff with durable retry/reconciliation. A mini-batch
+transaction or a conditional same-connection callback is not, by itself, the
+journal mutation boundary.
+
+### Apply, restore, and the legacy bridge
+
+Successor operations use successor-owned typed `TargetApplyPayload` and
+`TargetRestorePayload` bodies with deterministic restore conversion. The
+compatibility reader and bridge are isolated from the successor writer and
+cannot turn historical output into `J`, `P`, `R`, `M`, or `V` authority.
+
+The legacy bridge may create only an action-scoped encrypted copy whose exact
+source bytes and original evidence remain unchanged. It is admitted only for a
+manifest-selected, verified-complete legacy apply while successor lineage is
+at genesis, with the exact ciphertext/conversion and predecessor checks. It
+does not provide general legacy writes, synthetic successor artifacts, or
+backfill. A completed legacy rollback is not an eligible predecessor, and a
+new rollback requires separate approval. Unsupported payloads, lineage, or
+bridge combinations are rejected before mutation.
+
+### Cutover and lineage API
+
+Every cutover or restore operation takes and returns the exact authenticated
+manifest, evidence, and activation references; appends authenticated cutover
+metadata; and uses one canonical lineage/CAS path. There is no simplified
+replacement-record path and no silent rebasing. The adapter rejects an
+unsupported combination before mutation and preserves every readable
+historical state for permission-limited inspection.
+
+### Downstream ownership
+
+Issue #108 does not absorb the later gates. Issue #109 owns implementation
+sequencing and evidence qualification; #111 owns target-release verification;
+#77 owns independent assessment; and #78 owns final design acceptance and the
+gate to implementation planning. Those issues may use the accepted 90108
+roster and the separately digest-bound issue-107 overlay as planning inputs,
+but source availability is not runtime evidence and no live authority follows
+from these interface decisions.
+
 ## Source and test ownership map
 
 Every test citation below is an inspected source seam; no test was run for this

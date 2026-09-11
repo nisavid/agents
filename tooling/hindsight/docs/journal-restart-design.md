@@ -16,6 +16,14 @@ final design acceptance remain open in
 [#78](https://github.com/nisavid/agents/issues/78). Implementation, deployment,
 candidate assembly, and live recovery remain separately authorized work.
 
+The accepted-source inventory for this issue is anchored only to revision
+`90108b516f5a1c460980a93670348f6e228124f2`. The IA11/admission carrier,
+no-proof FW03 form, conditional transaction/start members, protected-result
+partition, acknowledgement read, and retained-lock race rules below are the
+separately digest-bound issue-107 proposal overlay; they do not receive that
+accepted revision. In particular, the accepted 90108 FW03 interface retains
+its incarnation-proof parameter.
+
 ## Decision
 
 Hindsight automatically advances an interrupted apply or rollback aggregate
@@ -384,16 +392,29 @@ again.
 Every invocation first submits one immutable `OperationWorkRequest/v1` to the
 acceptance contract's uncharged, side-effect-free committed-result preflight.
 The request binds the complete work identity, including forward or recovery
-mode and the exact recovery request when present. A byte-identical committed
-result returns immediately and writes nothing. Only an unresolved request
-enters the protected accounting transaction. Under the plan accounting lock,
-that transaction either commits one charged
+mode and the exact recovery request when present. The preflight performs the
+mandatory protected read of the complete RW01 admission carrier. A
+byte-identical committed result returns immediately with that carrier and
+writes nothing. An unresolved request enters
+the protected FW02 reservation transaction, which evaluates the authenticated
+caller, immutable identity, and invocation. The runner enters FW02; FW02 takes
+ranks 1 and 2 and, for candidate AW04, invokes O16-owned IA11 once at rank 3
+before any rank-5 work lock. An admission denial rolls back before any
+request, refusal, reservation, accounting, start, stage, or result effect. Only after admission,
+under the rank-5 plan-accounting lock, FW02 either commits one charged
 `OperationWorkReservation/v1`, or commits one separately request-keyed,
 `authority=NONE` `OperationWorkPreReservationRefusal/v1` without a charge or
 reservation. Exhaustion, arithmetic overflow, invalid clock binding, stale
 ordinal, request conflict, and unavailable reservation all use that refusal
 path and perform no work. Reservation-keyed recovery-observation guarantees
 apply only after a reservation commits.
+
+Every admitted new FW02 branch stores the complete protected
+`OperationWorkAdmission` immutably with RW01 in the same transaction. For AW04
+the carrier contains its row, derived M work class, opaque RX03 admission ID,
+and authenticated RX05 adapter-incarnation ID. Candidate-AW04 FW02
+reservation/refusal replay invokes IA11 once and requires that fresh value to
+equal RW01.
 
 The charged transaction atomically consumes the checked-next retry or
 reconciliation count and complete declared duration before any query, wait,
@@ -411,21 +432,47 @@ clock after the aggregate attestation expires or is fenced, without reviving
 that authority. Committed charges never roll back after failed work or reset
 after a crash, controller replacement, new request ID, or lost acknowledgement.
 
-The protected start slot advances once from `RESERVED` to `STARTED`, atomically
-inserting its exact `OperationWorkStart/v1` and registered
-`TransactionIdentity/v1` and binding the sole dispatch to that attempt and
-adapter invocation. Transaction resolution and ambiguity queries reference
+The runner enters the proposal-only `FW03(reservation)` before its protected
+locks; that proposed interface accepts no incarnation proof, while the
+accepted 90108 interface retains its proof parameter. FW03 takes every applicable rank 1 and 2 dependency. For
+candidate AW04 it then invokes IA11 once at rank 3, takes rank 5, owns the
+fresh-to-RW01 comparison, and copies the authenticated adapter-incarnation ID
+into the M `OperationWorkStart/v1` and `TransactionIdentity/v1`. The eleven
+non-AW04 positive expansions call IA11 zero times and omit that field from the
+complete J/P/R/V/RECONCILIATION bodies. Every ranked lock ends at the outer
+commit or rollback. Once IA11 holds rank-3 locks, a concurrent replacement
+waits for that boundary; rank 5 and any effect use the retained binding. A
+replacement that wins before rank-3 locking may determine the binding IA11
+subsequently locks or cause admission denial. The protected start slot then advances
+once from `RESERVED` to `STARTED`, atomically inserting those exact bodies and
+binding the sole dispatch to that attempt and adapter invocation. Transaction
+resolution and ambiguity queries reference
 that exact transaction body. Reconciliation references one exact registered
 `ReconciliationSubject/v1`. Every observation, terminal result, and protected
 recovery-state comparison resolves and recomputes the same transaction or
 subject body. The only following slot change is the terminal
-`STARTED -> COMMITTED` result binding. A forward invocation ordinarily inserts
-its typed result and `OperationWorkCommittedResult/v1` together. A recovered
-stage advancement instead commits one `RecoveryAdvancementObservation/v1` as
-the reservation's sole result; its `result_body` points to the stage body
-inserted in the same transaction. A crash or controller replacement cannot
-start it again. Exact replay terminates at preflight and creates no new
-observation. An absent, uncommitted, ambiguous, or started attempt requires a
+`STARTED -> COMMITTED` result binding. A forward invocation inserts its typed result and
+`OperationWorkCommittedResult/v1` together. The close selection uses the
+protected result, not invocation identity alone. Only CURRENT J/P,
+R_VALID/R_LATE, or M under `RECOVERY/ADVANCE_STAGE` uses its stage-specific
+outer entrypoint to stage the exact body, after which owner-internal FW04 atomically derives BS125/RW10,
+writes BS099/RW06 pointing only to BS125, and closes RS15. `BS125.result_body`
+points to the stage inserted in that transaction. For a late `J` or `P` under
+FORWARD or RECOVERY, the typed result is the existing same-transaction BS108
+observation and the prefix does not advance. A recovered late J/P outer
+transaction contains only RP03/BS108, direct BS099/RW06, and RS15; it creates
+no stage, BS125/RW10, authority, refund, replacement entitlement, deadline
+renewal, or prefix change. A recovered V remains a direct
+`RECOVERY/VERIFY_STAGE` result. A crash or
+controller replacement cannot start either branch again. Exact replay
+terminates at preflight and returns the existing complete mapping and RW01
+admission carrier without a new stage or observation. FW01/FW08 dispatch
+readback by committed result kind and exact typed body before validating the
+immutable identity. A recovery
+observation requires the complete stage chain; a J/P pre-stage-expiry result
+requires BS108 and forbids that chain. A missing, extra, or internally
+inconsistent carrier returns `DATABASE_CONFLICT`.
+An absent, uncommitted, ambiguous, or started attempt requires a
 separately charged typed resolution.
 
 If that resolution or its exact ambiguity query proves the original
@@ -496,12 +543,12 @@ WAL flush, or acknowledgement.
 
 | Durable prefix | Continuous and before expiry | Continuous at or after expiry | Fenced or discontinuous |
 | --- | --- | --- | --- |
-| `ABSENT` | Revalidate the exact grant, plan, approval, authorization receipt, equal shared expiry, complete action binding, immutable nonauthorizing preimage body, digest-and-length-verified protected PostgreSQL ciphertext, target generation, exact selected and preserved cohorts, preparation evidence, and canonical lineage gate; create the exact `J`, its protected binding and byte adoptions, and a `CURRENT` pre-stage observation atomically only from genesis or an exactly verified head. | Resolve an original `J` transaction only. If none committed, refuse; no new durable authority may begin, and a replacement aggregate requires separate approval. | Preserve nonauthorizing preparation evidence only; require a new epoch and separately approved aggregate. |
-| `JOURNALED` | Exact-replay `J`, then create `P` only with its own `CURRENT` pre-stage observation under the same authority chain. | Resolve an original `P` transaction only. If none committed, preserve and query `J`; it cannot newly gain mutation authority. | Preserve and query; require a new epoch and separately approved aggregate. |
-| `PROVEN` | Exact-replay `JP`, then make one protected `R` attempt with a fresh post-proof monotonic sample. | Resolve only an original `R` attempt. If it committed, use its exact `R`. If it cannot commit, first commit the sole conclusive close; only a later distinct reconciliation that binds that exact terminal result may record `UNPROVEN`. Never take a fresh sample. | Resolve an original attempt for evidence only. Even a recovered `VALID R` remains fenced from `M`; `UNPROVEN` still requires the prior exact conclusive close. |
+| `ABSENT` | Revalidate the exact grant, plan, approval, authorization receipt, equal shared expiry, complete action binding, immutable nonauthorizing preimage body, digest-and-length-verified protected PostgreSQL ciphertext, target generation, exact selected and preserved cohorts, preparation evidence, and canonical lineage gate; create the exact `J`, its protected binding and byte adoptions, and a `CURRENT` pre-stage observation atomically only from genesis or an exactly verified head. | Resolve an original `J` transaction only. A committed `PRE_STAGE_EXPIRY_OBSERVATION` returns its exact BS108 observation and leaves `ABSENT`; if no `J` committed, refuse. No new durable authority may begin, and a replacement aggregate requires separate approval. | Preserve nonauthorizing preparation evidence only; require a new epoch and separately approved aggregate. |
+| `JOURNALED` | Exact-replay `J`, then create `P` only with its own `CURRENT` pre-stage observation under the same authority chain. | Resolve an original `P` transaction only. A committed `PRE_STAGE_EXPIRY_OBSERVATION` returns its exact BS108 observation and leaves `JOURNALED`; if no `P` committed, preserve and query `J`. It cannot newly gain mutation authority. | Preserve and query; require a new epoch and separately approved aggregate. |
+| `PROVEN` | Exact-replay `JP`, then make one protected `R` attempt with a fresh post-proof monotonic sample. Recovery commits R plus BS125/RW10 and BS099→BS125 atomically; `R_VALID` reaches `VALID`, while `R_LATE` reaches `LATE` and stops before M. | Resolve only an original `R` attempt. If it committed, use its exact `R`; a recovered `R_LATE` reaches `LATE` and stops. If it cannot commit, first commit the sole conclusive close; only a later distinct reconciliation that binds that exact terminal result may record `UNPROVEN`. Never take a fresh sample. | Resolve an original attempt for evidence only. Even a recovered `VALID R` remains fenced from `M`; recovered `R_LATE` remains terminal, and `UNPROVEN` still requires the prior exact conclusive close. |
 | `VALID` | Automatically perform exact `M` only while the grant, plan, approval, and authorization receipt retain exact current unrevoked identities; independently timed deployment policy, attestation, evidence, clock, capability, identity, and epoch gates remain unexpired; and continuity, target/cohort/protected-ciphertext/preimage, any legacy fence, and the bound lineage generation and exact genesis or head-plus-`V` state remain current. | Same live gates; the shared operation-authority expiry is not sampled again and does not revoke a durable timely receipt. | Preserve `R`, refuse `M`, and require a new epoch and separately approved replacement aggregate. |
 | `LATE` | Preserve as terminal and nonauthorizing. | Preserve as terminal and nonauthorizing. | Preserve unchanged. |
-| `MUTATED` | Never repeat `M`; resolve its receipt and automatically attempt evidence-only verification. | Same. | Never repeat `M`; a fresh evidence-only verifier may still verify it. |
+| `MUTATED` | Never repeat `M`; resolve its receipt and attempt evidence-only verification through `RECOVERY/VERIFY_STAGE`, whose result is direct and creates no BS125/RW10. | Same. | Never repeat `M`; a fresh evidence-only verifier may still verify it through the same direct branch. |
 | `VERIFIED` | Return exact terminal replay and status. | Return exact terminal replay and status. | Preserve as terminal historical evidence. |
 
 Every matrix transition also requires its work reservation to be available. A
@@ -560,10 +607,15 @@ the `J` or `P` write. `CURRENT` requires that `U` be strictly below the shared
 grant/plan/approval/authorization expiry; equality is `LATE`. No scheduler,
 transaction-duration, commit, WAL-flush, or acknowledgement bound is claimed.
 
-Under the same locks, `CURRENT` and its stage commit atomically. `LATE` appends
-only the observation. An invalid clock, continuity, current-policy,
+Under the same locks, `CURRENT` and its stage commit atomically. Under FORWARD
+or `RECOVERY/ADVANCE_STAGE`, `LATE` appends the observation and closes the started reservation with exactly one
+`OperationWorkCommittedResult/v1` whose
+`result_kind=PRE_STAGE_EXPIRY_OBSERVATION` and whose `result` is that BS108
+observation. It creates no stage, BS125/RW10, authority, refund, replacement
+entitlement, deadline renewal, or prefix change. An invalid clock, continuity, current-policy,
 prerequisite, deployment, authority, or arithmetic gate appends neither. Exact
-same-key replay returns the canonical observation and any atomic stage;
+same-key replay returns the canonical observation and, only for a CURRENT
+stage-producing result, its atomic stage;
 different bytes conflict. Recovery first resolves an original ambiguous stage
 transaction. If it committed, the durable prefix already includes the stage.
 That remains true when commit or acknowledgement completed after expiry;
@@ -653,6 +705,13 @@ drift, or non-genesis lineage permits remediation only and cannot begin
 rollback.
 
 ## Transaction ambiguity and lost acknowledgements
+
+Every nominal mutating success remains provisional through the protected
+function return and the driver's COMMIT return. Caller acknowledgement requires
+a separate authoritative protected read of the exact durable receipt or
+committed-result mapping after that transaction. A failed or lost read remains
+ambiguous and is resolved through the same exact readback; the driver return
+alone never closes the ambiguity.
 
 Every protected stage uses the aggregate row lock and a unique stage key. A
 same-key, same-binding caller returns the exact committed stage; a same-key,
@@ -1009,7 +1068,9 @@ and rollback:
 
 - crash before commit, after commit before acknowledgement, and after
   acknowledgement for every `J`, `P`, `R`, `M`, and `V` transition;
-- `U` immediately before expiry, exactly at expiry, and after expiry;
+- `U` immediately before expiry, exactly at expiry, and after expiry,
+  including exact BS108/BS099 readback for late `J` and `P`, unchanged
+  prefixes, no authority, and no refund;
 - a grant deadline earlier or later than the plan, approval, authorization,
   `J`, or `R` deadline refusing the chain, and a durable timely `R` remaining
   eligible after that shared deadline while each independent live gate is
@@ -1089,6 +1150,17 @@ and rollback:
   identity, recovered-stage observation-to-result mapping,
   distinct-reservation preservation, bare-observation rejection, and
   byte-identical committed-binding-only free replay;
+- the issue-107 proposal's FW02/FW03 entry before IA11, the two guarded IA11
+  call sites and exact branch cardinalities, RX03/RX05 identity origin, atomic
+  RW01 carrier insertion, and FW03 incarnation derivation without a caller
+  proof, while accepted revision 90108 retains its FW03 proof parameter;
+  post-session-loss FW01/FW08 readback without reauthorization and the
+  four-part deterministic admission/refusal/conflict outcome partition;
+- acknowledgement only after a separate authoritative protected read following
+  the driver COMMIT return, including lost-read ambiguity and exact replay;
+- replacement before IA11 rank-3 locking may select the locked binding or deny
+  admission, while replacement after rank 3 waits until outer commit or
+  rollback;
 - multi-reboot qualification with one stable boot configuration and contiguous
   per-boot clock epochs, plus rejection of reused, missing, or cross-bound boot
   identities in runs, live projections, and attestations;
@@ -1136,3 +1208,75 @@ Only after that acceptance may a separately authorized implementation effort
 translate this contract into successor schemas, protected PostgreSQL
 interfaces, controller behavior, tests, deployment admission, and migration
 sequencing.
+
+## FW02/FW03 recovery admission
+
+This section closes the digest-bound issue-107 proposal members against the
+accepted 90108 roster without promoting them into that roster. Stopped-run
+recovery uses the proposed exact stage-owner boundary:
+
+| Authenticated caller | Admitted work | Admitted invocation | Session condition |
+| --- | --- | --- | --- |
+| `C16` publication adapter | J, P, or R `StageAttemptWorkIdentity` | `FORWARD/NONE/NONE` or `RECOVERY/ADVANCE_STAGE/non-NONE` | C16 qualified transaction connection; no activation-session or M authority |
+| `C17` continuity client | M `StageAttemptWorkIdentity` | `FORWARD/NONE/NONE` or `RECOVERY/ADVANCE_STAGE/non-NONE` | exact activation-bound backend, session witness, durable continuity-session identity, and adapter incarnation |
+| `C18` verification adapter | `VerificationAttemptWorkIdentity`, derived V | `FORWARD/NONE/NONE` or `RECOVERY/VERIFY_STAGE/non-NONE` | C18 qualified evidence-only connection; no mutation authority |
+| `C19` recovery adapter | transaction-resolution, ambiguity-query, or reconciliation identity | respectively `RECOVERY/RESOLVE_TRANSACTION`, `RECOVERY/QUERY_AMBIGUITY`, or `RECOVERY/RECONCILE_SUBJECT`, each with a non-`NONE` request | C19 qualified current connection; a subject-stage field grants no stage callable |
+
+For candidate C17/M work, O10 has one path to the required current state:
+O16-owned `IA11 project_current_m_work_admission(plan,work_identity_binding)`,
+nested only inside FW02 or FW03. It accepts no caller, epoch, backend, session,
+witness, continuity, capability, or incarnation override. It locks the exact
+current active-epoch, activation, session-witness, and completed continuity
+binding projection at rank 3 and retains the locks through the outer commit or
+rollback. Its successful result is exactly
+`{row_id=AW04,work_class=M,m_work_admission_identity={m_work_admission_id,adapter_incarnation_id}}`:
+RX03 owns the opaque activation-scoped ID, and RX05 owns the authenticated
+live-session incarnation ID. It exposes no other protected component. The
+runner enters FW02 or FW03 first. FW02 then orders ranks 1, 2, IA11 at 3, and
+5; FW03 orders every applicable rank 1 and 2 dependency, IA11 at 3, and rank
+5. FW02 then owns atomic RW01 insertion or replay equality. FW03 then owns
+fresh-to-RW01 equality and only afterward persists RW04/RW05/RS14 and returns
+START. O10 cannot read the underlying O16 state. Every ranked lock ends at the
+outer commit or rollback. A replacement attempted after IA11 holds rank-3
+locks waits for that boundary; it does not race through to an admission denial
+before rank 5.
+
+FW02 derives `work_class` only from the admitted immutable identity. It checks
+the matrix before RW01/RW02, reservation observation, accounting, RW03, or
+RS13 and stores the complete admitted projection immutably with RW01. FW03
+accepts only the reservation, requires a fresh AW04 projection to equal RW01,
+and derives the transaction/start adapter incarnation from it before RW04,
+RW05, or RS14. The two AW04 invocation expansions require that field in both M
+bodies. The other eleven positive expansions omit it from both complete
+J/P/R/V/RECONCILIATION bodies and call IA11 zero times. Denial preserves
+`RESERVED` before start and `STARTED` after start. Every other caller,
+identity kind, stage, invocation, recovery mode, request-presence, or
+continuity-session combination fails with no durable effect. C19 can inspect
+and reconcile exact chains, but it cannot
+reserve or start stage work and has no FW04, stage callable, or stage-relation
+write path. IA11 has exactly two guarded sites. FW02 calls once per
+candidate-AW04 initial reservation, new refusal, exact reservation replay,
+exact refusal replay, or repeated unresolved request. FW03 calls once per
+first start, acknowledgement-uncertain repeat, or already-started repeat.
+FW01/FW08, non-AW04 branches, and adapters call zero times. After the driver
+returns from COMMIT, acknowledgement requires a separate authoritative
+protected read that validates and returns RW01 after session loss without
+reauthorizing M; a new reservation or start requires the current helper result.
+
+The one closed `OperationWorkProtectedResult` union covers FW01–FW03 and FW08.
+FW01/FW08 historical readback evaluates no current activation or session
+continuity and returns `DATABASE_CONFLICT` for immutable-carrier or chain
+inconsistency. For FW02/FW03, the first matching exceptional predicate is
+matrix, currentness, session, a pre-rank-3 replacement that leaves the
+candidate AW04 tuple noncurrent or causes IA11 to deny admission, or
+fresh-to-stored drift; each returns effect-free `ADMISSION_DENIED`. A valid
+replacement that wins before rank 3 instead becomes the binding IA11 locks.
+The same
+`(plan,request_id)` with changed exact request bytes has a different RequestKey
+because that key includes the exact-body digest and commits `REQUEST_CONFLICT`;
+a different `(plan,request_id)` whose ReservationKey already exists commits
+`WORK_ALREADY_RESERVED`; and remaining immutable-chain inconsistency returns
+effect-free `DATABASE_CONFLICT`. The
+union makes FW01 and FW08 conflict representable without a preflight body. The two
+durable RW01/RW02 refusals change no observation, accounting, start, stage, or
+result state.

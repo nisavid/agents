@@ -231,6 +231,8 @@ The exact v1 body identities are:
 | Recovery fence observation | `hindsight-postgresql-recovery-fence-observation` | `1` |
 | Recovery advancement observation | `hindsight-postgresql-recovery-advancement-observation` | `1` |
 | Recovery unproven observation | `hindsight-postgresql-recovery-unproven-observation` | `1` |
+| Deployment admission stimulus | `hindsight-postgresql-deployment-admission-stimulus` | `1` |
+| Expected deployment refusal | `hindsight-postgresql-expected-deployment-refusal` | `1` |
 
 Every object below has exactly the listed keys. Every key is required. Unknown
 keys and `null` are invalid. `Digest` is 64 lowercase hexadecimal SHA-256,
@@ -303,7 +305,7 @@ mutation image or restore payload.
 `ClaimId` matches `^JAC-[A-Z]{2,3}-[0-9]{2}$`. `FieldName` matches
 `^[a-z][a-z0-9_]{0,127}$`. `OracleId` is exactly one of `OR-TRACE`, `OR-ID`,
 `OR-PFX`, `OR-NEXT`, `OR-TIME`, `OR-TGT`, `OR-LIN`, `OR-FENCE`, `OR-EVID`,
-`OR-EVAL`, `OR-LEG`, `OR-ACL`, `OR-CAP`, or `OR-PHY`.
+`OR-EVAL`, `OR-LEG`, `OR-ACL`, `OR-CAP`, `OR-PHY`, or `OR-DEP`.
 `OracleEnumToken` matches `^[A-Z][A-Z0-9_]{0,127}$`; an optional enum uses
 that exact string or the literal `"NONE"`.
 
@@ -314,6 +316,12 @@ EvidenceRef := {
   "body_digest": Digest,
   "contract_kind": ContractId,
   "contract_version": SafeInteger
+}
+
+EvidenceIdentityEvidenceRef := {
+  "body_digest": Digest,
+  "contract_kind": "hindsight-postgresql-evidence-identity",
+  "contract_version": 1
 }
 ```
 
@@ -1548,13 +1556,12 @@ OperationWorkReservation := {
   "work_class": "J" | "P" | "R" | "M" | "V" | "RECONCILIATION"
 }
 
-TransactionIdentity := {
-  "adapter_incarnation_id": Id,
+NonMutationTransactionIdentity := {
   "aggregate_identity": OperationWorkAggregateIdentity,
   "kind": "hindsight-postgresql-transaction-identity",
   "plan": EvidenceRef,
   "schema_version": 1,
-  "stage": "J" | "P" | "R" | "M" | "V" | "RECONCILIATION",
+  "stage": "J" | "P" | "R" | "V" | "RECONCILIATION",
   "target_database_identity": EvidenceRef,
   "transaction_identity_id": Id,
   "transaction_mode": "STAGE_EFFECT" | "VERIFICATION" |
@@ -1564,8 +1571,24 @@ TransactionIdentity := {
   "work_identity_digest": Digest
 }
 
-OperationWorkStart := {
+MutationTransactionIdentity := {
   "adapter_incarnation_id": Id,
+  "aggregate_identity": OperationWorkAggregateIdentity,
+  "kind": "hindsight-postgresql-transaction-identity",
+  "plan": EvidenceRef,
+  "schema_version": 1,
+  "stage": "M",
+  "target_database_identity": EvidenceRef,
+  "transaction_identity_id": Id,
+  "transaction_mode": "STAGE_EFFECT",
+  "work_identity": StageAttemptWorkIdentity,
+  "work_identity_digest": Digest
+}
+
+TransactionIdentity := NonMutationTransactionIdentity |
+                       MutationTransactionIdentity
+
+NonMutationOperationWorkStart := {
   "kind": "hindsight-postgresql-operation-work-start",
   "reservation": EvidenceRef,
   "schema_version": 1,
@@ -1575,12 +1598,35 @@ OperationWorkStart := {
   "work_identity_digest": Digest
 }
 
+MutationOperationWorkStart := {
+  "adapter_incarnation_id": Id,
+  "kind": "hindsight-postgresql-operation-work-start",
+  "reservation": EvidenceRef,
+  "schema_version": 1,
+  "start_nonce": Id,
+  "transaction_identity": EvidenceRef,
+  "work_identity": StageAttemptWorkIdentity,
+  "work_identity_digest": Digest
+}
+
+OperationWorkStart := NonMutationOperationWorkStart |
+                      MutationOperationWorkStart
+
+The `TransactionIdentity` branch is selected by its literal `stage`. The
+`OperationWorkStart` branch is selected by its resolved transaction identity.
+The mutation branches require `stage=M`, an AW04 work binding, and the same
+`adapter_incarnation_id` in both bodies. That ID is the authenticated IA11
+session-incarnation witness. Every J, P, R, V, and RECONCILIATION branch omits
+the field from both complete bodies; adding it is an extra-field failure, and
+omitting it from either M body is a missing-field failure.
+
 OperationWorkCommittedResult := {
   "kind": "hindsight-postgresql-operation-work-committed-result",
   "plan": EvidenceRef,
   "reservation": EvidenceRef,
   "result": EvidenceRef,
-  "result_kind": "J" | "P" | "R_VALID" | "R_LATE" | "M" | "V" |
+  "result_kind": "J" | "P" | "PRE_STAGE_EXPIRY_OBSERVATION" |
+                 "R_VALID" | "R_LATE" | "M" | "V" |
                  "CONCLUSIVE_NONCOMMIT" |
                  "TRANSACTION_RESOLUTION_OUTCOME" |
                  "AMBIGUITY_QUERY_OUTCOME" |
@@ -2018,6 +2064,8 @@ PostgreSQL configuration and rederives the same endpoint. A directory alone,
 an address derived from the configured path instead of the bound resolved
 path, an alternate path spelling, or any additional, missing, reordered, or
 changed directory is unsupported rather than an equivalent endpoint.
+`configured_path` and `resolved_path` may be equal in a valid profile; the
+endpoint address still unconditionally equals the resolved-path construction.
 Every non-Unix endpoint has `unix_socket_directory="NONE"`; it cannot retain a
 directory binding while selecting another transport.
 
@@ -2210,7 +2258,9 @@ policy, matrix, failure, and candidate projection positions name
 `OracleProjection/v1`. A deployment policy's `allowed_support_profiles` name
 only `SupportProfile/v1`, and its `target_database_identities` name only
 `EvidenceIdentity/v1` with `TARGET_DATABASE`.
-`FailureEvidence.source_identity` names `EvidenceIdentity/v1`. Verification
+`DeploymentAdmissionStimulus.failure_source_identity` and
+`FailureEvidence.source_identity` each name exact `EvidenceIdentity/v1`; a
+matrix refusal requires those two references to be byte-identical. Verification
 and recovery failure evidence also names `FailureEvidence/v1`.
 
 `RoleGrantSet/v1` and `WriterInventory/v1` name the exact target database and
@@ -2416,24 +2466,49 @@ identity for a retry, and derives `work_identity_digest` and
 successor-canonical bytes including the LF. It reads only the immutable result
 key `(plan, work_identity_digest)`. `COMMITTED_REPLAY` is valid only when
 `committed_result` resolves the byte-identical request, reservation, start,
-transaction identity, work identity, and typed result. The interface returns
-that existing result and performs no reservation, charge, observation, clock
-sample, dispatch, or write. `UNRESOLVED` requires
+transaction identity, work identity, and typed result. Readback dispatches
+first by `committed_result.result_kind` and that exact typed result body, then
+checks that the selected close is permitted by the immutable work identity.
+`RECOVERY_OBSERVATION` requires the complete BS099→BS125/RW10→same-
+transaction-stage chain and a stage-producing `RECOVERY/ADVANCE_STAGE`
+identity. `PRE_STAGE_EXPIRY_OBSERVATION` requires the exact BS108 J/P body,
+including a stage matching the J/P work identity, and forbids a J/P stage,
+BS125/RW10, prefix change, or any other result carrier even when the immutable
+identity uses `RECOVERY/ADVANCE_STAGE`. Every other direct result likewise
+must match its exact typed-body and identity branch. A missing or extra chain
+member, a result-kind/body mismatch, or an identity-inconsistent close is a
+conflict, not unresolved work. The interface returns the existing complete
+result and performs no reservation, charge, observation, clock sample,
+dispatch, or write. `UNRESOLVED` requires
 `committed_result="NONE"` and authorizes no work; it only permits the exact same
 request bytes to enter the second boundary. A malformed request, changed body
 under one digest, or result conflict fails closed without a preflight-result
 body.
 
-Second, only `UNRESOLVED` enters one protected reservation transaction. It
-locks the accounting row, request body, and exact limit bodies; requires the
-request attempt ordinal to equal the still-current checked-next ordinal;
-recomputes both digests; checks every resulting counter and cumulative charge
-with unbounded arithmetic and in-range encoded results; and either commits one
+Second, FW02 handles `UNRESOLVED` inside one protected reservation transaction.
+It derives the authenticated caller, immutable work identity, and invocation
+without reading or reconstructing O16 state. FW02 is the protected entrypoint.
+After it enters, it acquires every applicable rank-1 route/schema dependency
+and every rank-2 authority, plan, policy, attestation, evidence, clock,
+deadline, and limit dependency. Candidate AW04 then invokes O16-owned IA11
+once to obtain a fresh typed admission result and rank-3 current
+activation/session locks. IA11 holds those locks through the outer FW02 commit
+or rollback. Every admission denial rolls back before a request, refusal,
+reservation, observation, accounting, start, stage, or result effect. Only
+after the complete FW02/FW03 matrix row succeeds does FW02 take rank-5 locks
+on the accounting, request, reservation, and work-slot rows. It then requires
+the request attempt ordinal to equal the still-current checked-next ordinal,
+recomputes both digests, and checks every resulting counter and cumulative charge with
+unbounded arithmetic and in-range encoded results. It then either commits one
 reservation plus the complete accounting advance or commits one separately
 keyed refusal and no accounting change. A successful reservation copies the
-exact request reference and work identity, and `work_class` is derived from
-the identity union member. It commits before attempted work. A later abort,
-timeout, lost acknowledgement, or caller rollback never refunds it.
+exact request and work identity; `work_class` is derived from the admitted
+identity union member, never supplied by the caller. The same atomic insert
+stores the complete protected `OperationWorkAdmission` projection with the
+request, whether the admitted branch creates a refusal or a reservation. It
+commits before work.
+A later abort, timeout, lost acknowledgement, or caller rollback never refunds
+it.
 
 When reservation cannot commit because the attempt, row, elapsed, or
 reconciliation ceiling is exhausted; checked arithmetic cannot produce an
@@ -2546,12 +2621,31 @@ ambiguity-query, and `TRANSACTION` subject all use literal
 and remain within the same finite reconciliation counters and duration.
 
 Each reservation has one protected state slot, initially `RESERVED`. The only
-start transition locks the reservation and accounting row, rederives and
-compares the complete request, work identity, and digest, and atomically
-inserts one `TransactionIdentity/v1`, the unique `OperationWorkStart/v1`
-marker, and the `STARTED` state. The transaction identity copies the plan,
-aggregate, target, complete work identity and digest, authenticated adapter
-incarnation, derived stage, and exact transaction mode. Its server-generated
+start transition first rederives the authenticated caller, complete request,
+work identity, digest, and candidate admission row without reading or
+reconstructing O16 state. FW03 is the protected entrypoint. The issue-107
+proposal form accepts only the reservation and no incarnation proof; the
+accepted-source interface at revision
+`90108b516f5a1c460980a93670348f6e228124f2` retains its incarnation-proof
+parameter. After proposed FW03 enters, it takes every applicable rank-1
+route/schema dependency and every rank-2 authority, plan, policy, attestation,
+evidence, clock, deadline, and limit dependency. Candidate AW04 then invokes
+O16-owned IA11 once before rank 5; IA11 holds its rank-3 current
+activation/session locks through the outer FW03 commit or rollback. FW03
+does not give IA11 RW01 access or a stored-equality decision. After IA11
+returns, FW03 takes the rank-5 RW01, reservation, accounting, and work-slot
+locks, validates the durable chain, and compares the fresh projection with the
+immutable admission projection stored with the request. It then atomically
+inserts one
+`TransactionIdentity/v1`, the unique `OperationWorkStart/v1` marker, and the
+`STARTED` state. A denial writes nothing and preserves the durable state:
+pre-start denial leaves `RESERVED`, while denial of an already-started repeat
+leaves `STARTED`. The transaction identity copies the plan, aggregate, target,
+complete work identity and digest, derived stage, and exact transaction mode.
+For AW04 only, proposed FW03 copies `adapter_incarnation_id` from the fresh typed IA11
+result into both the transaction identity and start; the proposal accepts no
+incarnation proof or override. Every J, P, R, V, and RECONCILIATION start is
+complete without IA11 and omits that field from both bodies. Its server-generated
 `transaction_identity_id` is unique; its stable key is
 `(plan, work_identity_digest)`. The start's `transaction_identity` names those
 exact bytes, while its reservation, work identity, and digest equal the
@@ -2569,13 +2663,42 @@ attempt while the original slot remains `STARTED`.
 
 The ordinary result transition locks the `STARTED` reservation, its exact
 start and transaction identity, and the protected result key
-`(plan, work_identity_digest)`. A `FORWARD` stage identity commits its exact
-stage body; a `FORWARD` or `RECOVERY/VERIFY_STAGE` verification identity
-commits its exact verification body. A `RECOVERY/ADVANCE_STAGE` identity
-instead commits exactly one `RecoveryAdvancementObservation/v1` as the
-reservation's sole result. That observation's `result_body` names the exact
-newly committed stage body, and both bodies are inserted in the same
-transaction; no second committed-result row may point directly to the stage.
+`(plan, work_identity_digest)`. A protected J/P/R/M entrypoint derives its
+result from protected operands inside the outer transaction. Its close
+predicate is outcome-aware:
+
+```text
+RECOVERY_STAGE_CLOSE :=
+  invocation = RECOVERY/ADVANCE_STAGE
+  and protected_outcome in
+    {J_CURRENT, P_CURRENT, R_VALID, R_LATE, M_CREATED}
+
+DIRECT_CLOSE := every other admitted close
+```
+
+`DIRECT_CLOSE` expressly includes J/P `LATE` under either invocation mode and
+every V result. Equality with the protected J/P expiry is `LATE`. A forward
+stage-producing result commits its exact stage body directly. A `FORWARD` or
+`RECOVERY/VERIFY_STAGE` verification identity commits its exact verification
+body directly; verification never uses an advancement observation.
+
+For `RECOVERY_STAGE_CLOSE`, the stage-specific outer entrypoint first stages
+the exact stage body from protected operands. Owner-internal `FW04` then derives the one
+`RecoveryAdvancementObservation/v1`, materializes its reservation,
+transaction-identity, result-body, and applicable reconciliation-subject
+projections, writes the sole `OperationWorkCommittedResult/v1` with
+`result_kind=RECOVERY_OBSERVATION` and `result` naming only that
+advancement observation, and closes the work slot. The stage body, advancement
+body, both protected projections, committed-result mapping, and terminal slot
+change are one atomic group. The observation's `result_body` names the stage
+created by that same transaction; no committed-result row points directly to
+the recovered stage, and no subset may commit. A recovered late J/P instead
+uses `DIRECT_CLOSE`: the outer FJ01/FJ02 transaction atomically commits only
+RP03/BS108, BS099/RW06 with
+`result_kind=PRE_STAGE_EXPIRY_OBSERVATION`, and RS15. It creates no J/P stage,
+BS125/RW10, authority, refund, replacement entitlement, deadline renewal, or
+prefix change. After an uncertain commit, an absent authoritative read remains
+ambiguous until separately accepted conclusive-noncommit evidence exists.
 When a transaction-resolution or ambiguity-query identity obtains a conclusive
 answer that the original transaction committed, it commits, respectively, one
 `OperationWorkTransactionResolutionOutcome/v1` or
@@ -3072,13 +3195,147 @@ CanonicalClaimRegistry := {
   "tier": "DESIGN" | "IMPLEMENTATION"
 }
 
+DeploymentStimulusTopologyValue := {
+  "topology_value": DeploymentTopologyBinding,
+  "value_kind": "DEPLOYMENT_TOPOLOGY_BINDING"
+}
+
+DeploymentStimulusEndpointValue := {
+  "endpoint_value": PostgresqlEndpointBinding,
+  "value_kind": "POSTGRESQL_ENDPOINT_BINDING"
+}
+
+ControllerHostBindingEvidenceRef := {
+  "body_digest": Digest,
+  "contract_kind": "hindsight-postgresql-controller-host-binding",
+  "contract_version": 1
+}
+
+PostgresqlHostBindingEvidenceRef := {
+  "body_digest": Digest,
+  "contract_kind": "hindsight-postgresql-host-binding",
+  "contract_version": 1
+}
+
+DeploymentStimulusControllerHostReferenceValue := {
+  "reference_value": ControllerHostBindingEvidenceRef,
+  "value_kind": "CONTROLLER_HOST_BINDING_REF"
+}
+
+DeploymentStimulusPostgresqlHostReferenceValue := {
+  "reference_value": PostgresqlHostBindingEvidenceRef,
+  "value_kind": "POSTGRESQL_HOST_BINDING_REF"
+}
+
+DeploymentStimulusSocketDirectoryValue := {
+  "socket_directory_value": PostgresqlUnixSocketDirectory,
+  "value_kind": "SOCKET_DIRECTORY"
+}
+
+DeploymentStimulusSocketDirectorySequenceValue := {
+  "socket_directory_sequence_value": sequence<PostgresqlUnixSocketDirectory>,
+  "value_kind": "SOCKET_DIRECTORY_SEQUENCE"
+}
+
+DeploymentStimulusConditionValue := {
+  "condition_value": "DIRECTORY_MISSING" | "DIRECTORY_NOT_DIRECTORY" |
+                     "DIRECTORY_SYMLINK_RETARGET" |
+                     "DIRECTORY_RESOLUTION_RACE",
+  "value_kind": "INJECTED_CONDITION"
+}
+
+DeploymentStimulusValue := DeploymentStimulusTopologyValue |
+                           DeploymentStimulusEndpointValue |
+                           DeploymentStimulusControllerHostReferenceValue |
+                           DeploymentStimulusPostgresqlHostReferenceValue |
+                           DeploymentStimulusSocketDirectoryValue |
+                           DeploymentStimulusSocketDirectorySequenceValue |
+                           DeploymentStimulusConditionValue
+
+DeploymentStimulusOperation := {
+  "operation": "REPLACE_DEPLOYMENT_TOPOLOGY" |
+               "REPLACE_POSTGRESQL_ENDPOINT" |
+               "REPLACE_LIVE_CONTROLLER_HOST_REF" |
+               "REPLACE_LIVE_POSTGRESQL_HOST_REF" |
+               "REPLACE_PROFILE_SOCKET_DIRECTORY_SEQUENCE" |
+               "REPLACE_LIVE_CONFIGURATION_SOCKET_DIRECTORY_SEQUENCE" |
+               "REPLACE_LIVE_PROJECTION_SOCKET_DIRECTORY_SEQUENCE" |
+               "REPLACE_LIVE_SOCKET_DIRECTORY_MEMBER" |
+               "REPLACE_OPEN_CONDITION" |
+               "REPLACE_REVALIDATION_CONDITION",
+  "replacement": DeploymentStimulusValue
+}
+
+DeploymentStimulusDefect := {
+  "defect_id": "NMR001" | "NMR002" | "NMR003" | "NMR004" |
+               "NMR005" | "NMR006" | "NMR007" | "NMR008" |
+               "NMR009" | "NMR010" | "NMR011" | "NMR012" |
+               "NMR013" | "NMR015" | "NMR017" | "NMR018" |
+               "NMR019" | "NMR020" | "NMR021" | "NMR022" |
+               "NMR023" | "NMR024" | "NMR025" | "NMR026" |
+               "NMR027" | "NMR028" | "NMR029" | "NMR030" |
+               "NMR031" | "NMR032" | "NMR033" | "NMR034",
+  "operation": DeploymentStimulusOperation
+}
+
+DeploymentAdmissionStimulus := {
+  "baseline_live_projection": EvidenceRef,
+  "case_id": ContractId,
+  "defects": sequence<DeploymentStimulusDefect>,
+  "failure_source_identity": EvidenceIdentityEvidenceRef,
+  "kind": "hindsight-postgresql-deployment-admission-stimulus",
+  "schema_version": 1,
+  "support_profile": EvidenceRef,
+  "target_database_identity": EvidenceIdentityEvidenceRef,
+  "target_surface_digest": Digest
+}
+
+ExpectedDeploymentFailure := {
+  "evidence": EvidenceRef,
+  "failure_code": DeploymentFailureCode,
+  "oracle_id": OracleId
+}
+
+ExpectedDeploymentRefusal := {
+  "candidate_projection": EvidenceRef,
+  "failures": sequence<ExpectedDeploymentFailure>,
+  "kind": "hindsight-postgresql-expected-deployment-refusal",
+  "schema_version": 1
+}
+
+DeploymentMatrixRowSelector := {
+  "candidate_projection": EvidenceRef,
+  "case_id": ContractId,
+  "cell_id": ContractId,
+  "expected_refusal": EvidenceRef | "NONE",
+  "row_position": PositiveSafeInteger,
+  "run_id": ContractId,
+  "stimulus": EvidenceRef,
+  "support_profile": EvidenceRef,
+  "target_database_identity": EvidenceRef,
+  "target_surface_digest": Digest
+}
+
+DeploymentPredicateNonApplicabilityProof := {
+  "predicate_id": "NMR029",
+  "proof_id": ContractId,
+  "reason": "CONFIGURED_PATH_EQUALS_RESOLVED_PATH",
+  "support_profile": EvidenceRef
+}
+
 CanonicalDeploymentMatrix := {
+  "acquisition_procedure": EvidenceRef,
+  "admission_tool": EvidenceRef,
   "claim_definitions": sequence<CanonicalClaimDefinitionEvidenceRef>,
   "claim_predicates": sequence<CanonicalClaimPredicateEvidenceRef>,
   "deployment_policy": EvidenceRef,
   "kind": "hindsight-postgresql-canonical-deployment-matrix",
+  "limits": EvidenceRef,
+  "non_applicability_proofs":
+    sequence<DeploymentPredicateNonApplicabilityProof>,
   "planned_runs": sequence<CampaignRunRequirement>,
   "required_claim_ids": sequence<ClaimId>,
+  "row_selectors": sequence<DeploymentMatrixRowSelector>,
   "schema_version": 1,
   "support_profiles": sequence<EvidenceRef>,
   "target_database_identities": sequence<EvidenceRef>,
@@ -4204,43 +4461,48 @@ HistoricalCorpusPlanAcceptance := {
   "valid_until_unix_ns": UInt128String
 }
 
+DeploymentFailureCode := "UNKNOWN_CONTRACT" |
+                         "DEPLOYMENT_POLICY_MISMATCH" |
+                         "DEPLOYMENT_POLICY_NONCURRENT" |
+                         "DEPLOYMENT_POLICY_REVOKED" |
+                         "DEPLOYMENT_POLICY_EXPIRED" |
+                         "DEPLOYMENT_PARTITION_INVALID" |
+                         "DEPLOYMENT_EVIDENCE_OPEN" |
+                         "DEPLOYMENT_EVIDENCE_FAIL" |
+                         "DEPLOYMENT_EVIDENCE_STALE" |
+                         "DEPLOYMENT_EVIDENCE_SUPERSEDED" |
+                         "DEPLOYMENT_EVIDENCE_INVALIDATED" |
+                         "DEPLOYMENT_EVIDENCE_ACQUISITION_INVALID" |
+                         "INVALID_QUALIFICATION_RECEIPT" |
+                         "EXPIRED_QUALIFICATION_RECEIPT" |
+                         "QUALIFICATION_RESULT_NOT_PASS" |
+                         "PROFILE_MISMATCH" |
+                         "QUALIFICATION_EVIDENCE_INVALIDATED" |
+                         "QUALIFICATION_EVIDENCE_STALE" |
+                         "QUALIFICATION_CAMPAIGN_SUPERSEDED" |
+                         "PLAN_MISMATCH" | "PLAN_ACCEPTANCE_MISMATCH" |
+                         "RELEASE_MISMATCH" | "CLOCK_EVIDENCE_STALE" |
+                         "STORAGE_EVIDENCE_STALE" |
+                         "ROLE_GRANT_SET_MISMATCH" |
+                         "ROLE_INVENTORY_INCOMPLETE" |
+                         "WRITER_INVENTORY_MISMATCH" |
+                         "BOOT_CONFIGURATION_DRIFT" |
+                         "BOOT_IDENTITY_CHANGED" |
+                         "CONTROLLER_HOST_MISMATCH" |
+                         "POSTGRESQL_HOST_MISMATCH" |
+                         "ENDPOINT_IDENTITY_CHANGED" | "ENDPOINT_DRIFT" |
+                         "ENDPOINT_TOPOLOGY_MISMATCH" |
+                         "CLOSURE_POLICY_MISMATCH" |
+                         "CLOSURE_GUARD_UNSUPPORTED" |
+                         "REMOTE_POSTGRESQL_UNSUPPORTED" |
+                         "MANAGED_POSTGRESQL_UNSUPPORTED" |
+                         "FENCE_RESULT_INVALID" |
+                         "PROFILE_UNQUALIFIED" | "HEALTH_CHECK_FAILED" |
+                         "ATTESTATION_CONSTRUCTION_INVALID"
+
 DeploymentFailure := {
   "evidence": EvidenceRef,
-  "failure_code": "UNKNOWN_CONTRACT" | "DEPLOYMENT_POLICY_MISMATCH" |
-                  "DEPLOYMENT_POLICY_NONCURRENT" |
-                  "DEPLOYMENT_POLICY_REVOKED" |
-                  "DEPLOYMENT_POLICY_EXPIRED" |
-                  "DEPLOYMENT_PARTITION_INVALID" |
-                  "DEPLOYMENT_EVIDENCE_OPEN" |
-                  "DEPLOYMENT_EVIDENCE_FAIL" |
-                  "DEPLOYMENT_EVIDENCE_STALE" |
-                  "DEPLOYMENT_EVIDENCE_SUPERSEDED" |
-                  "DEPLOYMENT_EVIDENCE_INVALIDATED" |
-                  "DEPLOYMENT_EVIDENCE_ACQUISITION_INVALID" |
-                  "INVALID_QUALIFICATION_RECEIPT" |
-                  "EXPIRED_QUALIFICATION_RECEIPT" |
-                  "QUALIFICATION_RESULT_NOT_PASS" | "PROFILE_MISMATCH" |
-                  "QUALIFICATION_EVIDENCE_INVALIDATED" |
-                  "QUALIFICATION_EVIDENCE_STALE" |
-                  "QUALIFICATION_CAMPAIGN_SUPERSEDED" |
-                  "PLAN_MISMATCH" | "PLAN_ACCEPTANCE_MISMATCH" |
-                  "RELEASE_MISMATCH" | "CLOCK_EVIDENCE_STALE" |
-                  "STORAGE_EVIDENCE_STALE" |
-                  "ROLE_GRANT_SET_MISMATCH" |
-                  "ROLE_INVENTORY_INCOMPLETE" |
-                  "WRITER_INVENTORY_MISMATCH" |
-                  "BOOT_CONFIGURATION_DRIFT" | "BOOT_IDENTITY_CHANGED" |
-                  "CONTROLLER_HOST_MISMATCH" |
-                  "POSTGRESQL_HOST_MISMATCH" |
-                  "ENDPOINT_IDENTITY_CHANGED" | "ENDPOINT_DRIFT" |
-                  "ENDPOINT_TOPOLOGY_MISMATCH" |
-                  "CLOSURE_POLICY_MISMATCH" |
-                  "CLOSURE_GUARD_UNSUPPORTED" |
-                  "REMOTE_POSTGRESQL_UNSUPPORTED" |
-                  "MANAGED_POSTGRESQL_UNSUPPORTED" |
-                  "FENCE_RESULT_INVALID" |
-                  "PROFILE_UNQUALIFIED" | "HEALTH_CHECK_FAILED" |
-                  "ATTESTATION_CONSTRUCTION_INVALID",
+  "failure_code": DeploymentFailureCode,
   "oracle_id": OracleId
 }
 
@@ -4290,6 +4552,17 @@ the body and independently expands its complete `planned_runs`; a table in this
 document, code constant, caller-projected list, or digest without the matching
 typed body cannot supply the expansion.
 
+For deployment runs, the acyclic governing identity is the enclosing accepted
+`EvidenceCampaignPlan/v1` basis, not a member of an `OR-DEP` projection. If
+that basis names `ref(M)`, then its policy equals `M.deployment_policy`, the
+plan's `planned_runs` equals `M.planned_runs` byte for byte, and each selected
+run and row selector is the same-position member of `M`. The validator starts
+at the plan basis and follows its one-way edge to `M`; `M` may contain the
+expected projection, but that projection contains no matrix, plan, campaign,
+or result reference. A missing basis, a matrix or policy mismatch, a
+differently selected row, or any reverse projection edge rejects source
+closure.
+
 The claim-registry body has one literal `DESIGN` or `IMPLEMENTATION` tier. Its
 claim sequence is the complete ASCII-ordered required claim set for that tier;
 `claim_definitions` and `claim_predicates` have the same cardinality and order.
@@ -4315,20 +4588,340 @@ With `PROFILE_INDEPENDENT`, `support_profiles` is empty; with
 `EXACT_PROFILES`, it is nonempty and ordered by canonical reference bytes. With
 `TARGET_INDEPENDENT`, both target sequences are empty; with `EXACT_TARGETS`,
 both are nonempty and ordered by canonical identity-reference bytes and
-target-surface digest. The deployment matrix copies the policy's complete
-ordered required claims, their canonical definitions and `DEPLOYMENT`
-predicates, support profiles, target identities, and target surfaces, and
-every run has literal `DEPLOYMENT`. Each deployment stimulus prebinds exactly
-one admitted profile/target/surface tuple. The matrix runs sort by profile
-reference, target reference, target-surface digest, ASCII `cell_id`, and ASCII
-`run_id`; a claim-registry body sorts by ASCII `run_id`. Within every run, the
-fields have the displayed `CampaignRunRequirement` types, `claim_ids` is ASCII
-ascending, the definition and predicate sequences align one for one, and
-`oracles` is in registry `OracleId` order. These rules make the two plan
-families independently and exactly expandable. A missing body, changed
-obligation, predicate, run, oracle, definition, expected projection, order, or
-digest rejects the registry or matrix before campaign acceptance.
+target-surface digest. The deployment matrix copies the policy's complete ordered required claims,
+their canonical definitions and `DEPLOYMENT` predicates, support profiles,
+target identities, and target surfaces. Its `acquisition_procedure`,
+`admission_tool`, and `limits` resolve one exact procedure, tool, and limits
+body. Every run has literal `DEPLOYMENT`, `EV-DEP`, the complete
+`required_claim_ids`, those aligned definitions and predicates, the matrix's
+tool/procedure/limits, `conformance_prestate="NONE"`,
+`reader_execution="NONE"`, and exactly `OR-ID`, `OR-TIME`, `OR-FENCE`,
+`OR-ACL`, and `OR-DEP` requirements in canonical oracle-registry order.
 
+The three scope sequences are nonempty and duplicate-free. Selector
+candidate-projection references are also duplicate-free. The matrix contains
+the exact Cartesian product of support-profile, target-database, and
+target-surface members. For one-based positions `p`, `t`, and `s` in those
+source sequences, each tuple uses this exact 32-member `DEFECT_ORDER`:
+
+```text
+NMR019, NMR020, NMR021, NMR022, NMR023,
+NMR034, NMR033, NMR032,
+NMR030, NMR031,
+NMR001, NMR002, NMR003, NMR004, NMR005,
+NMR017, NMR018,
+NMR013,
+NMR006, NMR007, NMR008, NMR009, NMR010, NMR011, NMR012,
+NMR015,
+NMR024, NMR025, NMR026, NMR027,
+NMR028, NMR029
+```
+
+The registry is canonical even when one predicate cannot produce bytes for a
+particular profile. `NMR029_APPLICABLE(profile)` holds exactly when the sole
+configured socket-directory member has
+`configured_path != resolved_path`. If it holds, the configured-path socket
+address differs from the required resolved-path socket address and NMR029 has
+its exact address-substitution case. If the paths are equal, the matrix emits
+one `DeploymentPredicateNonApplicabilityProof` for that profile and no NMR029
+row. The validator independently resolves the profile, port, and both address
+constructions and requires
+`socket_address(configured_path,port) =
+socket_address(resolved_path,port)`. The proof ID is
+`"proof-nmr029-equal-path-p-" || p`, where `p` is the profile's one-based
+canonical position. It is target- and surface-independent and discharges the
+NMR029 obligation for every tuple under that exact profile without excluding
+the profile or weakening the unconditional production resolved-path-address
+requirement.
+
+The exact constructible adjacent-precedence sequence is:
+
+```text
+NMR019+NMR020, NMR020+NMR021, NMR021+NMR022, NMR022+NMR023,
+NMR034+NMR033, NMR033+NMR032, NMR032+NMR030,
+NMR031+NMR001, NMR001+NMR002, NMR003+NMR004, NMR004+NMR005,
+NMR005+NMR017, NMR017+NMR018, NMR018+NMR013, NMR013+NMR006,
+NMR006+NMR007, NMR007+NMR008, NMR008+NMR009, NMR009+NMR010,
+NMR010+NMR011, NMR011+NMR012, NMR012+NMR015, NMR015+NMR024,
+NMR025+NMR026, NMR027+NMR028
+```
+
+The six omitted adjacent pairs are closed incompatibility certificates, not
+test cases: `NMR023+NMR034` cannot make the malformed member be two exact
+copies of the configured member; retaining the configured member introduces
+NMR033, while omitting it introduces NMR032. `NMR030+NMR031` requires one
+sequence to be both empty and have at
+least two members; `NMR002+NMR003` requires one transport to have two enum
+values; `NMR024+NMR025` requires one open result to be both missing and a
+nondirectory; `NMR026+NMR027` requires one
+revalidation to end in both retarget and race; and `NMR028+NMR029` requires
+one address scalar to have two distinct exact constructions. The matrix
+validator proves those contradictions from the typed operation and candidate
+invariants. It rejects a selector that carries one of those pairs; no skipped
+pair consumes a run or masquerades as precedence evidence.
+
+The canonical case slots are:
+
+```text
+case-000-accept
+case-001-nmr019 through case-031-nmr028, in DEFECT_ORDER
+case-032-nmr029, only when NMR029_APPLICABLE(profile)
+case-033-nmr019-nmr020 through case-057-nmr027-nmr028,
+  in constructible-adjacent-precedence order
+```
+
+The ranges abbreviate deterministic literal expansion from the two displayed
+closed sequences. Case 000 has no defect. Cases 001–032 pair their one-based
+registry slot with the corresponding `DEFECT_ORDER` member, subject only to
+the NMR029 applicability rule. Cases 033–057 pair their registry slot with the
+corresponding displayed constructible pair. A case ID uses the lowercase
+defect IDs joined by one hyphen. A distinct-path profile has all 58 cases. An
+equal-path profile has the 57 applicable cases, omits only case 032, and has
+exactly its independently checked non-applicability proof. Padding, a dead
+case-032 row, or omission of the proof invalidates the matrix.
+
+Each selector's `cell_id` is
+`"dep-p-" || p || "-t-" || t || "-s-" || s || "-c-" || ddd`, where `p`,
+`t`, and `s` are shortest decimal and `ddd` is the three-digit canonical case
+slot. Its `run_id` is `cell_id || "-run-1"`. The selector's
+`row_position` is its one-based position after sorting by canonical
+support-profile reference bytes, canonical target-database reference bytes,
+target-surface digest, ASCII `cell_id`, and ASCII `run_id`. The aligned
+`planned_runs` member has exactly that cell and run ID. Consequently,
+
+```text
+defect_count = len(DEFECT_ORDER) = 32
+precedence_case_count = len(CONSTRUCTIBLE_ADJACENT_PRECEDENCE) = 25
+applicable_defect_count(profile) =
+  32 when NMR029_APPLICABLE(profile), otherwise 31
+cases_per_tuple(profile) =
+  1 + applicable_defect_count(profile) + precedence_case_count
+  = 58 when paths differ, otherwise 57
+non_applicability_proof_count(profile) =
+  0 when paths differ, otherwise 1
+len(row_selectors) = len(planned_runs)
+                   = sum(cases_per_tuple(profile)
+                         for profile in support_profiles)
+                       * len(target_database_identities)
+                       * len(target_surface_digests)
+row_selectors[i].row_position = i + 1
+row_selectors[i].run_id = planned_runs[i].run_id
+row_selectors[i].stimulus = planned_runs[i].stimulus
+```
+
+All arithmetic is checked and the resulting counts must be `SafeInteger`.
+The matrix's `non_applicability_proofs` sequence contains exactly the proofs
+derived above, ordered by canonical profile position. The counts are
+consequences of the canonical predicate, pair, and applicability registries;
+they do not admit padding, aliases, dead rows, implementation-selected cases,
+or profile exclusion.
+
+Every selector's stimulus resolves exact
+`DeploymentAdmissionStimulus/v1`; its baseline resolves exact
+`MacosLocalPostgresqlLiveProjection/v1`, its profile resolves exact
+`SupportProfile/v1`, and its target and `failure_source_identity` each
+resolve exact `EvidenceIdentity/v1` with
+`identity_class=TARGET_DATABASE`. Both identity references equal each other
+and the selector and matrix target byte for byte. Those tuple members equal
+the selector and matrix tuple. The baseline must pass the clean admission
+projection before defect application.
+
+The deployment runner constructs one transient typed graph `T` by resolving
+the profile's controller-host, PostgreSQL-host, endpoint, topology, and
+PostgreSQL-configuration bodies; the baseline live projection and the
+PostgreSQL configuration it names; the target identity; and the opened
+socket-directory observation. `T` contains distinct
+`profile_postgresql_configuration` and
+`live_postgresql_configuration` nodes even when their clean bytes are equal.
+It also contains one `open_condition=OPENED_DIRECTORY` and one
+`revalidation_condition=STABLE`. References between transient nodes are
+rewired to their corresponding candidate node after all operations. Derived
+endpoint address is recomputed from a replaced resolved directory for NMR008
+and NMR010; only NMR028 and NMR029 deliberately violate address construction.
+These mechanical rebinds are not additional defects. No operation edits or replaces the
+immutable baseline, profile, endpoint, topology, configuration, identity, or
+live-projection body.
+
+Each `DeploymentStimulusOperation.operation` fixes both its target and its
+permitted value arm: `REPLACE_DEPLOYMENT_TOPOLOGY` targets
+`deployment_topology` and requires `DEPLOYMENT_TOPOLOGY_BINDING`;
+`REPLACE_POSTGRESQL_ENDPOINT` targets `postgresql_endpoint` and requires
+`POSTGRESQL_ENDPOINT_BINDING`; `REPLACE_LIVE_CONTROLLER_HOST_REF` targets the live-projection controller-host
+reference and requires `CONTROLLER_HOST_BINDING_REF`;
+`REPLACE_LIVE_POSTGRESQL_HOST_REF` targets the live-projection PostgreSQL-host
+reference and requires `POSTGRESQL_HOST_BINDING_REF`; the three `*_SOCKET_DIRECTORY_SEQUENCE` literals target,
+respectively, the profile configuration, live configuration, and live
+projection sequence and require `SOCKET_DIRECTORY_SEQUENCE`;
+`REPLACE_LIVE_SOCKET_DIRECTORY_MEMBER` targets live member zero and requires
+`SOCKET_DIRECTORY`; and the two condition literals target the named
+condition and require `INJECTED_CONDITION`. The table's operation phrase
+selects that one literal. A different target, arm, or path is not another
+encoding of the same case.
+
+The exact operation target, value arm, final-graph predicate, and selected
+failure code are:
+
+| Defect | Exact operation on `T` | Required value arm and final-graph predicate | Failure code |
+| --- | --- | --- | --- |
+| `NMR001` | replace `deployment_topology` | `DEPLOYMENT_TOPOLOGY_BINDING`; locality is `REMOTE` | `REMOTE_POSTGRESQL_UNSUPPORTED` |
+| `NMR002` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; transport `TCP_REMOTE` with its internally consistent non-socket address, port, and `unix_socket_directory="NONE"` | `REMOTE_POSTGRESQL_UNSUPPORTED` |
+| `NMR003` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; transport `TCP_LITERAL_LOOPBACK` with its internally consistent literal-loopback address, positive port, and `unix_socket_directory="NONE"` | `REMOTE_POSTGRESQL_UNSUPPORTED` |
+| `NMR004` | replace `deployment_topology` | `DEPLOYMENT_TOPOLOGY_BINDING`; locality is `MANAGED` | `MANAGED_POSTGRESQL_UNSUPPORTED` |
+| `NMR005` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; transport `MANAGED_SERVICE` with its internally consistent non-socket endpoint members | `MANAGED_POSTGRESQL_UNSUPPORTED` |
+| `NMR006` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; `endpoint_identity` differs from the clean endpoint identity | `ENDPOINT_DRIFT` |
+| `NMR007` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; `target_database_identity` differs from the clean target identity | `ENDPOINT_DRIFT` |
+| `NMR008` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; socket-directory identity differs and address is recomputed from that replacement | `ENDPOINT_DRIFT` |
+| `NMR009` | replace `live_projection.unix_socket_directories[0]` | `SOCKET_DIRECTORY`; normalized absolute `configured_path` differs from clean | `ENDPOINT_DRIFT` |
+| `NMR010` | replace `live_projection.unix_socket_directories[0]` | `SOCKET_DIRECTORY`; normalized absolute `resolved_path` differs from clean and the dependent endpoint address is recomputed from it | `ENDPOINT_DRIFT` |
+| `NMR011` | replace `live_projection.unix_socket_directories[0]` | `SOCKET_DIRECTORY`; the UInt128-string `directory_device_id` differs from clean | `ENDPOINT_DRIFT` |
+| `NMR012` | replace `live_projection.unix_socket_directories[0]` | `SOCKET_DIRECTORY`; the UInt128-string `directory_file_id` differs from clean | `ENDPOINT_DRIFT` |
+| `NMR013` | replace `live_postgresql_configuration.unix_socket_directories` | `SOCKET_DIRECTORY_SEQUENCE`; count differs from the clean live-configuration sequence | `ENDPOINT_TOPOLOGY_MISMATCH` |
+| `NMR015` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; the baseline Unix-socket endpoint's zero port is a positive `SafeInteger` | `ENDPOINT_DRIFT` |
+| `NMR017` | replace `live_projection.controller_host` | `CONTROLLER_HOST_BINDING_REF`; different exact `ControllerHostBinding/v1` reference | `CONTROLLER_HOST_MISMATCH` |
+| `NMR018` | replace `live_projection.postgresql_host` | `POSTGRESQL_HOST_BINDING_REF`; different exact `PostgresqlHostBinding/v1` reference | `POSTGRESQL_HOST_MISMATCH` |
+| `NMR019` | replace `live_projection.unix_socket_directories[0]` | `SOCKET_DIRECTORY`; `configured_path` is relative | `PROFILE_UNQUALIFIED` |
+| `NMR020` | replace the same directory member | `SOCKET_DIRECTORY`; `configured_path` has a repeated separator | `PROFILE_UNQUALIFIED` |
+| `NMR021` | replace the same directory member | `SOCKET_DIRECTORY`; `configured_path` has an embedded `.` component | `PROFILE_UNQUALIFIED` |
+| `NMR022` | replace the same directory member | `SOCKET_DIRECTORY`; `configured_path` has an embedded `..` component | `PROFILE_UNQUALIFIED` |
+| `NMR023` | replace the same directory member | `SOCKET_DIRECTORY`; `configured_path` has a non-root trailing separator | `PROFILE_UNQUALIFIED` |
+| `NMR024` | replace `open_condition` | `INJECTED_CONDITION=DIRECTORY_MISSING` | `ENDPOINT_DRIFT` |
+| `NMR025` | replace `open_condition` | `INJECTED_CONDITION=DIRECTORY_NOT_DIRECTORY` | `ENDPOINT_DRIFT` |
+| `NMR026` | replace `revalidation_condition` | `INJECTED_CONDITION=DIRECTORY_SYMLINK_RETARGET` | `ENDPOINT_DRIFT` |
+| `NMR027` | replace `revalidation_condition` | `INJECTED_CONDITION=DIRECTORY_RESOLUTION_RACE` | `ENDPOINT_DRIFT` |
+| `NMR028` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; `address` is the resolved directory without the socket filename and port | `ENDPOINT_DRIFT` |
+| `NMR029` | replace `postgresql_endpoint` | `POSTGRESQL_ENDPOINT_BINDING`; when `NMR029_APPLICABLE(profile)`, `address` is `socket_address(configured_path,port)` instead of the required `socket_address(resolved_path,port)` | `ENDPOINT_DRIFT` |
+| `NMR030` | replace `profile_postgresql_configuration.unix_socket_directories` | empty `SOCKET_DIRECTORY_SEQUENCE` | `PROFILE_UNQUALIFIED` |
+| `NMR031` | replace the same profile sequence | `SOCKET_DIRECTORY_SEQUENCE` with at least two distinct members | `PROFILE_UNQUALIFIED` |
+| `NMR032` | replace `live_projection.unix_socket_directories` | `SOCKET_DIRECTORY_SEQUENCE` omits the clean configured member `C` | `ENDPOINT_TOPOLOGY_MISMATCH` |
+| `NMR033` | replace the same live sequence | `SOCKET_DIRECTORY_SEQUENCE` contains a member `U` distinct from `C` | `ENDPOINT_TOPOLOGY_MISMATCH` |
+| `NMR034` | replace the same live sequence | `SOCKET_DIRECTORY_SEQUENCE` contains two exact copies of `C` | `ENDPOINT_TOPOLOGY_MISMATCH` |
+
+Every table row defines one final-graph predicate together with its registered
+operation target and typed value arm. Isolation is separate. A singleton must
+satisfy exactly its named predicate. A pair must satisfy exactly its named two
+predicates, with the earlier `DEFECT_ORDER` member selected as the expected
+failure. In either case every untargeted field and condition remains clean,
+except for exact candidate-reference rebinds and address recomputations required
+by a named replacement. Those mechanical changes do not instantiate another
+predicate. Every replacement must be well typed, canonical, and different from
+the clean source.
+
+For a pair on disjoint targets, both operations apply to the same clean `T`.
+For a pair on one target, both entries carry the same exact replacement value.
+For ancestor/descendant targets, one canonical structural merge is fixed
+before application: the parent replacement embeds the exact descendant
+replacement and both typed views resolve to that one final graph. There is no
+source-order or last-write-wins rule. Let `C` be the clean configured directory,
+`U` a canonical directory distinct from `C`, and a primed scalar or reference
+be a valid value distinct from clean. The following is the complete retained
+pair-witness registry:
+
+| Case and predicates | Concrete final graph | Why no other predicate holds |
+| --- | --- | --- |
+| `case-033-nmr019-nmr020` | The shared configured path is `var//run/postgresql`. | It is relative and has a repeated separator, with no `.`, `..`, or trailing separator. |
+| `case-034-nmr020-nmr021` | The shared configured path is `/var//./run/postgresql`. | It has a repeated separator and embedded `.`, with no `..`, trailing separator, or relative form. |
+| `case-035-nmr021-nmr022` | The shared configured path is `/var/./../run/postgresql`. | It has embedded `.` and `..`, with no repeated separator, trailing separator, or relative form. |
+| `case-036-nmr022-nmr023` | The shared configured path is `/var/../run/postgresql/`. | It has embedded `..` and a non-root trailing separator, with no repeated separator, embedded `.`, or relative form. |
+| `case-037-nmr034-nmr033` | The live sequence is exactly `[C,C,U]`. | `C` is present and duplicated, and exactly one distinct unconfigured member is present; omission is false. |
+| `case-038-nmr033-nmr032` | The live sequence is exactly `[U]`. | `C` is omitted, one unconfigured member is present, and no member is duplicated. |
+| `case-039-nmr032-nmr030` | The candidate profile sequence and live-projection sequence are both empty; the clean configured member remains the comparison anchor. | NMR030 empties only the profile sequence and NMR032 omits `C` only from the live projection; the live-configuration sequence and every other node remain clean. |
+| `case-040-nmr031-nmr001` | The profile sequence is `[C,U]`, and topology locality is `REMOTE`. | The two replacements are disjoint; the live sequences and endpoint remain clean, so no omission, addition, duplicate, or transport predicate is present. |
+| `case-041-nmr001-nmr002` | Topology locality is `REMOTE`, and the endpoint is an internally coherent `TCP_REMOTE` endpoint. | Neither replacement is managed, and all other topology and endpoint members remain clean. |
+| `case-042-nmr003-nmr004` | The endpoint is internally coherent `TCP_LITERAL_LOOPBACK`, and topology locality is `MANAGED`. | Transport is neither remote nor managed-service, and locality is not remote. |
+| `case-043-nmr004-nmr005` | Topology locality is `MANAGED`, and the endpoint is internally coherent `MANAGED_SERVICE`. | The two registered predicates hold without a remote or loopback transport. |
+| `case-044-nmr005-nmr017` | The endpoint is `MANAGED_SERVICE`, and the controller-host reference is `Hc'`. | Endpoint and host-reference replacements are disjoint; PostgreSQL-host and topology remain clean. |
+| `case-045-nmr017-nmr018` | Controller-host is `Hc'`, and PostgreSQL-host is `Hp'`. | Only the two independent host-reference leaves differ. |
+| `case-046-nmr018-nmr013` | PostgreSQL-host is `Hp'`, and the live PostgreSQL-configuration directory sequence is empty. | Profile and live-projection sequences remain clean, so no profile-count, omission, addition, or duplicate predicate is introduced. |
+| `case-047-nmr013-nmr006` | The live PostgreSQL-configuration directory sequence is empty, and endpoint identity is `E'`. | The changes are disjoint; every other endpoint member and both other directory sequences remain clean. |
+| `case-048-nmr006-nmr007` | Endpoint identity is `E'`, and target-database identity is `T'`; every other endpoint member is clean. | The shared endpoint changes exactly those two registered fields. |
+| `case-049-nmr007-nmr008` | Target identity is `T'`; the endpoint's socket-directory binding is `D'`, and its address is derived from `D'.resolved_path`. | Endpoint identity, transport, port, and all live-directory fields remain clean; the address rebind is required by NMR008. |
+| `case-050-nmr008-nmr009` | The live member differs only in `configured_path`; the endpoint names that exact changed member and uses its resolved-path address. | The endpoint/member structural merge is exact; resolved path, device, file, target, port, and address construction remain clean. |
+| `case-051-nmr009-nmr010` | The shared live member has distinct changed configured and resolved paths; the endpoint address is recomputed from the changed resolved path. | Device and file IDs remain clean, and correct resolved-path construction excludes NMR028 and NMR029. |
+| `case-052-nmr010-nmr011` | The shared live member has changed `resolved_path` and `directory_device_id`; address follows the changed resolved path. | Configured path and file ID remain clean, and address construction is correct. |
+| `case-053-nmr011-nmr012` | The shared live member has changed device and file IDs; paths and endpoint address remain clean. | No path, sequence, or endpoint predicate is present. |
+| `case-054-nmr012-nmr015` | The live member's file ID is changed, and the Unix-socket endpoint port is a positive `SafeInteger`. | The targets are disjoint; path/address and all other identity members remain clean. |
+| `case-055-nmr015-nmr024` | Endpoint port is positive, and `open_condition=DIRECTORY_MISSING`. | No other endpoint member changes; the open condition is neither nondirectory nor a revalidation condition. |
+| `case-056-nmr025-nmr026` | `open_condition=DIRECTORY_NOT_DIRECTORY` and `revalidation_condition=DIRECTORY_SYMLINK_RETARGET`. | The two independent condition leaves coexist in the final graph. NMR025 wins by precedence; execution need not reach revalidation. Neither missing nor race is present. |
+| `case-057-nmr027-nmr028` | `revalidation_condition=DIRECTORY_RESOLUTION_RACE`, and endpoint address is the resolved directory without socket filename or port. | The targets are disjoint; no retarget condition or configured-path substitution is present. |
+
+The incompatibility proof for `NMR023+NMR034` is structural. NMR023 requires a
+malformed replacement member distinct from exact `C`, while NMR034 requires
+two exact copies of `C`. Retaining that malformed member beside `[C,C]`
+introduces NMR033; omitting `C` introduces NMR032; replacing both copies with
+the malformed member no longer satisfies NMR034. Thus no final graph has
+exactly those two predicates. The other five certificates follow directly from
+their mutually exclusive typed values above. A wrong arm, noncanonical object,
+inconsistent dependent reference, nonmatching condition, third predicate,
+conflicting shared value, or nonbaseline value that compares equal makes the
+stimulus invalid before admission.
+
+The exact transport enum has only three nonbaseline values, each already owned
+by `NMR002`, `NMR003`, or `NMR005`; there is no generic changed-transport
+defect. The exact initial profile and both clean socket-directory sequences
+each have one member. A same-multiset reorder therefore equals the baseline,
+so no reorder defect is inhabitable. The former generic transport and two
+reorder labels are not aliases, cases, predicates, or count members.
+
+The matrix runner supplies authenticated BS127 and its aligned candidate
+projection. The production finalizer receives those actual inputs plus its
+ordinary admission operands, authenticates the stimulus tuple, independently
+constructs the clean transient graph, applies the typed operations, and
+requires the resulting projection to equal the candidate. It does not resolve
+the selector, `selector.expected_refusal`, BS128, an expected failure triple,
+or an expected OR-DEP projection. It evaluates every applicable production
+deployment predicate and selects the first present member of `DEFECT_ORDER`.
+A negative attempt emits exactly one actual `DeploymentFailure`; pair cases
+therefore prohibit source-order, set-order, or all-matching-failures behavior.
+
+The accept selector carries `expected_refusal="NONE"`. Every negative
+selector carries exact `ExpectedDeploymentRefusal/v1` whose candidate
+projection equals the selector, whose `failures` has exactly one member,
+whose `oracle_id` is `OR-DEP`, and whose failure code is the selected
+precedence member's code. Its failure evidence is exact `FailureEvidence/v1`
+with `failure_code="deployment-refusal-" || lowercase(selected NMR ID)`,
+`evidence_artifact=selector.stimulus`, and
+`source_identity=body(selector.stimulus).failure_source_identity`. The
+expected-refusal body never references a campaign, campaign plan, matrix,
+attempt, failed result, attestation, or current slot, so its closure is
+acyclic.
+
+Only the independent verifier resolves BS128. Before execution it fixes the
+expected OR-DEP projection from the immutable matrix and independent source
+inventory without calling the finalizer or its predicate implementation. It
+derives the governing matrix only by resolving the accepted campaign plan's
+deployment basis, requires exact policy, planned-run, row-position, selector,
+and run equality, and omits that governing reference from the projection
+bytes. The same verifier independently reconstructs each profile's configured
+and resolved paths, port, clean resolved-path address, and configured-path
+substitution. It accepts a non-applicability proof only when the paths and the
+two address bytes are equal, case 032 is absent for every tuple under that
+profile, and all other applicable cases are present. A distinct-path profile
+must have case 032 and no such proof. The accept case expects
+`outcome=ATTESTED`, empty failure sequences, no expected
+refusal, `attestation_created=true`, `failed_result_created=false`,
+`reserved_epoch_changed=true`, and `active_epoch_changed=false`. A negative
+case expects `outcome=REFUSED`, the selector's expected-refusal and candidate
+references, its exact one-element failure-code, oracle-ID, and
+evidence-reference sequences, `attestation_created=false`,
+`failed_result_created=true`, `reserved_epoch_changed=false`, and
+`active_epoch_changed=false`.
+
+After the production attempt, that verifier reconstructs the observed
+projection from the immutable attempted BS127 stimulus, actual candidate,
+actual failed result when present, and before/after attestation,
+reserved-epoch, and active-epoch slots. It then resolves the prebound BS128
+only on the verifier side and compares exact expected and observed fields. An
+omitted, extra, reordered, or different operation, manifestation, failure
+triple, body reference, or slot effect fails equality.
+
+Every deployment stimulus therefore prebinds exactly one admitted
+profile/target/surface tuple. Matrix runs sort by profile reference, target
+reference, target-surface digest, ASCII `cell_id`, and ASCII `run_id`; a
+claim-registry body sorts by ASCII `run_id`. Within every run, fields have the
+displayed `CampaignRunRequirement` types. A missing body, changed obligation,
+predicate, operation, incompatibility or non-applicability proof, row,
+selector, run, oracle, definition, expected projection, order, derived count,
+or digest rejects the matrix before campaign acceptance.
 Every `CampaignRunRequirement.reader_execution` is literal `"NONE"` unless
 `evidence_class=EV-LEG`. An `EV-LEG` run carries the one exact
 `HistoricalReaderExecutionBinding/v1` selected by its corpus-plan cell. The
@@ -4705,6 +5298,8 @@ D.boot_identity = body(D.clock_envelope).boot_identity
 D.boot_identity = body(current_live_projection(D)).boot_identity
 body(current_live_projection(D)).boot_environment_configuration =
     body(body(D.support_profile).boot_configuration).configuration
+D.postgresql_settings =
+    body(body(current_live_projection(D)).postgresql_configuration).postgresql_settings
 D.endpoint_identity = body(D.postgresql_endpoint).endpoint_identity
 D.storage_identity = body(body(D.support_profile).storage_profile).identity
 D.role_grant_set = ref(RG)
@@ -4786,6 +5381,7 @@ body(C_D.campaign_plan).basis = {
 }
 M_D.deployment_policy = ref(P_D)
 C_D.planned_runs = M_D.planned_runs
+body(C_D.campaign_plan).planned_runs = M_D.planned_runs
 [T.claim_id for T in T_DEPLOYMENT] = [
     "JAC-ACL-01", "JAC-CAP-01", "JAC-CLK-01",
     "JAC-CLO-01", "JAC-CUT-01", "JAC-DUR-01", "JAC-PG-01"
@@ -6154,7 +6750,7 @@ RecoveryAdvancementObservation := {
   "to_prefix": "ABSENT" | "JOURNALED" | "PROVEN" | "VALID" |
                "LATE" | "MUTATED" | "VERIFIED",
   "transition": "J_CREATED" | "P_CREATED" | "R_VALID_CREATED" |
-                "R_LATE_CREATED" | "M_CREATED" | "V_CREATED" |
+                "R_LATE_CREATED" | "M_CREATED" |
                 "CONCLUSIVE_NONCOMMIT_RECORDED",
   "transaction_identity": EvidenceRef,
   "work_identity": OperationWorkIdentity,
@@ -6236,8 +6832,9 @@ separately keyed `OperationWorkPreReservationRefusal/v1` contract.
 
 The observation becomes replayable only when the same transaction stores it as
 the `result` of the unique `OperationWorkCommittedResult/v1` for that
-reservation. For `J_CREATED` through `V_CREATED`, `result_body` names the exact
-stage body inserted with the observation and the committed result names only
+reservation. For `J_CREATED`, `P_CREATED`, `R_VALID_CREATED`,
+`R_LATE_CREATED`, and `M_CREATED`, `result_body` names the exact stage body
+inserted with the observation and the committed result names only
 the observation. `CONCLUSIVE_NONCOMMIT_RECORDED` names the exact terminal
 noncommit body. Exact stage replay is returned by the read-only preflight and
 creates no observation. A bare observation, a committed result for another
@@ -6422,13 +7019,15 @@ to lowercase, and its source identity proves that exact refusal. An ambiguity
 resolves the exact original and query `TransactionIdentity/v1` bodies and
 bounded resolution deadline. A fence names the exact attestation and
 reconciliation subject that lost continuity. An advancement's `result_body`
-names the exact created `J`, `P`, `R`, `M`, or `V` selected by its transition.
-The exact
-created mappings are `J_CREATED: ABSENT->JOURNALED`,
+names the exact created `J`, `P`, `R`, or `M` selected by its transition.
+The exact created mappings are `J_CREATED: ABSENT->JOURNALED`,
 `P_CREATED: JOURNALED->PROVEN`, `R_VALID_CREATED: PROVEN->VALID`,
-`R_LATE_CREATED: PROVEN->LATE`, `M_CREATED: VALID->MUTATED`, and
-`V_CREATED: MUTATED->VERIFIED`; the result kind is the named stage and an `R`
-also has the named qualification. `CONCLUSIVE_NONCOMMIT_RECORDED` requires
+`R_LATE_CREATED: PROVEN->LATE`, and `M_CREATED: VALID->MUTATED`; the result
+kind is the named stage and an `R` also has the named qualification. A
+recovered `R_LATE` commits this mapping, reaches `LATE`, and admits no
+`M`. Recovered verification uses `RECOVERY/VERIFY_STAGE`, commits its
+accepted verification result directly, and never creates BS125/RW10.
+`CONCLUSIVE_NONCOMMIT_RECORDED` requires
 equal prefixes; its `result_body`
 names the exact `OperationWorkConclusiveNoncommitResult/v1` atomically bound as
 the original started reservation's terminal result, and its own work identity,
@@ -6724,8 +7323,11 @@ their prerequisite pointers, and the attestation's complete support-profile
 topology bindings through commit. It requires every reference to remain current,
 unrevoked, continuous, and exact at the protected sample and through commit.
 With `CURRENT`, the transaction may insert the observation and `J` or `P`
-atomically even if acknowledgement occurs after expiry. With `LATE`, it inserts only the
-nonauthorizing observation and refuses the stage. An invalid clock, topology,
+atomically even if acknowledgement occurs after expiry. With `LATE`, it
+inserts the nonauthorizing observation and closes the started work exactly once
+with `OperationWorkCommittedResult.result_kind=
+PRE_STAGE_EXPIRY_OBSERVATION`, whose `result` is that existing observation.
+It creates no stage, authority, refund, or replacement entitlement. An invalid clock, topology,
 policy, attestation, evidence partition, authority record, active-epoch, or
 continuity predicate inserts neither stage nor trusted expiry observation and
 returns the exact existing refusal path. This observation has `authority=NONE`:
@@ -6771,9 +7373,9 @@ sequence, and the two literal rules in the grammar. Those expansions,
 | ID | Exact ordered fields | Exact claim obligations |
 | --- | --- | --- |
 | `OR-TRACE` | `claim_registry:EVIDENCE_REF`, `requirement_entries:EVIDENCE_REF_SEQUENCE`, `matrix_rows:EVIDENCE_REF_SEQUENCE`, `tier_assignments:EVIDENCE_REF_SEQUENCE`, `limit_bindings:EVIDENCE_REF_SEQUENCE`, `unmapped_requirement_count:SAFE_INTEGER`, `contradiction_count:SAFE_INTEGER` | `JAC-ARC-01` |
-| `OR-ID` | `canonical_bodies:EVIDENCE_REF_SEQUENCE`, `canonical_body_digests:DIGEST_SEQUENCE`, `canonical_byte_lengths:SAFE_INTEGER_SEQUENCE`, `stable_key_digests:DIGEST_SEQUENCE`, `nested_bindings:EVIDENCE_REF_SEQUENCE`, `transaction_identities:EVIDENCE_REF_SEQUENCE`, `reconciliation_subjects:EVIDENCE_REF_SEQUENCE`, `work_requests:EVIDENCE_REF_SEQUENCE`, `target_surface_contract:EVIDENCE_REF`, `target_state_bodies:EVIDENCE_REF_SEQUENCE`, `artifact_provenance:EVIDENCE_REF_SEQUENCE`, `socket_directory_bindings:EVIDENCE_REF_SEQUENCE` | `JAC-CAN-01`, `JAC-ID-01`, `JAC-PG-01`, `JAC-CLO-01`, `JAC-CAP-01`, `JAC-DUR-01` |
+| `OR-ID` | `canonical_bodies:EVIDENCE_REF_SEQUENCE`, `canonical_body_digests:DIGEST_SEQUENCE`, `canonical_byte_lengths:SAFE_INTEGER_SEQUENCE`, `stable_key_digests:DIGEST_SEQUENCE`, `nested_bindings:EVIDENCE_REF_SEQUENCE`, `transaction_identities:EVIDENCE_REF_SEQUENCE`, `reconciliation_subjects:EVIDENCE_REF_SEQUENCE`, `work_requests:EVIDENCE_REF_SEQUENCE`, `operation_work_admissions:TEXT_SEQUENCE`, `operation_work_transaction_identities:EVIDENCE_REF_SEQUENCE`, `operation_work_starts:EVIDENCE_REF_SEQUENCE`, `operation_work_incarnation_derivations:TEXT_SEQUENCE`, `operation_work_lock_sequences:TEXT_SEQUENCE`, `target_surface_contract:EVIDENCE_REF`, `target_state_bodies:EVIDENCE_REF_SEQUENCE`, `artifact_provenance:EVIDENCE_REF_SEQUENCE`, `socket_directory_bindings:EVIDENCE_REF_SEQUENCE` | `JAC-CAN-01`, `JAC-ID-01`, `JAC-PG-01`, `JAC-RST-01`, `JAC-CLO-01`, `JAC-CAP-01`, `JAC-DUR-01` |
 | `OR-PFX` | `aggregate_identity:RECOVERY_AGGREGATE_IDENTITY`, `ordered_stage_bodies:EVIDENCE_REF_SEQUENCE`, `durable_prefix:ENUM_TOKEN`, `terminal_observation:EVIDENCE_REF_OR_NONE`, `impossible_hole_count:SAFE_INTEGER`, `ambiguous_transactions:EVIDENCE_REF_SEQUENCE`, `committed_results:EVIDENCE_REF_SEQUENCE` | `JAC-ID-01`, `JAC-ORD-01`, `JAC-TIM-01`, `JAC-AMB-01`, `JAC-RST-01`, `JAC-VER-01` |
-| `OR-NEXT` | `aggregate_identity:RECOVERY_AGGREGATE_IDENTITY`, `observed_prefix:ENUM_TOKEN`, `committed_replay:EVIDENCE_REF_OR_NONE`, `pre_reservation_refusal:EVIDENCE_REF_OR_NONE`, `permitted_transition:ENUM_TOKEN_OR_NONE`, `reconciliation_subject:EVIDENCE_REF_OR_NONE`, `replacement_permitted:BOOLEAN`, `terminal_refusal:ENUM_TOKEN_OR_NONE` | `JAC-ORD-01`, `JAC-AMB-01`, `JAC-RST-01`, `JAC-FEN-01`, `JAC-LEG-01`, `JAC-CLO-01` |
+| `OR-NEXT` | `aggregate_identity:RECOVERY_AGGREGATE_IDENTITY`, `observed_prefix:ENUM_TOKEN`, `committed_replay:EVIDENCE_REF_OR_NONE`, `pre_reservation_refusal:EVIDENCE_REF_OR_NONE`, `permitted_transition:ENUM_TOKEN_OR_NONE`, `reconciliation_subject:EVIDENCE_REF_OR_NONE`, `operation_work_protected_result:TEXT_SEQUENCE`, `operation_work_outcome_precedence:TEXT_SEQUENCE`, `preserved_work_state:ENUM_TOKEN_OR_NONE`, `replacement_permitted:BOOLEAN`, `terminal_refusal:ENUM_TOKEN_OR_NONE` | `JAC-ORD-01`, `JAC-AMB-01`, `JAC-RST-01`, `JAC-FEN-01`, `JAC-LEG-01`, `JAC-CLO-01` |
 | `OR-TIME` | `clock_envelope:EVIDENCE_REF`, `protected_samples:EVIDENCE_REF_SEQUENCE`, `integer_inputs:TEXT_SEQUENCE`, `rounded_terms:TEXT_SEQUENCE`, `trusted_upper_bound_unix_ns:UINT128`, `validity_deadline_monotonic_ns:UINT128`, `expiry_unix_ns:UINT128`, `strict_result:ENUM_TOKEN` | `JAC-TIM-01`, `JAC-CLO-01`, `JAC-CLK-01` |
 | `OR-TGT` | `target_database_identity:EVIDENCE_REF`, `target_surface_contract:EVIDENCE_REF`, `before_image:EVIDENCE_REF`, `before_image_digest:DIGEST`, `apply_payload:TARGET_APPLY_PAYLOAD_REF_OR_NONE`, `apply_payload_digest:DIGEST_OR_NONE`, `restore_payload:EVIDENCE_REF`, `restore_payload_digest:DIGEST`, `restore_conversion:EVIDENCE_REF`, `after_image:EVIDENCE_REF`, `after_image_digest:DIGEST`, `selected_cohort:EVIDENCE_REF`, `preserved_cohort:EVIDENCE_REF`, `allowed_delta:TARGET_ALLOWED_DELTA`, `observed_postimage:EVIDENCE_REF` | `JAC-RST-01`, `JAC-LIN-01`, `JAC-EFX-01`, `JAC-VER-01`, `JAC-RBK-01`, `JAC-PRS-01` |
 | `OR-LIN` | `lineage_key_body:EVIDENCE_REF`, `lineage_key_digest:DIGEST`, `predecessor_generation:SAFE_INTEGER`, `predecessor_head:DIGEST_OR_NONE`, `predecessor_verification:EVIDENCE_REF_OR_NONE`, `new_generation:SAFE_INTEGER`, `new_head:DIGEST`, `drift_result:ENUM_TOKEN` | `JAC-LIN-01`, `JAC-EFX-01`, `JAC-VER-01` |
@@ -6781,9 +7383,10 @@ sequence, and the two literal rules in the grammar. Those expansions,
 | `OR-EVID` | `fixture_prestate:EVIDENCE_REF_OR_NONE`, `before_evidence:EVIDENCE_REF_SEQUENCE`, `after_evidence:EVIDENCE_REF_SEQUENCE`, `allowed_new_evidence:EVIDENCE_REF_SEQUENCE`, `unaffected_identity_digests:DIGEST_SEQUENCE`, `original_committed_result:EVIDENCE_REF_OR_NONE`, `original_conclusive_noncommit_result:EVIDENCE_REF_OR_NONE`, `resolution_committed_result:EVIDENCE_REF_OR_NONE`, `protected_ciphertext:EVIDENCE_REF_OR_NONE`, `retention_state:ENUM_TOKEN` | `JAC-ORD-01`, `JAC-AMB-01`, `JAC-RST-01`, `JAC-EVL-01`, `JAC-VER-01`, `JAC-RBK-01`, `JAC-CLO-01`, `JAC-CUT-01`, `JAC-PRS-01` |
 | `OR-EVAL` | `campaign_plan:EVIDENCE_REF`, `oracle_registry:EVIDENCE_REF`, `claim_registry:EVIDENCE_REF`, `claim_definitions:EVIDENCE_REF_SEQUENCE`, `claim_predicates:EVIDENCE_REF_SEQUENCE`, `resolved_contract_bodies:EVIDENCE_REF_SEQUENCE`, `expanded_required_runs:EVIDENCE_REF_SEQUENCE`, `registered_run_results:EVIDENCE_REF_SEQUENCE`, `omitted_run_ids:CONTRACT_ID_SEQUENCE`, `invalidations:EVIDENCE_REF_SEQUENCE`, `supersessions:EVIDENCE_REF_SEQUENCE`, `staleness_inputs:EVIDENCE_REF_SEQUENCE`, `current_pointer_before:EVIDENCE_REF_SEQUENCE`, `current_pointer_after:EVIDENCE_REF_SEQUENCE`, `derived_tier_results:EVIDENCE_REF_SEQUENCE`, `qualification_receipt_eligibility:BOOLEAN` | `JAC-EVL-01` |
 | `OR-LEG` | `reader_registry:EVIDENCE_REF`, `reader_registry_digest:DIGEST`, `reader_registry_vector_digest:DIGEST`, `reader_registry_member_digest:DIGEST`, `reader_contract_id:TEXT`, `reader_execution_binding:EVIDENCE_REF`, `reader_output:LEGACY_READER_OUTPUT_REF`, `dependency_graph:EVIDENCE_REF_SEQUENCE`, `historical_disposition:ENUM_TOKEN`, `real_artifact_provenance:EVIDENCE_REF_OR_NONE`, `closure_result:EVIDENCE_REF_OR_NONE`, `rollback_eligibility:BOOLEAN`, `authority:ENUM_TOKEN` | `JAC-LEG-01`, `JAC-CUT-01` |
-| `OR-ACL` | `principal_identity:EVIDENCE_REF`, `database_role:EVIDENCE_REF`, `allowed_calls:CONTRACT_ID_SEQUENCE`, `observed_allowed_results:EVIDENCE_REF_SEQUENCE`, `denied_calls:CONTRACT_ID_SEQUENCE`, `observed_denials:EVIDENCE_REF_SEQUENCE`, `reachable_grant_paths:EVIDENCE_REF_SEQUENCE`, `bypass_path_count:SAFE_INTEGER` | `JAC-PG-01`, `JAC-EVL-01`, `JAC-CLO-01`, `JAC-CUT-01`, `JAC-ACL-01`, `JAC-CAP-01` |
+| `OR-ACL` | `principal_identity:EVIDENCE_REF`, `database_role:EVIDENCE_REF`, `allowed_calls:CONTRACT_ID_SEQUENCE`, `observed_allowed_results:EVIDENCE_REF_SEQUENCE`, `denied_calls:CONTRACT_ID_SEQUENCE`, `observed_denials:EVIDENCE_REF_SEQUENCE`, `internal_call_sites:CONTRACT_ID_SEQUENCE`, `internal_call_cardinalities:TEXT_SEQUENCE`, `reachable_grant_paths:EVIDENCE_REF_SEQUENCE`, `bypass_path_count:SAFE_INTEGER` | `JAC-PG-01`, `JAC-EVL-01`, `JAC-CLO-01`, `JAC-CUT-01`, `JAC-ACL-01`, `JAC-CAP-01` |
 | `OR-CAP` | `capability_identity:EVIDENCE_REF`, `entropy_source:CONTRACT_ID`, `entropy_bit_count:SAFE_INTEGER`, `cleartext_residence:EVIDENCE_REF_SEQUENCE`, `transient_copy_domains:EVIDENCE_REF_SEQUENCE`, `excluded_surfaces:CONTRACT_ID_SEQUENCE`, `activation_session_witness:EVIDENCE_REF_OR_NONE`, `invalidation:EVIDENCE_REF_OR_NONE`, `continuity_loss_result:ENUM_TOKEN` | `JAC-CAP-01` |
 | `OR-PHY` | `acknowledged_boundary:EVIDENCE_REF`, `power_cut_stimulus:EVIDENCE_REF`, `recovered_prefix:ENUM_TOKEN`, `pre_cut_target_image:EVIDENCE_REF`, `post_boot_target_image:EVIDENCE_REF`, `atomic_state_result:ENUM_TOKEN`, `post_boot_evidence:EVIDENCE_REF_SEQUENCE`, `evidence_integrity_result:ENUM_TOKEN` | `JAC-EFX-01`, `JAC-DUR-01` |
+| `OR-DEP` | `row_position:SAFE_INTEGER`, `case_id:CONTRACT_ID`, `run_id:CONTRACT_ID`, `stimulus:EVIDENCE_REF`, `expected_refusal:EVIDENCE_REF_OR_NONE`, `outcome:ENUM_TOKEN`, `candidate_projection:EVIDENCE_REF`, `failure_codes:TEXT_SEQUENCE`, `failure_oracle_ids:TEXT_SEQUENCE`, `failure_evidence:EVIDENCE_REF_SEQUENCE`, `attestation_created:BOOLEAN`, `failed_result_created:BOOLEAN`, `reserved_epoch_changed:BOOLEAN`, `active_epoch_changed:BOOLEAN` | `JAC-ACL-01`, `JAC-CAP-01`, `JAC-CLK-01`, `JAC-CLO-01`, `JAC-CUT-01`, `JAC-DUR-01`, `JAC-PG-01` |
 
 `LEGACY_READER_OUTPUT_REF` admits exactly an `EvidenceRef` to
 `hindsight-compatibility-legacy-reader-success/1` or
@@ -6813,7 +7416,7 @@ resolves the complete payload, independently reconstructs the locked selected
 membership, and requires the after selected projection to equal the payload;
 for rollback, either field containing anything other than `"NONE"` fails.
 
-The canonical registry's `definitions` sequence contains exactly the fourteen
+The canonical registry's `definitions` sequence contains exactly the fifteen
 definition references in this displayed order. Each reference must resolve the
 exact expanded body above, and the registry digest is SHA-256 over the complete
 `CanonicalOracleRegistry/v1` successor-canonical body including its LF. An
@@ -6862,16 +7465,22 @@ the closed class-and-oracle membership constraint on that expansion. A
 definition, predicate, expected field, run, class, oracle, or tier not derived
 from these sources is not part of the claim.
 
+Where `JAC-PG-01`, `JAC-RST-01`, or `JAC-ACL-01` names IA11, the no-proof
+FW03 form, the RW01 admission carrier, or their conditional result/body rules,
+it names an issue-107 proposal acceptance target under `I_107`, not a member of
+the accepted 90108 source roster `I_A`.
+
 | Claim | Falsifiable obligation | Tier requirements and oracles | Required tiers |
 | --- | --- | --- | --- |
 | `JAC-ARC-01` | The selected PostgreSQL `J→P→R→M→V` architecture covers the fixed expiry, durability, restart, compatibility, and preservation requirements, and every rejected alternative or deferral remains explicit. | Design: `EV-DES`; `OR-TRACE`. | Design |
-| `JAC-CAN-01` | Each complete successor body, nested referenced body, recovery observation, support/topology/closure-policy/socket-directory binding, deployment-evidence acquisition, contract body, role-grant set, writer inventory, closed target surface, relation, column, row, PostgreSQL value, cohort membership and projection, mutation image, restore payload and conversion, operation-work request, preflight or refusal, identity, transaction identity, reconciliation subject, reservation, start, committed result, transaction-resolution outcome, ambiguity-query outcome, conclusive-noncommit result, canonical claim definition and predicate, oracle definition and registry, historical reader-execution binding, per-class authority-gate fixture state, protected rollback ciphertext, real-artifact binding and provenance, private package, bounded public projection, independent review receipt, and compatibility registry, reader output, restore content, manifest, exclusion, closure branch-evidence, realized-fence-evidence, origin-fence-binding, or active-fence-adoption body has one accepted family-specific byte representation and digest, including exactly one LF. Role-grant vectors cover every closed object class, including `LANGUAGE`; writer vectors cover every direct, administrative, routine-mediated, and service-mediated path. | Design: `EV-DES`; `OR-ID`. Implementation: `EV-VEC`; `OR-ID`. | Design; implementation |
+| `JAC-CAN-01` | Each complete successor body, nested referenced body, recovery observation, support/topology/closure-policy/socket-directory binding, deployment-evidence acquisition, contract body, role-grant set, writer inventory, closed target surface, relation, column, row, PostgreSQL value, cohort membership and projection, mutation image, restore payload and conversion, operation-work request, preflight or refusal, identity, transaction identity, reconciliation subject, reservation, start, committed result, transaction-resolution outcome, ambiguity-query outcome, conclusive-noncommit result, canonical claim definition and predicate, deployment admission stimulus,
+acyclic expected deployment refusal, oracle definition and registry, historical reader-execution binding, per-class authority-gate fixture state, protected rollback ciphertext, real-artifact binding and provenance, private package, bounded public projection, independent review receipt, and compatibility registry, reader output, restore content, manifest, exclusion, closure branch-evidence, realized-fence-evidence, origin-fence-binding, or active-fence-adoption body has one accepted family-specific byte representation and digest, including exactly one LF. Role-grant vectors cover every closed object class, including `LANGUAGE`; writer vectors cover every direct, administrative, routine-mediated, and service-mediated path. | Design: `EV-DES`; `OR-ID`. Implementation: `EV-VEC`; `OR-ID`. | Design; implementation |
 | `JAC-ID-01` | Same key and binding replays exactly; same key with different bytes conflicts; the grant, plan, approval, authorization receipt, and `J` bind one exact closed action and predecessor input; every start, transaction-resolution outcome, ambiguity-query outcome, reconciliation, observation, terminal result, and protected comparison resolves the same canonical transaction or reconciliation-subject body; publication `UNPROVEN` names the exact original `R` attempt and its preexisting exact conclusive-noncommit committed and terminal results; and apply and rollback never share authority. | Implementation: `EV-REF`, `EV-PG`; `OR-ID`, `OR-PFX`. | Implementation |
 | `JAC-ORD-01` | Only ordered `J→P→R→M→V` prefixes exist; a hole or mixed chain fails closed. | Implementation: `EV-REF`, `EV-PG`, `EV-FLT`; `OR-PFX`, `OR-NEXT`, `OR-EVID`. | Implementation |
-| `JAC-PG-01` | The trusted adapter owns `BEGIN` through acknowledged `COMMIT`, checks effective synchronous settings immediately before commit, binds the exact target PostgreSQL identity, and admits the initial profile only with exact same-host local controller, PostgreSQL host, endpoint, topology, and complete canonical one-member Unix-socket-directory bindings. | Implementation: `EV-PG`, `EV-ACL`; `OR-ID`, `OR-FENCE`, `OR-ACL`. Deployment: `EV-DEP`; the same oracles. | Implementation; deployment |
+| `JAC-PG-01` | The trusted adapter owns `BEGIN` through the driver COMMIT return, checks effective synchronous settings immediately before commit, then reports acknowledgement only after a separate authoritative protected read of the exact durable receipt or committed-result mapping; neither the protected return nor driver COMMIT return alone is acknowledgement. It binds the exact target PostgreSQL identity and admits the initial profile only with exact same-host local controller, PostgreSQL host, endpoint, topology, and complete canonical one-member Unix-socket-directory bindings. Every applicable rank-1 and rank-2 dependency precedes proposal-member IA11 rank 3, and rank-5 work locks follow it. PostgreSQL releases all row locks at transaction end. Replacement attempted after rank 3 waits for that end. | Implementation: `EV-PG`, `EV-ACL`; `OR-ID`, `OR-FENCE`, `OR-ACL`. Deployment: `EV-DEP`; `OR-ID`, `OR-FENCE`, `OR-ACL`, `OR-DEP`. | Implementation; deployment |
 | `JAC-TIM-01` | Grant issuance, plan creation, approval, and authorization issuance have one strict order and one equal nonextendable expiry; the protected pre-commit start samples for `J` and `P` and the post-proof sample in `R` must have conservative `U` strictly below it, while equality and greater values are late. A durable timely `R` is the only shared-deadline decision for `M`; `M` rechecks those authority records for identity, currentness, and nonrevocation without resampling their deadline. No scheduling or acknowledgement bound is assumed. | Implementation: `EV-REF`, `EV-PG`; `OR-TIME`, `OR-PFX`. | Implementation |
 | `JAC-AMB-01` | A lost acknowledgement recovers only the exact committed stage. Transaction-resolution and ambiguity-query work that discovers commit closes through its own typed outcome referencing the original committed result and never duplicates the stage; unresolved commit state remains ambiguous rather than being inferred. | Implementation: `EV-PG`, `EV-FLT`; `OR-PFX`, `OR-NEXT`, `OR-EVID`. | Implementation |
-| `JAC-RST-01` | Restart advances only the one uniquely safe transition and otherwise replays, refuses, or fences. Every request first receives one uncharged side-effect-free committed-result preflight; only unresolved work can commit one charged reservation, while exhaustion, overflow, clock, ordinal, reservation, and conflict failures commit one separately request-keyed nonauthorizing refusal without a charge. Every reservation binds one exact forward or recovery identity and request, admits one durable start and transaction identity, and only a byte-identical committed result replays without charge. Recovered stage advancement commits its recovery observation as the reservation's sole result and points `result_body` to the stage committed in the same transaction. A resolver that discovers the original committed closes with its exact typed resolution or query outcome and original-result binding. Separately charged conclusive-noncommit resolution atomically commits the original terminal noncommit result and closes both started reservations. Only after that close may ordinary gates admit a charged replacement `R`, or terminal conditions admit a distinct charged publication-qualification reconciliation whose `UNPROVEN` result binds the preexisting original committed and conclusive-noncommit results. Each reservation keeps one terminal result, and a crashed `UNPROVEN` resolver is itself the exact `RECONCILIATION` transaction subject of the next separately charged resolver under the same finite limits. Canonical vectors cover both recursive result mappings, exact replay, and the committed-`R` alternative. Reservation-keyed recovery observations cover exactly post-reservation outcomes and record one exact immutable, queryable, nonauthorizing kind. | Implementation: `EV-REF`, `EV-PG`, `EV-FLT`; `OR-PFX`, `OR-NEXT`, `OR-TGT`, `OR-EVID`. | Implementation |
+| `JAC-RST-01` | Restart advances only the one uniquely safe transition and otherwise replays, refuses, or fences. Every request first receives one uncharged side-effect-free committed-result preflight; only unresolved work can commit one charged reservation, while exhaustion, overflow, clock, ordinal, reservation, and conflict failures commit one separately request-keyed nonauthorizing refusal without a charge. Every reservation binds one exact forward or recovery identity and request, admits one durable start and transaction identity, and only a byte-identical committed result replays without charge. RW01 retains the exact typed OperationWorkAdmission carrier. The eleven non-AW04 positive expansions and their complements construct complete J/P/R/V/RECONCILIATION transaction identities and starts without IA11 and with `adapter_incarnation_id` absent; the two AW04 expansions require the same IA11-derived authenticated incarnation in both M bodies. Each candidate AW04 call acquires every applicable rank-1 and rank-2 dependency, calls IA11 with its rank-3 locks retained through the outer transaction, and then acquires rank 5. IA11 neither reads RW01 nor owns equality. FW02 owns RW01 insertion for a new request and fresh-to-RW01 equality on replay. FW03 owns fresh-to-RW01 equality after rank 5 and only then persists RW04/RW05/RS14 and returns START. The closed protected-result union represents preflight, refusal, reservation, start, readback, ADMISSION_DENIED, and DATABASE_CONFLICT. Its ordered partition gives logical admission denial precedence, then same-ID changed-body REQUEST_CONFLICT even on a simultaneous reservation collision, then different-request WORK_ALREADY_RESERVED, then remaining immutable-chain DATABASE_CONFLICT. Denial preserves the current durable state, including RESERVED before start and STARTED after start. Stage-producing recovered J/P/R/M outcomes use the stage-specific outer entrypoint and owner-internal FW04 to commit the stage, BS125/RW10, BS099/RW06 pointing only to BS125, and RS15 all-or-neither; `result_body` points to that same-transaction stage. A recovered J/P equality-or-late outcome instead atomically commits only BS108, direct BS099/RW06, and RS15, with no stage, BS125/RW10, authority, refund, replacement entitlement, deadline renewal, or prefix change. Recovered V remains a direct `RECOVERY/VERIFY_STAGE` result. Readback selects the carrier from the committed result kind and exact typed body, then validates the immutable identity; a missing or extra carrier is conflict, and absent readback after uncertain commit remains ambiguous. FW01/FW08 remain durable historical reads after session loss and invoke no IA11; only new FW02/FW03 M admission is denied. A resolver that discovers the original committed closes with its exact typed resolution or query outcome and original-result binding. Separately charged conclusive-noncommit resolution atomically commits the original terminal noncommit result and closes both started reservations. Only after that close may ordinary gates admit a charged replacement `R`, or terminal conditions admit a distinct charged publication-qualification reconciliation whose `UNPROVEN` result binds the preexisting original committed and conclusive-noncommit results. Each reservation keeps one terminal result, and a crashed `UNPROVEN` resolver is itself the exact `RECONCILIATION` transaction subject of the next separately charged resolver under the same finite limits. Canonical vectors cover both recursive result mappings, exact replay, and the committed-`R` alternative. Reservation-keyed recovery observations cover exactly post-reservation outcomes and record one exact immutable, queryable, nonauthorizing kind. | Implementation: `EV-REF`, `EV-PG`, `EV-FLT`; `OR-ID`, `OR-PFX`, `OR-NEXT`, `OR-TGT`, `OR-EVID`, `OR-ACL`. | Implementation |
 | `JAC-FEN-01` | Loss or uncertainty of activation-bound continuity fences every unconsumed old-epoch `R`. | Implementation: `EV-PG`, `EV-FLT`; `OR-FENCE`, `OR-NEXT`. | Implementation |
 | `JAC-LIN-01` | One canonical lineage serializes all cohorts; one sibling advances and every loser observes immutable head drift. | Implementation: `EV-PG`; `OR-LIN`, `OR-TGT`. | Implementation |
 | `JAC-EFX-01` | Target mutation, canonical before and after `TargetMutationImage/v1` digests, `M`, generation change, mutation receipt, and lineage advance occur exactly once and atomically. Apply derives its complete selected postimage only from the plan-bound `TargetApplyPayload/v1`; rollback derives it only from `TargetRestorePayload/v1`. | Implementation: `EV-PG`, `EV-FLT`; `OR-TGT`, `OR-LIN`. Release: `EV-PHY`; `OR-PHY`. | Implementation; release |
@@ -6879,13 +7488,13 @@ from these sources is not part of the claim.
 | `JAC-VER-01` | Exact `MATCH` creates `V`; each stable attempt is immutable and replayable; only a genuinely retryable `UNABLE_TO_VERIFY` permits a later stable attempt; mismatch, invariant failure, and unproven target identity are sticky terminal outcomes that exclude every later `V` or mismatch. | Implementation: `EV-PG`, `EV-FLT`; `OR-PFX`, `OR-EVID`, `OR-TGT`, `OR-LIN`. | Implementation |
 | `JAC-RBK-01` | Rollback uses distinct authority and restores the exact selected content once. Before and after `TargetMutationImage/v1` bodies remain independently reconstructable state at their respective generations; the generation-free `TargetRestorePayload/v1` remains independently reconstructable content. Successor plaintext is exact LF-terminated payload bytes, while legacy no-LF plaintext passes through its registered reader output and deterministic conversion. Rollback preserves the locked preserved projection, substitutes only the payload's selected membership, increments generation once, and derives the after image and digest. Exact ciphertext bytes remain digest-and-length-verified protected PostgreSQL state from pre-plan construction through `J` adoption and verified rollback or authorized retirement. | Implementation: `EV-PG`, `EV-FLT`; `OR-TGT`, `OR-EVID`. | Implementation |
 | `JAC-LEG-01` | Every historical result is one exact registered nonauthorizing reader-success or reader-failure body selected by the complete frozen reader registry, deterministic selector-to-contract mapping, and exact member-to-tool execution binding; the output repeats that binding. The registry includes the kindless authenticated `requeue-plan` dependency reader, and public synthetic coverage remains exhaustive for its incremented member count and the exact registry-body and member-vector digests. Each required real-evidence run binds an authenticated controlled-private acquisition or sanitized-real derivation under its governing policies; private deciding artifacts stay bounded and controlled; public disclosure is only the exact mode-bearing bounded projection plus authenticated independent-review receipt and package commitment; and only the manifest-selected complete apply at genesis may enter the one successor rollback bridge. | Implementation: `EV-LEG`, `EV-PG`; `OR-LEG`, `OR-NEXT`. | Implementation |
-| `JAC-CLO-01` | Compatibility closure uses one exact qualified closure-policy identity, reserves bounded contiguous attempts with checked integer-nanosecond deadlines and separately rounded full resolution margin, admits one fenced observer lease, permits only same-ordinal takeover, rejects late or stale finalization, requires a qualified lower bound at or beyond reservation expiry for abandonment, resolves abandonment without target observation, closes exhaustion deterministically, and binds every branch to its exact closed v1 qualified-sample, takeover invalidation, comparison, and failure evidence bodies. | Implementation: `EV-PG`, `EV-FLT`, `EV-ACL`; `OR-ID`, `OR-TIME`, `OR-FENCE`, `OR-NEXT`, `OR-EVID`, `OR-ACL`. Release: `EV-CLK`, `EV-CAP`; `OR-TIME`, `OR-FENCE`, `OR-ACL`. Deployment: `EV-DEP`; `OR-ID`, `OR-TIME`, `OR-FENCE`. | Implementation; release; deployment |
-| `JAC-CUT-01` | One transaction allocates the proposed epoch, inserts its protected `RESERVED_FENCED` row, issues the bound deployment attestation, and installs the exact current selector. The row remains selected while the writer fence is established; activation revalidates that exact fence and atomically commits the manifest, genesis, one-time active-pointer transition, and selector clear, or a conclusive abort changes the row to permanent `ABANDONED_FENCED`. Every legacy-fence external effect requires fresh current authority and time validation, and the profiler and admission finalizer independently enumerate and exactly match the complete typed role-grant set and writer inventory before the compatibility fence proposal may project them. No unclassified or extra writer has an admitted interface or grant. | Implementation: `EV-LEG`, `EV-PG`, `EV-FLT`, `EV-ACL`; `OR-LEG`, `OR-FENCE`, `OR-EVID`, `OR-ACL`. Deployment: `EV-DEP`; `OR-FENCE`, `OR-ACL`. | Implementation; deployment |
+| `JAC-CLO-01` | Compatibility closure uses one exact qualified closure-policy identity, reserves bounded contiguous attempts with checked integer-nanosecond deadlines and separately rounded full resolution margin, admits one fenced observer lease, permits only same-ordinal takeover, rejects late or stale finalization, requires a qualified lower bound at or beyond reservation expiry for abandonment, resolves abandonment without target observation, closes exhaustion deterministically, and binds every branch to its exact closed v1 qualified-sample, takeover invalidation, comparison, and failure evidence bodies. | Implementation: `EV-PG`, `EV-FLT`, `EV-ACL`; `OR-ID`, `OR-TIME`, `OR-FENCE`, `OR-NEXT`, `OR-EVID`, `OR-ACL`. Release: `EV-CLK`, `EV-CAP`; `OR-TIME`, `OR-FENCE`, `OR-ACL`. Deployment: `EV-DEP`; `OR-ID`, `OR-TIME`, `OR-FENCE`, `OR-DEP`. | Implementation; release; deployment |
+| `JAC-CUT-01` | One transaction allocates the proposed epoch, inserts its protected `RESERVED_FENCED` row, issues the bound deployment attestation, and installs the exact current selector. The row remains selected while the writer fence is established; activation revalidates that exact fence and atomically commits the manifest, genesis, one-time active-pointer transition, and selector clear, or a conclusive abort changes the row to permanent `ABANDONED_FENCED`. Every legacy-fence external effect requires fresh current authority and time validation, and the profiler and admission finalizer independently enumerate and exactly match the complete typed role-grant set and writer inventory before the compatibility fence proposal may project them. No unclassified or extra writer has an admitted interface or grant. | Implementation: `EV-LEG`, `EV-PG`, `EV-FLT`, `EV-ACL`; `OR-LEG`, `OR-FENCE`, `OR-EVID`, `OR-ACL`. Deployment: `EV-DEP`; `OR-FENCE`, `OR-ACL`, `OR-DEP`. | Implementation; deployment |
 | `JAC-PRS-01` | Every unaffected row, limit, grant, historical artifact, prefix, and receipt remains byte- or value-identical. | Implementation: `EV-PG`, `EV-FLT`; `OR-TGT`, `OR-EVID`. Release: `EV-PHY`; the same oracles. Any later evidence class whose stimulus mutates a fixture repeats them. | Implementation; release |
-| `JAC-ACL-01` | The exact qualification, plan-authority, operation grant/plan/approval/authorization/revocation, deployment-policy-authority, admission, activation, publication, mutation, verification, evidence-owner, evidence-authority, evidence-producer, private registrar, private reviewer, public exporter, closure, fence, and ordinary-runtime identities can call only their declared interfaces, cannot select stored verdicts, and have no cross-role or direct-relation bypass. The complete role graph includes inherited, assumable, `PUBLIC`, ownership, default-privilege, function-mediated, and service paths; an unenumerated, unclassifiable, unresolved, duplicate, or extra path fails admission. Private roles have reciprocal denials, and export succeeds only for the exact current independently reviewed receipt. | Implementation: `EV-ACL`; `OR-ACL`. Deployment: `EV-DEP`; `OR-ACL`, `OR-FENCE`. | Implementation; deployment |
-| `JAC-CAP-01` | Each activation uses at least 256 OS-CSPRNG bits; cleartext persists only in the adapter's locked nondumpable allocation and the activation session's non-WAL relation; bounded transient copies remain inside the declared adapter, Unix-domain-socket protocol, and backend domains; only the digest is durable; continuity loss makes every later `M` fail without relying on forensic erasure. | Implementation: `EV-PG`, `EV-ACL`; `OR-CAP`, `OR-FENCE`, `OR-ACL`. Release: `EV-CAP`; `OR-CAP`, `OR-FENCE`, `OR-ACL`. Deployment: `EV-DEP`; `OR-ID`, `OR-ACL` verify the exact current passing `EV-CAP` qualification receipt and protected interface grants without observing a witness. | Implementation; release; deployment |
-| `JAC-CLK-01` | Clock rollback, reboot, suspend uncertainty, excessive error, stale envelope, or arithmetic failure cannot lower `U` or create authority. | Implementation: `EV-REF`, `EV-PG`; `OR-TIME`, `OR-FENCE`. Release: `EV-CLK`; the same oracles. Deployment: `EV-DEP`; `OR-FENCE`. | Implementation; release; deployment |
-| `JAC-DUR-01` | Within the exact profile's declared fault model, every acknowledged stage and atomic `M` effect exercised by the qualification campaign cold-recovers exactly; no unexplained run is accepted. | Release: `EV-PHY`; `OR-PHY`. Deployment: `EV-DEP`; `OR-ID`, `OR-FENCE` verify the exact current passing `EV-PHY` qualification receipt without repeating its campaign. | Release; deployment |
+| `JAC-ACL-01` | The exact qualification, plan-authority, operation grant/plan/approval/authorization/revocation, deployment-policy-authority, admission, activation, publication, mutation, verification, evidence-owner, evidence-authority, evidence-producer, private registrar, private reviewer, public exporter, closure, fence, and ordinary-runtime identities can call only their declared interfaces, cannot select stored verdicts, and have no cross-role or direct-relation bypass. The complete role graph includes inherited, assumable, `PUBLIC`, ownership, default-privilege, function-mediated, and service paths; an unenumerated, unclassifiable, unresolved, duplicate, or extra path fails admission. IA11 has exactly two O10-owned guarded call sites, FW02 and FW03, each calls once only for its listed AW04 branches, and every non-AW04, FW01, FW08, adapter, and out-of-context path calls it zero times. PostgreSQL ACL denial occurs before execution and is distinct from the protected ADMISSION_DENIED result. Private roles have reciprocal denials, and export succeeds only for the exact current independently reviewed receipt. | Implementation: `EV-ACL`; `OR-ACL`. Deployment: `EV-DEP`; `OR-ACL`, `OR-FENCE`, `OR-DEP`. | Implementation; deployment |
+| `JAC-CAP-01` | Each activation uses at least 256 OS-CSPRNG bits; cleartext persists only in the adapter's locked nondumpable allocation and the activation session's non-WAL relation; bounded transient copies remain inside the declared adapter, Unix-domain-socket protocol, and backend domains; only the digest is durable; continuity loss makes every later `M` fail without relying on forensic erasure. | Implementation: `EV-PG`, `EV-ACL`; `OR-CAP`, `OR-FENCE`, `OR-ACL`. Release: `EV-CAP`; `OR-CAP`, `OR-FENCE`, `OR-ACL`. Deployment: `EV-DEP`; `OR-ID`, `OR-ACL`, `OR-DEP` verify the exact current passing `EV-CAP` qualification receipt and protected interface grants without observing a witness. | Implementation; release; deployment |
+| `JAC-CLK-01` | Clock rollback, reboot, suspend uncertainty, excessive error, stale envelope, or arithmetic failure cannot lower `U` or create authority. | Implementation: `EV-REF`, `EV-PG`; `OR-TIME`, `OR-FENCE`. Release: `EV-CLK`; the same oracles. Deployment: `EV-DEP`; `OR-FENCE`, `OR-DEP`. | Implementation; release; deployment |
+| `JAC-DUR-01` | Within the exact profile's declared fault model, every acknowledged stage and atomic `M` effect exercised by the qualification campaign cold-recovers exactly; no unexplained run is accepted. | Release: `EV-PHY`; `OR-PHY`. Deployment: `EV-DEP`; `OR-ID`, `OR-FENCE`, `OR-DEP` verify the exact current passing `EV-PHY` qualification receipt without repeating its campaign. | Release; deployment |
 
 ### Compatibility closure state and fault matrix
 
@@ -6944,7 +7553,11 @@ every body and pointer outside the allowed delta remained unchanged.
 | Run registration, invalidation, supersession, or subject replacement racing current-pointer recomputation | Commit either the complete old state or the complete new state. No observer may see a new accepted body with an old affected pointer, a new pointer without its exact body, a partial claim set, or a caller-selected result. |
 | Prerequisite-result replacement | Recompute every dependent `EvidenceTierState/v1` with the complete exact ordered prerequisite references and atomically replace its current result pointer, even for `PASS` to a different current `PASS`. A non-`PASS` prerequisite derives `PREREQUISITE_BLOCKED`; unchanged claim-local evidence cannot retain the old dependent pointer, and the changed state digest is not a same-key conflict. |
 | Operation grant, plan, approval, authorization, or revocation | Only the matching isolated authenticated principal may perform its keyed transition. Resolve the complete typed action binding, including exact grant, retry, reconciliation, budget, protected ciphertext, source plaintext, restore payload and conversion, cohort membership, target, and epoch inputs; require the grant, plan, approval, and authorization receipt to carry the same nonextendable deadline; require the expected current slot; advance only through the closed lifecycle; and exact-replay identical bytes. A skipped state, stale expected reference, mismatched deadline, cross-key body, mixed principal, ambient default, reinstatement, or second revocation conflicts. Every stage locks both current unrevoked slots through commit. After durable timely `R`, `M` does not resample the shared deadline. |
-| Operation-work preflight, reservation, start, and committed result | Perform the exact read-only committed-result preflight first. A byte-identical committed result returns without charge or write; unresolved work proceeds with the same request to one accounting transaction. That transaction either consumes the checked-next ordinal and full charge and commits one reservation, or commits one request-keyed nonauthorizing pre-reservation refusal with no reservation or accounting change. Atomically permit only the reservation's one `RESERVED -> STARTED` transition, including its exact `TransactionIdentity/v1`, then one terminal `STARTED -> COMMITTED` result binding. Recovery stage advancement commits its `RecoveryAdvancementObservation/v1` as the sole result with `result_body` naming the stage created in that transaction. A transaction resolution or ambiguity query that proves the original committed instead closes its resolver reservation with the exact typed original-committed outcome, repeats both exact reservation/start/transaction/work chains and the original committed result, and inserts no duplicate stage or recovery observation. Changed outcome bytes or either identity conflict; a resolver for a resolver uses the earlier resolver's exact `RECONCILIATION` transaction subject and must reach the same closed result mapping. Conclusive noncommit requires a separately reserved, started, and charged reconciliation with one exact subject; one transaction verifies noncommit, inserts the typed terminal body, closes the original with its committed-result binding, records the resolution observation and binding, and closes the resolution. Only afterward may ordinary gates admit a replacement `R` or terminal conditions admit a separate publication-qualification reservation. Its `UNPROVEN` observation repeats the exact original `R` subject and complete identity chain and binds the preexisting original `CONCLUSIVE_NONCOMMIT` committed-result and terminal-result bodies; it writes only its own observation, binding, and slot close. An original still `STARTED`, an empty or different result, `R_VALID`, `R_LATE`, reversed ordering, or changed identity refuses `UNPROVEN`. A crashed `UNPROVEN` reconciliation is closed independently through its own exact `RECONCILIATION` transaction subject. Each reservation retains one terminal result, and exact retry returns only its byte-identical binding. Campaign or run coordinates cannot identify the original `R`. A crash before or after start, reused marker, changed mode, request, transaction, subject, predecessor or attempt ID, stale incarnation, same reservation for a distinct attempt, skipped ordinal, bare recovery observation, alternate observation key, or free replay without the byte-identical committed binding starts no work. |
+| Operation-work preflight, reservation, start, and committed result | Perform the exact read-only committed-result preflight first. FW01 and FW08 remain historical durable reads after session loss and call no IA11. FW02 and FW03 acquire every applicable rank-1 and rank-2 dependency, candidate AW04 alone calls IA11 with its rank-3 locks retained through the outer transaction, and rank-5 work locks follow. FW02 owns RW01 insertion for a new request and fresh-to-RW01 equality on replay. FW03 owns fresh-to-RW01 equality after rank 5 and only then persists RW04/RW05/RS14 and returns START. A byte-identical committed result returns without charge or write; unresolved work proceeds with the same request to one accounting transaction. That transaction either consumes the checked-next ordinal and full charge and commits one reservation, or commits one request-keyed nonauthorizing pre-reservation refusal with no reservation or accounting change. Atomically permit only the reservation's one `RESERVED -> STARTED` transition, including its exact `TransactionIdentity/v1`, then one terminal `STARTED -> COMMITTED` result binding. J/P/R/V/RECONCILIATION transaction identities and starts omit `adapter_incarnation_id` and require no IA11; M requires the same IA11-derived value in both. The closed protected-result union and ordered outcome partition represent every FW01–FW03/FW08 branch, give same-ID REQUEST_CONFLICT precedence over a simultaneous ReservationKey collision, and preserve RESERVED or STARTED on denial. `RECOVERY_STAGE_CLOSE` selects only stage-producing CURRENT J/P, R_VALID/R_LATE, and M outcomes and commits one atomic stage + BS125/RW10 + BS099/RW06 + RS15 group; BS099 names only BS125 and `BS125.result_body` names that same-transaction stage. Recovered `R_LATE` reaches `LATE` and stops before M. J/P equality or late selects `DIRECT_CLOSE` under either invocation mode and commits only BS108 + direct BS099/RW06 + RS15; recovered verification is also direct. FW01/FW08 dispatch by committed result kind and exact typed body before validating the immutable identity, reject partial or extra cross-branch carriers, and preserve ambiguity after an uncertain commit until conclusive noncommit evidence is accepted. A transaction resolution or ambiguity query that proves the original committed instead closes its resolver reservation with the exact typed original-committed outcome, repeats both exact reservation/start/transaction/work chains and the original committed result, and inserts no duplicate stage or recovery observation. Changed outcome bytes or either identity conflict; a resolver for a resolver uses the earlier resolver's exact `RECONCILIATION` transaction subject and must reach the same closed result mapping. Conclusive noncommit requires a separately reserved, started, and charged reconciliation with one exact subject; one transaction verifies noncommit, inserts the typed terminal body, closes the original with its committed-result binding, records the resolution observation and binding, and closes the resolution. Only afterward may ordinary gates admit a replacement `R` or terminal conditions admit a separate publication-qualification reservation. Its `UNPROVEN` observation repeats the exact original `R` subject and complete identity chain and binds the preexisting original `CONCLUSIVE_NONCOMMIT` committed-result and terminal-result bodies; it writes only its own observation, binding, and slot close. An original still `STARTED`, an empty or different result, `R_VALID`, `R_LATE`, reversed ordering, or changed identity refuses `UNPROVEN`. A crashed `UNPROVEN` reconciliation is closed independently through its own exact `RECONCILIATION` transaction subject. A late `J` or `P` closes its started reservation with exactly one
+`PRE_STAGE_EXPIRY_OBSERVATION` committed-result mapping to the same-transaction
+`PreStageExpiryObservation/v1`; it leaves the durable prefix unchanged and
+grants no refund or authority. Each reservation retains one terminal result,
+and exact retry returns only its byte-identical binding. Campaign or run coordinates cannot identify the original `R`. A crash before or after start, reused marker, changed mode, request, transaction, subject, predecessor or attempt ID, stale incarnation, same reservation for a distinct attempt, skipped ordinal, bare recovery observation, alternate observation key, or free replay without the byte-identical committed binding starts no work. |
 | Qualification-receipt finalization | Under locks on all required current pointers, require the exact complete ordered design, implementation, and release partitions, each result's exact ordered current prerequisite references, exact pointer equality, and `PASS` for every referenced tier and class result. Any omission, extra, duplicate, reorder, stale reference, `OPEN`, `PREREQUISITE_BLOCKED`, `FAIL`, `STALE`, or pointer change refuses receipt insertion. The positive implementation cell uses only the isolated conformance prestate defined below. |
 | Receipt finalization racing invalidation, supersession, or subject replacement | If finalization orders first, it may insert only the then-current exact passing receipt and the later change immediately makes that immutable receipt noncurrent. If the evidence change orders first, finalization refuses the old references. No mixed receipt can commit. |
 | Private package registration, independent review, or public export | Only the isolated registrar can register the exact package; only the isolated reviewer can read it and compare-and-set its projection and receipt; only the isolated exporter can return the exact current public pair. Registration and review require the same exact real-artifact binding through stimulus, plan cell, run, package, declared public mode, and package commitment, including its governing policies and authenticated acquisition or sanitization provenance. Export locks and revalidates the package mapping, deciding evidence, selected campaign and subject, policies, reviewer authorization, projection, and current receipt. Public synthetic bytes, an opaque artifact plus a cell label, any stale expected receipt, or any changed input returns no public body. Reciprocal attempts and every direct private-relation read are denied. |
@@ -7789,26 +8402,21 @@ admission attempt that refuses emits one exact nonauthorizing
 that result equals the row's prebound refusal oracle and fails only for an
 unexpected or mismatched outcome.
 
-The deployment matrix has explicit negative rows: `REMOTE`, `TCP_REMOTE`, or
-`TCP_LITERAL_LOOPBACK`
-must emit `REMOTE_POSTGRESQL_UNSUPPORTED`; `MANAGED` or `MANAGED_SERVICE` must
-emit `MANAGED_POSTGRESQL_UNSUPPORTED`; and any changed endpoint identity,
-target, socket path, socket-directory configured or resolved path,
-device/file identity, sequence count or order, port, or transport under an
-otherwise unchanged profile must emit `ENDPOINT_DRIFT` or
-`ENDPOINT_TOPOLOGY_MISMATCH` as the schema dictates. A controller-host or
-PostgreSQL-host change emits its corresponding host-mismatch code. Every row
-produces the expected `FailedDeploymentResult/v1`, no attestation, and no
-active or reserved epoch transition; exact oracle equality makes that negative
-row pass.
-
-The same matrix separately rejects a relative path, repeated separator,
-embedded `.` or `..`, noncanonical trailing separator, missing or nondirectory
-target, symlink retarget or resolution race, directory-only endpoint, address
-derived from the configured rather than resolved path, zero or multiple
-initial-profile members, and every omitted, added, duplicated, or reordered
-member. Each case uses the exact configuration member, endpoint member, live
-projection sequence, and derived address as one binding.
+The closed deployment matrix above derives every clean, applicable
+single-defect, and constructible adjacent simultaneous-defect row from the
+canonical registries. A distinct-path profile has 58 cases; an equal-path
+profile has 57 cases plus the independently reconstructed NMR029
+non-applicability proof. Each row fixes its typed stimulus, exact candidate
+projection, one selected failure triple, and `OR-DEP` expected projection.
+The accepted campaign-plan deployment basis owns the governing matrix
+identity and exact row selection; the projection bytes omit that identity, so
+the matrix-to-expected-projection edge has no reverse edge.
+A negative row passes only when the independently reconstructed observed
+projection equals those bytes, no attestation is created, and neither reserved
+nor active epoch changes. An unexpected refusal in the accept row or an
+unexpected attestation in a negative row fails. The finalizer's total
+`PRECEDENCE` order, not predicate discovery order, selects the one failure
+when defects coexist.
 
 ## Evidence record contract
 
@@ -7941,6 +8549,303 @@ This record does not:
 
 Implementation and qualification require accepted later plans. Deployment and
 live mutations also require exact authorization.
+
+## Canonical FW02/FW03 caller-to-work admission
+
+This section specifies the `P107001`–`P107013` proposal members and their
+`PV107001`–`PV107006` closure vectors. They are identified by the immutable
+`ISSUE107_PROPOSAL_SOURCE_ARTIFACT_SHA256` in the PostgreSQL schema record. The
+source-member inventory bounds their proposal subsection between its
+`### Issue #107 proposal-member roster` heading and the next level-3 accepted-
+source heading. Only the exact P107 table in that span generates `I_107`; the
+accepted-source paths and registries after it resume `I_A` and remain anchored
+only to revision `90108b516f5a1c460980a93670348f6e228124f2`. The two sets are
+disjoint. IA11, the RW01 admission carrier rules, and the no-proof
+`FW03(reservation)` form are proposal members, not accepted-source identities.
+The accepted 90108 FW03 source interface has an incarnation-proof parameter.
+Evidence for this section must preserve
+`I_A ∩ I_107 = ∅`, `domain(D_A)=I_A`, and
+`domain(D_107)=I_107` for those exact bounded sets before comparing
+implementation behavior.
+
+Proposed FW02 and FW03 use this complete admission matrix. They derive the caller from
+the authenticated SQL role and identity kind, stage, invocation mode, recovery
+mode, and recovery request from the immutable `OperationWorkIdentity`. They
+evaluate ordinary qualified-connection predicates from protected execution
+context. For C17/M they do not derive or project protected backend,
+continuity-session, or current-activation state locally; IA11 below is the sole
+projection. The request cannot supply or override the caller, stage owner,
+`work_class`, backend identity, or continuity session.
+
+The C17/M row has one closed owner boundary. O10 must obtain it by
+invoking the O16-owned read-only projection
+`IA11 project_current_m_work_admission(plan,work_identity_binding)`, and only
+from inside FW02 or FW03. IA11 accepts the exact plan and complete immutable
+work-identity binding already derived by O10. It has no caller, epoch,
+activation, backend, witness, continuity-session, capability, or adapter-
+incarnation override. O16 derives those values from the authenticated current
+backend and locks, at rank 3, the exact RS01 active-epoch selector, its RX01
+binding, RX02=`ACTIVE` state, RX03 activation, RX05 session witness, the RS08
+current-handoff selector, and its selected completed RC28-or-RC29 continuity
+binding. It verifies `RX03.current_handoff_ref=RS08`, plus their exact
+epoch, activation, backend, witness, continuity-session, capability, and
+adapter-incarnation equality. A successful result is exactly the typed
+`OperationWorkAdmission(AW04)` value defined below; denial returns no partial
+value. The rank-3 locks follow every rank-1
+and applicable rank-2 lock, precede all rank-5 accounting and work locks, and
+remain in the outer FW02 or FW03 transaction through commit or rollback. O10
+has no direct read on those relations and no other O16 callable. A concurrent
+replacement attempted after IA11 holds those rank-3 locks waits until the
+outer commit or rollback; rank 5 and any effect use the retained binding. A
+replacement that wins before rank-3 locking may determine the value IA11
+subsequently locks or cause admission denial.
+
+`OperationWorkAdmission` is a protected typed projection, not a canonical
+body, relation key, caller operand, or independent authority:
+
+```text
+OperationWorkAdmission := {
+  row_id: AW01 | AW02 | AW03 | AW04 | AW05 | AW06 | AW07 | AW08,
+  work_class: J | P | R | M | V | RECONCILIATION,
+  m_work_admission_identity:
+    NONE |
+    {
+      m_work_admission_id: Id,
+      adapter_incarnation_id: Id
+    }
+}
+```
+
+The canonical `OperationWorkPreflightResult/v1` body does not gain an
+admission member. FW01's protected SQL result is the typed pair
+`(preflight_result: OperationWorkPreflightResult,
+historical_admission: OperationWorkAdmission | NONE)`:
+FW01 performs a mandatory authoritative protected read of RW01 rather than
+inferring the carrier from the request or result chain. `historical_admission`
+is the exact RW01 value for `COMMITTED_REPLAY` and is
+`NONE` for `UNRESOLVED`. For every successful existing FW08 lookup, its
+protected SQL result returns the exact RW01 `OperationWorkAdmission` as a
+separate `historical_admission` projection beside the existing selected
+outcome projection. Neither callable returns a partial admission projection.
+
+`m_work_admission_identity=NONE` for AW01–AW03 and AW05–AW08. For AW04 it is
+present. FX01 server-generates the unique opaque `m_work_admission_id` when it
+inserts the immutable RX03 activation commit; RX03 stores it, and RX05 binds
+the authenticated `adapter_incarnation_id` to that activation's live session
+witness. IA11 returns exactly those two non-secret IDs with AW04 and exposes
+no epoch, target, activation binding, handoff, backend, witness,
+continuity-session, capability, or capability digest. The first ID uniquely
+names the durable RX03 activation and its exact handoff/continuity binding
+without returning those components; the second records the live incarnation
+that IA11 authenticated. The IDs identify the admission that was proved; they
+do not authorize a reservation, start, stage, or target effect.
+
+O10 owns the durable carrier. Every newly admitted FW02 branch inserts the
+complete projection immutably in RW01 in the same transaction as the request
+and either RW02 or RW03. Exact FW02 reservation or refusal replay invokes
+IA11 once for candidate AW04, then takes the rank-5 work locks and compares its
+complete fresh result with RW01 field for field before returning the prior
+outcome. FW03 follows the same ownership boundary for each candidate AW04
+first start or repeat: IA11 returns only the fresh projection or a
+currentness/session denial; FW03 takes rank 5, validates RW01, and owns the
+fresh-to-stored comparison. Only after equality does FW03 persist
+RW04/RW05/RS14 and return START. Only AW04 copies `adapter_incarnation_id` into the
+M branches of TransactionIdentity and OperationWorkStart. Every AW01–AW03 and
+AW05–AW08 branch constructs both complete bodies with that field absent and
+calls IA11 zero times. FW01 and FW08 may return and validate the stored carrier
+without IA11. After session loss it remains historical proof of the admitted
+request; it does not assert currentness or authorize another M reservation or
+start.
+
+The protected FW01–FW03/FW08 SQL return is this closed noncanonical union:
+
+```text
+OperationWorkProtectedResult :=
+  PREFLIGHT(
+    preflight_result: EvidenceRef,
+    historical_admission: OperationWorkAdmission | NONE
+  ) |
+  REFUSAL(
+    refusal: EvidenceRef,
+    historical_admission: OperationWorkAdmission
+  ) |
+  RESERVATION(
+    reservation: EvidenceRef,
+    historical_admission: OperationWorkAdmission
+  ) |
+  START(
+    transaction_identity: EvidenceRef,
+    start: EvidenceRef,
+    historical_admission: OperationWorkAdmission
+  ) |
+  READBACK(
+    selected_outcome: EvidenceRef | NONE,
+    historical_admission: OperationWorkAdmission | NONE
+  ) |
+  ADMISSION_DENIED(
+    preserved_work_state: ABSENT | RESERVED | STARTED | COMMITTED
+  ) |
+  DATABASE_CONFLICT(
+    preserved_work_state: ABSENT | RESERVED | STARTED | COMMITTED |
+                          INCONSISTENT
+  )
+```
+
+`PREFLIGHT` makes FW01's `COMMITTED_REPLAY` and `UNRESOLVED` bodies
+representable, and its immutable-chain conflict uses the `DATABASE_CONFLICT`
+arm rather than an untyped exception. `REQUEST_CONFLICT` and
+`WORK_ALREADY_RESERVED` are represented only by `REFUSAL` whose referenced
+durable RW02 body carries that exact code. A principal outside a callable's
+PostgreSQL EXECUTE cell receives an ACL denial before function execution; that
+SQL privilege denial is not an `ADMISSION_DENIED` union member. No branch may
+return a partial admission carrier. `ADMISSION_DENIED` never uses
+`INCONSISTENT`. Its state is the durable state already present: pre-start
+denial preserves `RESERVED`, and denial of an already-started repeat preserves
+`STARTED`.
+
+Throughout this acceptance record, a same-ID changed-body request means the
+same `(plan,request_id)` with changed exact `OperationWorkRequest/v1` bytes.
+Because RequestKey includes the digest of those complete bytes, that request
+has a different RequestKey. A different-request existing-reservation branch
+instead has a different `(plan,request_id)` whose ReservationKey already
+exists.
+
+| Caller | Admitted immutable work identity | Admitted invocation | Continuity-session condition |
+| --- | --- | --- | --- |
+| `C16` publication adapter | `StageAttemptWorkIdentity` with `stage=J`, `P`, or `R` | `FORWARD/NONE` with `recovery_request_id=NONE`, or `RECOVERY/ADVANCE_STAGE` with a non-`NONE` recovery request | Uses C16's qualified per-transaction connection. An activation-bound session is neither an operand nor authority for this row; C16 has no C17 role or M admission. |
+| `C17` continuity client | `StageAttemptWorkIdentity` with `stage=M` | `FORWARD/NONE` with `recovery_request_id=NONE`, or `RECOVERY/ADVANCE_STAGE` with a non-`NONE` recovery request | FW02 and FW03 run on the exact backend session bound by the selected active epoch and durable admission state. The session-local witness, continuity-session identity, and adapter incarnation must match. |
+| `C18` verification adapter | `VerificationAttemptWorkIdentity`, whose derived work class and transaction stage are `V` | `FORWARD/NONE` with `recovery_request_id=NONE`, or `RECOVERY/VERIFY_STAGE` with a non-`NONE` recovery request | Uses C18's qualified evidence-only transaction connection. It receives no activation-session or mutation authority. |
+| `C19` recovery adapter | `TransactionResolutionWorkIdentity` | `RECOVERY/RESOLVE_TRANSACTION` with a non-`NONE` recovery request | Uses C19's qualified current connection. The identity's `stage` names the protected transaction subject and grants no stage callable. |
+| `C19` recovery adapter | `AmbiguityQueryWorkIdentity` | `RECOVERY/QUERY_AMBIGUITY` with a non-`NONE` recovery request | Uses C19's qualified current connection. The identity's `stage` names the protected transaction subject and grants no stage callable. |
+| `C19` recovery adapter | `ReconciliationWorkIdentity` | `RECOVERY/RECONCILE_SUBJECT` with a non-`NONE` recovery request | Uses C19's qualified current connection and exact protected reconciliation subject. It receives no stage or activation-session authority. |
+
+After a row matches, FW02 derives `work_class=J|P|R|M|V` from the corresponding
+stage or verification identity and `work_class=RECONCILIATION` from any C19
+identity. No independent or caller-supplied work-class discriminator exists.
+FW02 checks admission before writing RW01 or RW02, invoking IA04, charging or
+advancing RS10, or writing RE05, RW03, or RS13. FW03 rederives and rechecks the
+same row before writing RW04, RW05, or RS14. Both functions acquire every
+applicable rank-1 and rank-2 dependency before candidate-AW04 IA11 rank 3 and
+every rank-5 work lock afterward. A denied FW03 call leaves the existing state
+unchanged: before a first start it remains `RESERVED`; an already-started
+repeat remains `STARTED`. Neither can be consumed, rewound, or reclassified.
+For candidate AW04, “checks admission” means a successful IA11 result under
+the retained rank-3 locks; no O10-local reconstruction can substitute for it.
+
+The denied logical complement includes C16 with M, V, transaction-resolution,
+ambiguity-query, or reconciliation identity; C17 with J/P/R stage,
+verification, transaction-resolution, ambiguity-query, or reconciliation
+identity; C18 with any stage, transaction-resolution, ambiguity-query, or
+reconciliation identity; C19 with any stage or verification identity; every
+admitted identity under a different invocation mode, recovery
+mode, or recovery-request presence; C17 M on any absent, replaced, pooled,
+reconnected, transferred, or differently bound activation session; every
+other or unresolved principal; every identity/digest or protected-session
+mismatch; and every attempted caller-supplied stage-owner, `work_class`, or
+continuity override. A principal without PostgreSQL EXECUTE privilege is the
+ACL-denial complement and never enters the function. An admitted caller whose
+tuple misses the logical matrix receives typed `ADMISSION_DENIED`. Each case
+fails before mutation and writes none of RW01,
+RW02, RE05, RW03, RS10, RS13, RW04, RW05, RS14, a stage relation, or a result
+body.
+
+Across FW01–FW03 and FW08, admission, refusal, collision, and immutable-chain
+cases use this ordered, total partition after PostgreSQL ACL admission; their
+defined success, replay, and readback outcomes remain unchanged:
+
+1. FW02/FW03 logical matrix failure, IA11 currentness/session denial, or a
+   valid fresh AW04 projection that FW02/FW03 finds unequal to valid RW01 is
+   transient `ADMISSION_DENIED` with no durable effect.
+2. The same `(plan,request_id)` with changed exact request bytes derives a
+   different RequestKey and commits the admitted request-keyed RW01/RW02
+   `REQUEST_CONFLICT` refusal.
+   This branch wins if the incoming work identity also collides with another
+   ReservationKey.
+3. Only when branch 2 does not apply, a different `(plan,request_id)` whose
+   ReservationKey already exists commits `WORK_ALREADY_RESERVED`.
+4. After the request-key branches, any remaining internally inconsistent
+   immutable digest, key, admission carrier, reservation, start, transaction,
+   or result chain is transient `DATABASE_CONFLICT` and writes nothing.
+5. Every remaining valid case takes its defined new, exact-replay, or readback
+   branch.
+
+The predicates are evaluated in that order and are non-overlapping after the
+first match. Both durable refusal codes consume no observation, charge,
+ordinal, start, stage, or result effect. Every transient result reports and
+preserves the durable state already reached; no denial changes `STARTED` back
+to `RESERVED`. No currentness or session drift is a database conflict, and no
+conflict or historical carrier can stand in for current AW04 admission.
+
+FW02 exact replay and every FW03 repeat rederive the same row; candidate AW04
+must acquire every applicable rank-1 and rank-2 dependency, call IA11 with its
+rank-3 locks retained through the outer transaction, and then acquire rank 5.
+IA11 does not read RW01 or decide fresh-to-stored equality. FW02 owns that
+equality on replay. FW03 owns it after rank 5 and only then persists
+RW04/RW05/RS14 and returns START. A cross-role, changed-row, stale-
+epoch, replaced-activation, fenced, lost-session, changed-witness, changed-
+continuity-session, or changed-incarnation request is `ADMISSION_DENIED`, not
+replay. FW01 and FW08 retain their read-only caller set for recovery
+inspection. They rederive the immutable identity-to-owner and work-class
+mapping and validate and return the RW01 admission carrier, but they do not
+call IA11, evaluate current activation continuity, or turn historical read
+access into new M authority. Their inconsistent immutable-chain outcome is
+`DATABASE_CONFLICT`, not a currentness decision. Read access by C19 does not
+make C19 eligible for stage reservation or start. PostgreSQL releases every
+ranked row lock when the mutating transaction commits or rolls back. After
+the driver returns from COMMIT, acknowledgement is a separate protected read of the durable receipt
+or committed-result mapping from the authoritative primary; it carries no lock
+from the mutating transaction. The protected return and driver COMMIT return
+alone are not acknowledgement. That acknowledgement read and every later exact
+readback compare the immutable work identity, its digest, the stored admission
+row and derived work class, transaction mode and stage, and stored AW04
+identity where applicable. They invoke no IA11. Any new M reservation or start
+still requires a fresh IA11 result.
+
+Implementation evidence supplies independent positive vectors for all 13
+admitted caller/identity/invocation rows: six C16 stage cases, two C17 M cases,
+two C18 V cases, and three C19 reconciliation-family cases. It applies each
+row to FW02 and FW03 and verifies the exact permitted reservation, accounting,
+and start effects. Each of the eleven non-AW04 expansions constructs complete
+TransactionIdentity and OperationWorkStart bodies with
+`adapter_incarnation_id` absent, calls IA11 zero times, and rejects that field
+as an extra caller or body member. The two C17 vectors construct the M variants
+with the field present in both bodies and equal only to the IA11 witness. They
+additionally prove IA11 is the sole
+O10-to-O16 path, returns the AW04 projection whose M-work admission identity
+has exactly two fields, follows all applicable ranks 1 and 2 inside
+FW02/FW03, precedes rank 5, and
+retains those locks through commit or rollback. They prove FX01 generation,
+RX03/RX05 origin, FW02-owned atomic RW01 insertion and replay equality,
+FW03-owned fresh-to-RW01 equality after rank 5 followed by incarnation copying
+and RW04/RW05/RS14 persistence before START, and post-session-loss
+historical readback without reauthorization. Independent
+complement-denial vectors cross every C16–C19
+caller with every identity member and stage, every invocation/recovery-mode
+and recovery-request-presence combination, and exact, absent, replaced, and
+mismatched continuity sessions. They also reject a missing AW04 incarnation,
+a supplied or changed AW04 incarnation, and any incarnation field on a
+non-AW04 body without calling IA11. Race vectors replace the active epoch,
+activation binding, completed continuity binding, fence, backend session,
+witness, continuity-session identity, capability, or adapter incarnation
+before IA11 locks, and attempt replacement after rank 3 but before rank 5. A
+pre-lock replacement may become the exact value IA11 subsequently locks or may
+deny admission with no effect. Once rank-3 locks are held, replacement waits
+until the outer commit or rollback; it cannot race through and return
+`ADMISSION_DENIED` inside that transaction. Session loss never transfers M
+authority. The digest-bound proposal inventory records these work, replay,
+acknowledgement, readback, race, fencing, conflict, and no-effect obligations
+as P107001–P107013, closed by PV107001–PV107006 and compared through
+`EV106-WORK`. None is assigned the accepted 90108 source identity. `EV-PG` and `EV-FLT` realize their
+implementation evidence classes. It records IA11's exact grant, typed-only
+return, two bounded call sites and branch guards, no-override checks,
+direct-relation denials, and full complement as `EV106-ACL`; `EV-ACL` realizes
+that class and retains C19's denial on FW04,
+FJ01–FJ03, FM01, FV01, and every stage-relation write path.
+
+These are accepted-source and separately identified proposal closure
+obligations, not executed evidence. They report no
+implemented function, PostgreSQL run, provider or worker behavior, deployment,
+or live recovery result.
 
 ## Related records and remaining gates
 

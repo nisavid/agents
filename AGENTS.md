@@ -7,6 +7,10 @@
 Issues, PRDs, and Wayfinder maps are tracked in GitHub Issues for
 `nisavid/agents`. See `docs/agents/issue-tracker.md`.
 
+The Hindsight PRD (`tooling/hindsight/docs/PRD.md`) stays its committed work
+contract. Publish it to the tracker only when the operator explicitly
+authorizes that publication.
+
 ### Triage labels
 
 Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`,
@@ -15,8 +19,11 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`,
 
 ### Domain docs
 
-This is a single-context repository with root `CONTEXT.md` and system-wide
-ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+This repository uses the single-context layout: a root `CONTEXT.md` and
+system-wide ADRs under `docs/adr/`, created when domain modeling first needs
+them. Neither exists yet. The Hindsight glossary lives at
+`tooling/hindsight/lib/hindsight_memory_control_plane/CONTEXT.md`. See
+`docs/agents/domain.md`.
 
 ## Ownership boundary
 
@@ -24,7 +31,9 @@ Rolecasting, Tricritical, Versionkeeping, Mergecraft, Artifact Customs, Task
 Witness, and Tidesmith live in
 [`nisavid/provingkit`](https://github.com/nisavid/provingkit). Do not add or
 restore their source here; change them in Provingkit.
-`scripts/validate_provingkit_retirement.py` enforces this boundary.
+`scripts/validate_provingkit_retirement.py` rejects the retired paths it lists;
+it does not detect member source added elsewhere, so check new paths against
+this boundary.
 
 `tooling/` owns the personal tools that remain here, each with its own
 documentation. `.scratch/` holds unrelated experiments and is not a supported

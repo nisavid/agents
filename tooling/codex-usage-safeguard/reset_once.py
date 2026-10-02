@@ -60,7 +60,7 @@ def execute(config, runtime, account_name, episode_id, confirmation):
             raise ValueError('episode_mismatch')
         path = runtime / f'reset-{episode_id}.json'
         previous = json.loads(path.read_text()) if path.exists() else None
-        if previous and previous.get('status') in ('reset', 'already_redeemed'):
+        if previous and previous.get('status') in ('reset', 'already_redeemed', 'no_credit', 'nothing_to_reset'):
             return previous
         if previous and previous.get('status') in ('attempting', 'outcome_unknown', 'reconciliation_required'):
             # A successful provider reset can restore quota before its response
@@ -70,13 +70,11 @@ def execute(config, runtime, account_name, episode_id, confirmation):
             previous.update(status='reconciliation_required', reason='prior_reset_outcome_unconfirmed')
             save(path, previous)
             raise ValueError('reset_reconciliation_required')
+        if previous:
+            raise ValueError('invalid_saved_reset_status')
         usage = read_account(account, node=config['nodeBinary'])
         inventory = read_account(account, mode='resets', node=config['nodeBinary'])
         request = prepare(account, episode, usage, inventory, confirmation, dt.datetime.now(dt.UTC).isoformat())
-        if previous:
-            # Never pick another credit or a new key after an uncertain attempt.
-            for key in ('creditId', 'idempotencyKey', 'confirmationReference'):
-                request[key] = previous['request'][key]
         record = {'request': request, 'status': 'attempting'}
         save(path, record)
         try:

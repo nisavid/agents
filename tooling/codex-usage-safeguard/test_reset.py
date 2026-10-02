@@ -54,5 +54,24 @@ class ResetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no_applicable_reset'):
             prepare(ACCOUNT, self.state['episode'], sample(100, resets=0), self.inventory, 'human-reply', '2026-10-01T00:00:00Z')
 
+    def test_known_reset_outcomes_are_terminal_and_unknown_saved_status_fails_closed(self):
+        for status in ('reset', 'already_redeemed', 'no_credit', 'nothing_to_reset', 'invalid'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as name:
+                root = Path(name); episode = self.state['episode']
+                (root / 'daybreak.json').write_text(json.dumps(self.state))
+                request = prepare(ACCOUNT, episode, sample(100), self.inventory, 'actual-human-reply', '2026-10-01T00:00:00Z')
+                path = root / ('reset-' + episode['id'] + '.json')
+                previous = {'request': request, 'status': status, 'response': {'code': status}}
+                path.write_text(json.dumps(previous)); before = path.read_bytes()
+                config = {'accounts': [{**ACCOUNT, 'name': 'daybreak'}]}
+                with patch('reset_once.read_account') as read, patch('reset_once.subprocess.run') as consume:
+                    if status == 'invalid':
+                        with self.assertRaisesRegex(ValueError, 'invalid_saved_reset_status'):
+                            execute(config, root, 'daybreak', episode['id'], 'another-reference')
+                    else:
+                        self.assertEqual(execute(config, root, 'daybreak', episode['id'], 'another-reference'), previous)
+                    read.assert_not_called(); consume.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+
 if __name__ == '__main__':
     unittest.main()

@@ -172,6 +172,9 @@ An `attempting` or `outcome_unknown` saved reset is marked
 consume request and preserves the exact saved request, credit, key and approval.
 Determine the actual provider outcome before any separately authorized retry;
 restored quota or a missing credit is not a reason to bypass eligibility checks.
+Known `reset`, `already_redeemed`, `no_credit`, and `nothing_to_reset` results
+are terminal for the saved logical attempt. Later helper invocations return the
+saved result without a new request; an unrecognized saved status blocks execution.
 
 The reference is an audit pointer; typing an arbitrary string does not establish
 consent. The caller must verify the reply and honor any execution approval gate.

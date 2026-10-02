@@ -137,7 +137,26 @@ class TransportTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.publish(str(regular))
         pipe = self.route('app.sock'); self.publish(pipe)
         os.chmod(self.root / 'transport' / 'candidates.json', 0o644)
-        with self.assertRaises(ValueError): self.manager().connection()
+        with self.assertRaises(RuntimeError): self.manager().connection()
+        self.assertEqual(len(self.alerts), 1)
+        with self.assertRaises(RuntimeError): self.manager().connection()
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_corrupt_candidate_registry_cannot_displace_accepted_route(self):
+        pipe = self.route('app.sock'); self.publish(pipe)
+        manager = self.manager(); manager.connection(); manager.close()
+        (self.root / 'transport' / 'candidates.json').write_text('invalid JSON')
+        self.assertEqual(self.manager().connection().route, pipe)
+        self.assertEqual(self.alerts, [])
+
+    def test_unreadable_health_and_malformed_registry_record_one_recovery_incident(self):
+        root = self.root / 'transport'; root.mkdir(mode=0o700)
+        (root / 'health.json').write_text('bad JSON')
+        (root / 'candidates.json').write_text('{"bad": {"publishedAt": "invalid"}}')
+        with self.assertRaises(RuntimeError): self.manager().connection()
+        self.assertEqual(len(self.alerts), 1)
+        with self.assertRaises(RuntimeError): self.manager().connection()
+        self.assertEqual(len(self.alerts), 1)
 
 
 if __name__ == '__main__': unittest.main()

@@ -6,9 +6,10 @@ import stat
 import tempfile
 
 
-def private_directory(path):
+def private_directory(path, *, create=True):
     path = Path(path)
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if create:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError('private_owned_directory_required')

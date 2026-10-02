@@ -15,9 +15,10 @@ def load_config(path, state_dir):
     state = Path(state_dir).resolve()
     if state != Path(config['stateDir']).resolve():
         raise ValueError('configured_state_directory_mismatch')
-    if state == Path(__file__).parent.resolve() or Path(__file__).parent.resolve() in state.parents:
+    release = Path(__file__).resolve().parents[2]  # agents archive root, not only this package
+    if state == release or release in state.parents:
         raise ValueError('state_must_live_outside_release')
-    private_directory(state)
+    private_directory(state, create=False)
     for key in ('nodeBinary', 'nativeBridgeScript', 'foremanThreadId', 'parentThreadId', 'sharedLock'):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise ValueError('missing_installation_setting')

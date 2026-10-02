@@ -84,11 +84,12 @@ def reset_count(sample):
 
 
 def observation_failed(previous, policy):
-    """Only an already-confirmed exhaustion episode can justify outage fallback."""
+    """The approved fallback applies only during an existing reset-confirmation wait."""
     state = copy.deepcopy(previous)
     episode = state.get('episode')
     events = []
-    if episode and episode.get('active') and policy.get('pauseWhenUnmetered') is True:
+    if (episode and episode.get('active') and policy.get('pauseWhenUnmetered') is True
+            and any(e['kind'] == 'reset_confirmation_required' for e in episode['events'])):
         emit(episode, events, 'foreman_pause_required', 'observation_failed_during_confirmed_exhaustion')
     return state, events
 
@@ -120,19 +121,19 @@ def advance(previous, sample, account, *, now, policy=None):
             else:
                 episode['budgetStatus'] = 'quota_unknown_wait_blocked'
             return state, events
+        count = reset_count(sample)
+        pending = any(e['kind'] == 'reset_confirmation_required' for e in episode['events'])
+        if not pending and count and count > 0:
+            episode.update(resetCount=count, confirmationStartedAt=now)
+            balance = decimal((sample.get('credits') or {}).get('balance'))
+            episode.update(lastBalance=str(balance) if balance is not None else None,
+                           waitingCredits='0', waitingSpendUsd='0')
+            emit(episode, events, 'reset_confirmation_required')
+            pending = True
         if not any(e['kind'] == 'foreman_pause_required' for e in episode['events']):
-            count = reset_count(sample)
-            pending = any(e['kind'] == 'reset_confirmation_required' for e in episode['events'])
-            if not pending and count and count > 0:
-                episode.update(resetCount=count, confirmationStartedAt=now)
-                balance = decimal((sample.get('credits') or {}).get('balance'))
-                episode.update(lastBalance=str(balance) if balance is not None else None,
-                               waitingCredits='0', waitingSpendUsd='0')
-                emit(episode, events, 'reset_confirmation_required')
-                pending = True
             if count == 0 and main_scope:
                 reason = 'no_applicable_reset'
-            elif pending or main_scope:
+            elif pending:
                 reason = wait_budget(episode, sample, previous, now, policy)
             else:
                 episode['budgetStatus'] = 'no_reset_confirmation_pending'
@@ -153,7 +154,7 @@ def advance(previous, sample, account, *, now, policy=None):
         emit(episode, events, 'foreman_pause_required', 'no_applicable_reset')
     elif count is None:
         emit(episode, events, 'reset_availability_unknown')
-    if not main_scope and not count:
+    if not count:
         episode['budgetStatus'] = 'no_reset_confirmation_pending'
         return state, events
     # Include debits since the preceding healthy sample to cover detection lag.

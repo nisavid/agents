@@ -1,6 +1,7 @@
 // Operator-only one-reset request; never called by the polling service.
 import {readFileSync} from 'node:fs';
 import {providerFetch} from './http.mjs';
+import {readCredentials} from './credentials.mjs';
 
 try {
   const request = JSON.parse(readFileSync(0, 'utf8'));
@@ -11,10 +12,8 @@ try {
   if (!expected || request.email !== expected.email || request.accountId !== expected.accountId) {
     throw new Error('wrong_account');
   }
-  const stored = JSON.parse(readFileSync(expected.authFile, 'utf8'));
-  const token = stored.tokens.access_token;
-  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
-  if ((claims.email ?? claims['https://api.openai.com/profile']?.email) !== request.email || stored.tokens.account_id !== request.accountId) {
+  const {email, id, token} = readCredentials(expected.authFile);
+  if (email !== request.email || id !== request.accountId) {
     throw new Error('credential_identity_mismatch');
   }
   const headers = {authorization: `Bearer ${token}`, accept: 'application/json', 'ChatGPT-Account-Id': request.accountId};

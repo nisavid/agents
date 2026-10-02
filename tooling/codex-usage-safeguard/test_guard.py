@@ -27,7 +27,7 @@ class GuardTests(unittest.TestCase):
         original = state['episode']['id']
         for used in (99, 100, 101, None, 0, 100):
             state, events = advance(copy.deepcopy(state), sample(used, resets=2), ACCOUNT, now=20)
-            self.assertEqual(events, [])
+            self.assertFalse(any(e['kind'] == 'foreman_pause_required' for e in events))
             self.assertEqual(state['episode']['id'], original)
 
     def test_identity_mismatch_and_missing_telemetry_never_trigger(self):

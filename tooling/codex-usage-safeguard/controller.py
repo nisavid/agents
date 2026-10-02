@@ -142,22 +142,28 @@ def dispatch(state, account, config, bridge, path):
         if event['kind'] == 'foreman_pause_required':
             targets.insert(0, ('foreman', config['foremanThreadId']))
         for key, target in targets:
-            if event['kind'] in ('reset_confirmation_required', 'reset_availability_unknown'):
-                pause = next((e for e in episode['events'] if e['kind'] == 'foreman_pause_required'), None)
-                delivered = (pause or {}).get('deliveries', {}).get('parent', {})
-                if delivered.get('status') == 'submitted':
-                    event.setdefault('deliveries', {})['parent'] = {
-                        'status': 'submitted', 'target': target, 'coalescedInto': pause['id']}
-                    save(path, state)
-                    continue
             delivery = event.setdefault('deliveries', {}).get(key)
             if delivery:
                 if delivery['status'] == 'submitted':
                     continue
-                # A crash after submitting must never create a second action.
+                # Preserve the original evidence even if a later pause mentions
+                # the same approval. Reconnection/coalescing cannot resolve it.
                 failures.append('delivery_outcome_requires_reconciliation')
                 continue
+            if event['kind'] in ('reset_confirmation_required', 'reset_availability_unknown'):
+                pause = next((e for e in episode['events'] if e['kind'] == 'foreman_pause_required'), None)
+                delivered = (pause or {}).get('deliveries', {}).get('parent', {})
+                if delivered.get('status') == 'submitted' and delivered.get('includesEvent') == event['id']:
+                    event.setdefault('deliveries', {})['parent'] = {
+                        'status': 'submitted', 'target': target, 'coalescedInto': pause['id']}
+                    save(path, state)
+                    continue
             event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
+            if event['kind'] == 'foreman_pause_required' and key == 'parent':
+                confirmation = next((e for e in episode['events'] if e['kind'] in (
+                    'reset_confirmation_required', 'reset_availability_unknown')), None)
+                if confirmation:
+                    event['deliveries'][key]['includesEvent'] = confirmation['id']
             save(path, state)
             try:
                 bridge.send(target, make_prompt(event, episode, account, path, key))

@@ -85,6 +85,58 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(state['episode']['resetCount'])
         self.assertEqual(events[0]['kind'], 'reset_availability_unknown')
 
+    def test_main_unknown_applicability_does_not_start_confirmation_wait_budget(self):
+        policy = {'usdPerCredit': '0.04', 'pauseAtUsd': '8'}
+        value = sample(100); value['rate_limit_reset_credits'] = {}
+        state, _ = advance({}, value, ACCOUNT, now=10, policy=policy)
+        value['credits']['balance'] = '500'
+        state, events = advance(state, value, ACCOUNT, now=20, policy=policy)
+        self.assertEqual(events, [])
+        self.assertNotIn('waitingSpendUsd', state['episode'])
+
+    def test_reset_arriving_after_submitted_no_reset_pause_requests_confirmation(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / 'main.json'; transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
+            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            state, events = advance(state, sample(100, resets=1), ACCOUNT, now=20)
+            self.assertEqual([e['kind'] for e in events], ['reset_confirmation_required'])
+            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            self.assertEqual([target for target, _ in transport.received], ['foreman', 'parent', 'parent'])
+
+    def test_new_pause_does_not_overwrite_uncertain_confirmation_receipt(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / 'main.json'
+            policy = {'usdPerCredit': '0.04', 'pauseAtUsd': '8'}
+            state, _ = advance({}, sample(100), ACCOUNT, now=10, policy=policy)
+            with self.assertRaises(RuntimeError):
+                dispatch(state, ACCOUNT, CONFIG, ReceiptTransport(path, fail='parent'), path)
+            old_receipt = copy.deepcopy(state['episode']['events'][0]['deliveries']['parent'])
+            state, _ = advance(state, sample(100, balance='800'), ACCOUNT, now=20, policy=policy)
+            with self.assertRaises(RuntimeError): dispatch(state, ACCOUNT, CONFIG, ReceiptTransport(path), path)
+            self.assertEqual(state['episode']['events'][0]['deliveries']['parent'], old_receipt)
+
+    def test_daybreak_no_reset_outage_cannot_start_unapproved_wait(self):
+        from safeguard import observation_failed
+        state, _ = advance({}, sample(100, resets=0), dict(ACCOUNT, name='daybreak'), now=10)
+        _, events = observation_failed(state, {'pauseWhenUnmetered': True})
+        self.assertEqual(events, [])
+
+    def test_preflight_config_rejects_missing_state_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = self.config(root)
+            config['stateDir'] = str(root / 'missing'); path = root / 'config.json'; save(path, config)
+            with self.assertRaises((ValueError, FileNotFoundError)): load_config(path, root / 'missing')
+            self.assertFalse((root / 'missing').exists())
+
+    def test_config_rejects_state_anywhere_inside_release_archive(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = self.config(root)
+            config['stateDir'] = str(Path(__file__).resolve().parents[2] / 'private-state')
+            path = root / 'config.json'; save(path, config)
+            with self.assertRaisesRegex(ValueError, 'outside_release'):
+                load_config(path, config['stateDir'])
+
     def test_status_is_read_only_and_distinguishes_stale_health(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name); config = self.config(root); path = root / 'config.json'; save(path, config)

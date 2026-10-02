@@ -7,6 +7,7 @@ Quota, approval, and delivery state are never modified by this module.
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -60,6 +61,14 @@ def desktop_notice(message):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
 
 
+def valid_route(route):
+    return (isinstance(route, dict)
+            and all(isinstance(route.get(k), str) and route[k] for k in ('pipe', 'binding', 'generation'))
+            and isinstance(route.get('socket'), dict)
+            and isinstance(route.get('publishedAt'), (int, float))
+            and math.isfinite(route['publishedAt']))
+
+
 class Transport:
     def __init__(self, state_dir, config, *, factory=None, notifier=desktop_notice, clock=time.time):
         self.root = private_directory(private_directory(state_dir) / 'transport')
@@ -67,6 +76,16 @@ class Transport:
         self.factory = factory or (lambda cfg, route: NativeBridge(cfg, route['pipe']))
         self.bridge = None; self.route = None; self.checked_at = 0
         self.attempted = {}
+
+    def _health(self):
+        try:
+            value = read_private(self.root / 'health.json', {})
+            if not isinstance(value, dict): raise ValueError('invalid_health_record')
+            return value
+        except (OSError, ValueError):
+            # Health is reconstructible; never apply this recovery to delivery,
+            # approval or quota ledgers. Persist a new incident if still offline.
+            return {}
 
     def _verify(self, route):
         if route['binding'] != binding(self.config):
@@ -82,13 +101,13 @@ class Transport:
         return candidate
 
     def _healthy(self, route):
-        old = read_private(self.root / 'health.json', {})
+        old = self._health()
         value = {'healthy': True, 'observedAt': self.clock(), 'generation': route['generation'],
                  'incident': None, 'lastRecoveredIncident': old.get('incident') or old.get('lastRecoveredIncident')}
         save(self.root / 'health.json', value)
 
     def _failed(self, candidates):
-        value = read_private(self.root / 'health.json', {})
+        value = self._health()
         first = not value.get('incident')
         if first:
             value = {'incident': str(uuid.uuid4()), 'startedAt': self.clock(), 'attempts': 0,
@@ -124,11 +143,20 @@ class Transport:
                 return self.bridge
             except Exception:
                 self.close()
-        candidates = read_private(self.root / 'candidates.json', {})
-        health = read_private(self.root / 'health.json', {})
+        try:
+            candidates = read_private(self.root / 'candidates.json', {})
+            if not isinstance(candidates, dict) or not all(valid_route(r) for r in candidates.values()):
+                raise ValueError('invalid_registry')
+        except (OSError, ValueError):
+            candidates = {}  # Still try the independently persisted accepted route.
+        health = self._health()
         if (now < health.get('retryAt', 0) and sorted(candidates) == health.get('candidateSet')):
             raise RuntimeError('transport_waiting_for_local_retry')
-        accepted = read_private(self.root / 'accepted.json')
+        try:
+            accepted = read_private(self.root / 'accepted.json')
+            if accepted is not None and not valid_route(accepted): raise ValueError('invalid_accepted_route')
+        except (OSError, ValueError):
+            accepted = None
         routes = sorted(candidates.values(), key=lambda route: route['publishedAt'], reverse=True)
         if accepted:
             routes = [accepted] + [r for r in routes if r['generation'] != accepted['generation']]

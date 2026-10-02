@@ -92,6 +92,18 @@ connections per poll, and backs off locally up to five minutes after failure.
 Native RPC timeout is five seconds; quota reads begin concurrently. These are
 best-effort safeguards, not a hard spending cap or an app-boot guarantee.
 
+Failed checks retain bounded `lastFailures` diagnostics in transport health:
+the category, check stage, numeric RPC code when available, and the recipient
+role. They omit raw error prose, credentials, and response payloads. Diagnostics
+survive retry cooldowns and clear only on a verified recovery. A missing old
+socket and rejection through a newer candidate can therefore be distinguished.
+`native_socket_access_denied` means the diagnostic process could not connect;
+it does not establish invalid caller authorization. Use the supported execution
+approval flow for a narrowly scoped read-only check, never an alternate socket
+or substituted identity. `native_app_request_failed` is deliberately inconclusive:
+the app may mask a caller rejection behind this response. Inspect the app's local
+diagnostic log for the matching owner and time before proposing a repair.
+
 An incident is persisted in `transport/health.json`. The observer attempts one
 `notify-send` alert per incident, persisting intent before delivery. `submitted`
 means the notification command succeeded, not that a person saw it; `failed`
@@ -108,6 +120,15 @@ the registration; update only the private registration, repeat exact Foreman and
 parent preflight, and perform the controlled restart. There is no implemented
 unattended route for creating new caller authorization. Do not relax peer checks
 or create a replacement owner to make recovery appear successful.
+
+An account switch can leave a cloud owner inaccessible with an app diagnostic
+such as `thread placement belongs to a different actor`. A fresh socket cannot
+repair that actor boundary. Stop retrying that owner during maintenance and
+obtain operator approval for a genuine supported registration under the intended
+account/owner; never copy this repair task's context into the config. Approval to
+repair the service is not approval to transfer owner authorization or change the
+notification parent. Resolve those decisions separately, preserve the ledger and
+both locks, then verify the exact owner/Foreman/parent route before restarting.
 
 For `attempting` or `outcome_unknown` delivery, read the exact destination thread
 and search for that episode/event marker. Reconcile the receipt from actual

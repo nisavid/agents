@@ -15,7 +15,7 @@ import subprocess
 import time
 import uuid
 
-from native_bridge import NativeBridge, verify_bridge
+from native_bridge import NativeBridge, NativeBridgeError, verify_bridge
 from storage import private_directory, read_private, save
 
 
@@ -69,6 +69,20 @@ def valid_route(route):
             and math.isfinite(route['publishedAt']))
 
 
+def failure_diagnostic(error):
+    """Only allowlisted metadata crosses into the persisted health record."""
+    if isinstance(error, NativeBridgeError):
+        return error.diagnostic()
+    if isinstance(error, FileNotFoundError):
+        return {'kind': 'native_socket_missing', 'stage': 'route_validation'}
+    if isinstance(error, PermissionError):
+        return {'kind': 'native_socket_access_denied', 'stage': 'route_validation'}
+    if isinstance(error, ValueError) and str(error) in (
+            'registration_binding_changed', 'socket_generation_changed', 'owned_native_socket_required'):
+        return {'kind': str(error), 'stage': 'route_validation'}
+    return {'kind': 'native_route_check_failed', 'stage': 'route_validation'}
+
+
 class Transport:
     def __init__(self, state_dir, config, *, factory=None, notifier=desktop_notice, clock=time.time):
         self.root = private_directory(private_directory(state_dir) / 'transport')
@@ -106,7 +120,7 @@ class Transport:
                  'incident': None, 'lastRecoveredIncident': old.get('incident') or old.get('lastRecoveredIncident')}
         save(self.root / 'health.json', value)
 
-    def _failed(self, candidates):
+    def _failed(self, candidates, failures):
         value = self._health()
         first = not value.get('incident')
         if first:
@@ -114,6 +128,8 @@ class Transport:
                      'notice': {'status': 'attempting'}}
         value.update(healthy=False, observedAt=self.clock(), reason='native_route_unavailable_or_registration_rejected',
                      candidateSet=sorted(candidates))
+        if failures:
+            value.update(lastFailures=failures[-3:], lastFailureAt=self.clock())
         value['attempts'] += 1
         value['retryAt'] = self.clock() + min(300, 5 * 2 ** min(value['attempts'] - 1, 6))
         # Notice intent precedes delivery. A crash at this point is uncertain,
@@ -121,9 +137,10 @@ class Transport:
         save(self.root / 'health.json', value)
         if first:
             try:
-                self.notifier('Open the ChatGPT app and check the quota safeguard status. '
-                    'If recovery fails, re-register its existing owner through the supported '
-                    'app workflow, verify Codex Foreman and parent, then replace the private registration. '
+                self.notifier('Open the ChatGPT app and check the quota safeguard status and connection diagnostics. '
+                    'A socket access denial does not establish an invalid registration. '
+                    'If app diagnostics confirm the stored owner is no longer authorized, obtain explicit approval '
+                    'for supported owner registration recovery and separately for any destination change. '
                     'Quota reads continue; pause delivery is unavailable. No reset or resume was performed.')
                 value['notice']['status'] = 'submitted'
             except Exception:
@@ -132,6 +149,7 @@ class Transport:
 
     def connection(self):
         now = self.clock()
+        failures = []
         if self.bridge is not None:
             if now - self.checked_at < 60:
                 return self.bridge
@@ -141,7 +159,8 @@ class Transport:
                 verify_bridge(self.bridge, self.config['foremanThreadId'], self.config['parentThreadId'])
                 self.checked_at = now; self._healthy(self.route)
                 return self.bridge
-            except Exception:
+            except Exception as error:
+                failures.append(failure_diagnostic(error))
                 self.close()
         try:
             candidates = read_private(self.root / 'candidates.json', {})
@@ -167,7 +186,8 @@ class Transport:
             self.attempted[route['generation']] = now
             try:
                 bridge = self._verify(route)
-            except Exception:
+            except Exception as error:
+                failures.append(failure_diagnostic(error))
                 continue
             try:
                 save(self.root / 'accepted.json', route)
@@ -178,7 +198,7 @@ class Transport:
             self.bridge = bridge; self.route = route; self.checked_at = now
             self.attempted.pop(route['generation'], None)
             return bridge
-        self._failed(candidates)
+        self._failed(candidates, failures)
         raise RuntimeError('transport_unavailable_requires_registration_or_app_recovery')
 
     def close(self):

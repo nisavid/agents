@@ -9,6 +9,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from transport import Transport, publish_candidate
+from native_bridge import NativeBridgeError
 
 
 CONFIG = {'nativeContext': {'threadId': 'fixture-owner', 'turnId': 'fixture-turn', 'host': 'fixture'},
@@ -23,6 +24,8 @@ class FixtureBridge:
     def call(self, tool, arguments):
         self.calls.append((self.route, tool, arguments['threadId']))
         mode = self.registry[self.route]
+        if isinstance(mode, Exception):
+            raise mode
         if mode == 'deny':
             raise RuntimeError('fixture_authorization_rejected')
         target = arguments['threadId']
@@ -102,6 +105,43 @@ class TransportTests(unittest.TestCase):
         self.registry[pipe] = 'deny'; self.now += 301
         with self.assertRaises(RuntimeError): transport.connection()
         self.assertEqual(len(self.alerts), 2)
+
+    def test_stale_socket_and_app_rejection_remain_distinguishable_during_cooldown(self):
+        first = self.route('old.sock'); self.publish(first)
+        transport = self.manager(); transport.connection(); transport.close()
+        os.unlink(first)
+        self.now += 301
+        second = self.route('new.sock', NativeBridgeError('native_app_request_failed',
+            stage='read_thread', rpc_code=-32000))
+        self.publish(second)
+        with self.assertRaises(RuntimeError): transport.connection()
+        health = json.loads((self.root / 'transport' / 'health.json').read_text())
+        self.assertEqual([x['kind'] for x in health['lastFailures']],
+                         ['native_socket_missing', 'native_app_request_failed'])
+        self.assertEqual(health['lastFailures'][1]['recipient'], 'foreman')
+        failed_at = health['lastFailureAt']
+        self.now += 6  # Health retry expires before the per-route retry cooldown.
+        with self.assertRaises(RuntimeError): transport.connection()
+        retained = json.loads((self.root / 'transport' / 'health.json').read_text())
+        self.assertEqual(retained['lastFailures'], health['lastFailures'])
+        self.assertEqual(retained['lastFailureAt'], failed_at)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertFalse(any(c[1] == 'send' for c in self.calls))
+        self.registry[second] = 'valid'; self.now += 301
+        transport.connection()
+        recovered = json.loads((self.root / 'transport' / 'health.json').read_text())
+        self.assertTrue(recovered['healthy'])
+        self.assertNotIn('lastFailures', recovered)
+        transport.close()
+
+    def test_unknown_failure_details_cannot_leak_into_health(self):
+        pipe = self.route('private.sock', RuntimeError('secret-token fixture@example.test'))
+        self.publish(pipe)
+        with self.assertRaises(RuntimeError): self.manager().connection()
+        raw = (self.root / 'transport' / 'health.json').read_text()
+        self.assertNotIn('secret-token', raw)
+        self.assertNotIn('fixture@example.test', raw)
+        self.assertEqual(json.loads(raw)['lastFailures'][0]['kind'], 'native_route_check_failed')
 
     def test_changed_context_and_wrong_foreman_cannot_be_adopted(self):
         pipe = self.route('app.sock')

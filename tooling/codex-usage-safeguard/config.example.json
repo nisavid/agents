@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "enabled": false,
+  "intervalSeconds": 10,
+  "stateDir": "/PRIVATE/STATE",
+  "sharedLock": "/PRIVATE/EXISTING/observer.lock",
+  "nodeBinary": "node",
+  "nativeBridgeScript": "/PRIVATE/INSTALLED-APP/codex-app-tools/server.mjs",
+  "foremanThreadId": "REPLACE-VERIFIED-FOREMAN",
+  "parentThreadId": "REPLACE-VERIFIED-PARENT",
+  "nativeContext": {
+    "threadId": "REPLACE-GENUINE-OWNER",
+    "turnId": "REPLACE-GENUINE-TURN",
+    "host": "REPLACE-GENUINE-HOST"
+  },
+  "policy": {
+    "pauseWhenUnmetered": false,
+    "usdPerCredit": "0.04",
+    "pauseAtUsd": "8",
+    "usdRateEvidence": "https://help.openai.com/en/articles/20001147-codex-credits-for-students-terms-of-service"
+  },
+  "accounts": [
+    {
+      "name": "main",
+      "dynamicDefault": true
+    },
+    {
+      "name": "daybreak",
+      "email": "daybreak@example.test",
+      "accountId": "daybreak-example",
+      "authFile": "/PRIVATE/PROFILE/auth.json"
+    }
+  ]
+}

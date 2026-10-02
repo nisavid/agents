@@ -1,0 +1,43 @@
+"""Durable private JSON writes shared by policy and transport state."""
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+
+
+def private_directory(path, *, create=True):
+    path = Path(path)
+    if create:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('private_owned_directory_required')
+    return path
+
+
+def read_private(path, default=None):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return default
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('private_owned_file_required')
+        return json.load(stream)
+
+
+def save(path, value):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, indent=2)
+            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)

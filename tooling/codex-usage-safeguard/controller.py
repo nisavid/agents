@@ -138,6 +138,10 @@ def dispatch(state, account, config, bridge, path):
     # A protective pause must not wait behind the approval notification.
     events = sorted(episode['events'], key=lambda e: e['kind'] != 'foreman_pause_required')
     for event in events:
+        if event.get('invalidated'):
+            if any(d['status'] != 'submitted' for d in event.get('deliveries', {}).values()):
+                failures.append('delivery_outcome_requires_reconciliation')
+            continue
         targets = [('parent', config['parentThreadId'])]
         if event['kind'] == 'foreman_pause_required':
             targets.insert(0, ('foreman', config['foremanThreadId']))
@@ -151,13 +155,25 @@ def dispatch(state, account, config, bridge, path):
                 failures.append('delivery_outcome_requires_reconciliation')
                 continue
             if event['kind'] in ('reset_confirmation_required', 'reset_availability_unknown'):
-                pause = next((e for e in episode['events'] if e['kind'] == 'foreman_pause_required'), None)
+                pause = next((e for e in reversed(episode['events'])
+                              if e['kind'] == 'foreman_pause_required' and
+                              e.get('deliveries', {}).get('parent', {}).get('includesEvent') == event['id']), None)
                 delivered = (pause or {}).get('deliveries', {}).get('parent', {})
-                if delivered.get('status') == 'submitted' and delivered.get('includesEvent') == event['id']:
+                if delivered:
                     event.setdefault('deliveries', {})['parent'] = {
-                        'status': 'submitted', 'target': target, 'coalescedInto': pause['id']}
+                        **delivered, 'coalescedInto': pause['id']}
                     save(path, state)
+                    if delivered['status'] != 'submitted':
+                        failures.append('delivery_outcome_requires_reconciliation')
                     continue
+            if (account['name'] == 'daybreak' and event['kind'] == 'foreman_pause_required'
+                    and event.get('reason') == 'no_applicable_reset' and default_identity() != {
+                        'email': account['email'], 'accountId': account['accountId']}):
+                # Keep all receipts, but never send the stale conditional event.
+                # A later fresh policy decision gets a distinct event identifier.
+                event['invalidated'] = {'reason': 'daybreak_no_longer_main', 'at': time.time()}
+                save(path, state)
+                break
             event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
             if event['kind'] == 'foreman_pause_required' and key == 'parent':
                 confirmation = next((e for e in episode['events'] if e['kind'] in (
@@ -179,6 +195,8 @@ def dispatch(state, account, config, bridge, path):
 
 
 def validate_config(config, activate=False):
+    if config['foremanThreadId'] == config['parentThreadId']:
+        raise ValueError('distinct_notification_destinations_required')
     accounts = config['accounts']
     if len({a['name'] for a in accounts}) != len(accounts):
         raise ValueError('duplicate_account_configuration')
@@ -244,6 +262,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                     for configured in config['accounts']:
                         account = configured
                         name = account['name']; path = state_dir / f'{name}.json'
+                        observation_acquired = False
                         try:
                             try:
                                 reading = futures[name].result()
@@ -254,6 +273,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                 # account. Its already server-validated reading is
                                 # valid evidence for that identity, never another one.
                                 reading = alias_reading
+                            observation_acquired = True
                             if account.get('dynamicDefault'):
                                 account, state = select_main_identity(state_dir, account, reading)
                                 daybreak = next(a for a in config['accounts'] if a['name'] == 'daybreak')
@@ -289,7 +309,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                                        'reason': str(error) if isinstance(error, (RuntimeError, ValueError)) else 'read_or_dispatch_failed'}
                             if bridge is not None and isinstance(error, RuntimeError) and 'delivery' in str(error):
                                 transport.close(); bridge = None
-                            if not observe_only and path.exists():
+                            if not observation_acquired and not observe_only and path.exists():
                                 try:
                                     retained = json.loads(path.read_text())
                                     if configured.get('dynamicDefault'):

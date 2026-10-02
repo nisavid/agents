@@ -84,11 +84,18 @@ class NativeBridge:
                 self.buffer += chunk
             while b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
-                value = json.loads(line)
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    raise NativeBridgeError('native_protocol_error', stage=stage) from None
+                if not isinstance(value, dict):
+                    raise NativeBridgeError('native_protocol_error', stage=stage)
                 if value.get("id") != self.seq:
                     continue
                 if "error" in value:
                     raise rpc_failure(value['error'], stage)
+                if not isinstance(value.get('result'), dict):
+                    raise NativeBridgeError('native_protocol_error', stage=stage)
                 return value["result"]
         raise NativeBridgeError('native_rpc_timeout', stage=stage)
 
@@ -100,10 +107,19 @@ class NativeBridge:
         if result.get("isError"):
             # Tool-returned prose can contain private thread/account data.
             raise NativeBridgeError('native_tool_rejected', stage=tool)
-        texts = [x["text"] for x in result.get("content", []) if x.get("type")=="text"]
+        content = result.get('content')
+        if not isinstance(content, list):
+            raise NativeBridgeError('native_protocol_error', stage=tool)
+        texts = [x.get('text') for x in content if isinstance(x, dict) and x.get('type') == 'text']
         if not texts:
-            raise RuntimeError("Native app tool returned no text")
-        return json.loads(texts[0])
+            raise NativeBridgeError('native_protocol_error', stage=tool)
+        try:
+            value = json.loads(texts[0])
+        except (ValueError, TypeError):
+            raise NativeBridgeError('native_protocol_error', stage=tool) from None
+        if not isinstance(value, dict):
+            raise NativeBridgeError('native_protocol_error', stage=tool)
+        return value
 
     def send(self, target, prompt):
         reply = self.call("send_message_to_thread", {"threadId":target, "prompt":prompt})
@@ -123,6 +139,8 @@ class NativeBridge:
 
 def verify_bridge(bridge, foreman, parent):
     """Read-only identity/route check; never creates a turn or sends a marker."""
+    if foreman == parent:
+        raise NativeBridgeError('native_route_identity_mismatch', stage='verify_destinations')
     for recipient, thread_id, expected_title in [('foreman', foreman, 'Codex Foreman'), ('parent', parent, None)]:
         try:
             value = bridge.call('read_thread', {'threadId': thread_id, 'turnLimit': 1,

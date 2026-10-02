@@ -12,11 +12,19 @@ from transport import publish_candidate
 def serve(config, state_dir, incoming, outgoing, environment):
     published = False
     for line in incoming:
-        request = json.loads(line)
-        if 'id' not in request:
+        try:
+            request = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(request, dict) or 'id' not in request:
             continue
         method = request.get('method'); params = request.get('params', {})
         if method == 'initialize':
+            if not isinstance(params, dict) or not isinstance(params.get('protocolVersion'), str):
+                outgoing.write(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
+                    'error': {'code': -32602, 'message': 'Invalid initialize parameters'}}) + '\n')
+                outgoing.flush()
+                continue
             result = {'protocolVersion': params['protocolVersion'], 'capabilities': {'tools': {}},
                       'serverInfo': {'name': 'codex-quota-connection', 'version': '0.1.0'}}
             if not published and config.get('enabled') is True:

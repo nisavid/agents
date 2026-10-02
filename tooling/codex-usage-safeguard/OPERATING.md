@@ -19,11 +19,13 @@ directory with mode `0700`. State must live outside the release directory.
 and differ from the current state's `observer.lock`. Preserve both lock inodes.
 Do not create a second state directory to get around a running watcher.
 
-The config binds a genuine existing owner thread, turn, and host. These values
-must come from the supported app tool-call context with operator authorization.
-MCP initialize does not supply fresh caller identity. Do not infer or manufacture
-an identity from thread listings, copy another owner's registration, scrape a
-pipe from logs, or resume an owner into an unrelated app-server instance.
+The config stores the originating caller's thread, turn, and host, separately
+from the recipient IDs. The adapter forwards this caller context to the app;
+there is no separate service-identity registration operation in this package.
+These values must come from genuine app tool-call context with operator
+authorization. MCP initialize does not supply fresh caller identity. Do not
+infer or manufacture an identity from thread listings, copy another owner's
+context, scrape a pipe from logs, or resume an owner into another app-server.
 
 From a reviewed staged release, run:
 
@@ -114,21 +116,33 @@ incident without resetting quota state.
 
 If opening the app and loading a Codex session supplies a valid route, renewal
 is automatic for the existing registration. If caller authorization is rejected,
-use the supported app tool workflow to register this safeguard owner again and
-obtain the genuine context. Have the operator explicitly approve replacement of
-the registration; update only the private registration, repeat exact Foreman and
-parent preflight, and perform the controlled restart. There is no implemented
-unattended route for creating new caller authorization. Do not relax peer checks
-or create a replacement owner to make recovery appear successful.
+stop at that boundary. Establish whether the app can supply fresh genuine caller
+context through its normal integration, and verify that context's permitted use
+before changing the stored caller. Do not assume a separate persistent grant is
+required or available. Creating or reading a task alone does not establish this
+context. The current sending method requires an explicit recipient thread ID;
+successful sending does not imply automatic discovery of the current dot.
+Normal companion startup supplies a connection route, not that recipient.
+Until a supported account-to-destination mapping is verified, preserve the
+explicitly approved destination. Repeat exact Foreman/parent preflight before
+the controlled restart. Do not relax peer checks or invent caller metadata.
 
 An account switch can leave a cloud owner inaccessible with an app diagnostic
 such as `thread placement belongs to a different actor`. A fresh socket cannot
 repair that actor boundary. Stop retrying that owner during maintenance and
-obtain operator approval for a genuine supported registration under the intended
-account/owner; never copy this repair task's context into the config. Approval to
+identify a supported context-refresh path under the intended account/owner;
+never copy this repair task's context into the config. Approval to
 repair the service is not approval to transfer owner authorization or change the
 notification parent. Resolve those decisions separately, preserve the ledger and
 both locks, then verify the exact owner/Foreman/parent route before restarting.
+
+A Daybreak no-reset pause is conditional on Daybreak still being the default
+main account. Dispatch checks that identity before each unsent recipient. A
+verified mismatch durably invalidates the stale event while preserving existing
+receipts. It is never replayed after switching back; a later fresh policy
+condition can create a distinct event. Missing identity evidence blocks dispatch.
+An uncertain combined pause/confirmation receipt also remains uncertain for
+the confirmation; connection recovery does not generate a second request.
 
 For `attempting` or `outcome_unknown` delivery, read the exact destination thread
 and search for that episode/event marker. Reconcile the receipt from actual
@@ -152,6 +166,12 @@ python3 reset_once.py --config "$private_config" --state-dir "$existing_state" \
   --account daybreak --episode "$episode" \
   --confirmation-reference "$verified_human_reply" --execute
 ```
+
+An `attempting` or `outcome_unknown` saved reset is marked
+`reconciliation_required` on a later invocation. That invocation performs no
+consume request and preserves the exact saved request, credit, key and approval.
+Determine the actual provider outcome before any separately authorized retry;
+restored quota or a missing credit is not a reason to bypass eligibility checks.
 
 The reference is an audit pointer; typing an arbitrary string does not establish
 consent. The caller must verify the reply and honor any execution approval gate.

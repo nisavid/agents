@@ -44,7 +44,14 @@ def publish_candidate(state_dir, config, environment, *, now=None):
     fd = os.open(root / 'publish.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'r+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        candidates = read_private(root / 'candidates.json', {})
+        try:
+            candidates = read_private(root / 'candidates.json', {})
+        except json.JSONDecodeError:
+            candidates = {}
+        # Reconstruct only malformed routing metadata. Ownership/permission
+        # failures from read_private must still fail closed, never be repaired here.
+        if not isinstance(candidates, dict) or not all(valid_route(r) for r in candidates.values()):
+            candidates = {}
         previous = candidates.get(key)
         # Hundreds of MCP copies publish the same generation without rewriting
         # or making a stale route appear newer than a later app generation.

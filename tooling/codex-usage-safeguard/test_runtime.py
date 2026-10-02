@@ -20,6 +20,34 @@ from test_controller import CONFIG, ReceiptTransport
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_only_quota_read_failure_can_start_observation_fallback(self):
+        for failure in ('transport', 'delivery', 'read'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as name:
+                root = Path(name); config = self.config(root)
+                config['policy'].update(pauseWhenUnmetered=True,
+                    fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+                pinned = config['accounts'][1]
+                value = sample(100); value.update(email=pinned['email'], accountId=pinned['accountId'])
+                state, _ = advance({}, value, pinned, now=10, policy=config['policy'])
+                save(root / 'daybreak.json', state)
+                def read(account, **kwargs):
+                    if account['name'] == 'daybreak':
+                        if failure == 'read': raise RuntimeError('fixture_quota_read_failed')
+                        return value
+                    return sample(0)
+                with patch('controller.read_account', side_effect=read), \
+                     patch('controller.default_identity', return_value={'email': ACCOUNT['email'], 'accountId': ACCOUNT['accountId']}), \
+                     patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True), \
+                     patch('controller.time.time', return_value=20):
+                    if failure == 'transport':
+                        transport.return_value.connection.side_effect = RuntimeError('fixture_transport_down')
+                    elif failure == 'delivery':
+                        transport.return_value.connection.return_value.send.side_effect = TimeoutError('fixture_timeout')
+                    run(config, root, once=True)
+                events = json.loads((root / 'daybreak.json').read_text())['episode']['events']
+                fallbacks = [e for e in events if e.get('reason') == 'observation_failed_during_confirmed_exhaustion']
+                self.assertEqual(len(fallbacks), 1 if failure == 'read' else 0)
+
     def config(self, root):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         config.update(stateDir=str(root), sharedLock=str(root / 'legacy.lock'), enabled=True)
@@ -38,6 +66,22 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(output[1]['result']['tools'], [])
             self.assertIn('error', output[2])
             self.assertFalse((root / 'transport').exists())
+
+    def test_companion_survives_bad_frames_and_initialization_without_publishing(self):
+        outgoing = io.StringIO()
+        requests = '\nnot-json\n[]\n42\nnull\n' + '\n'.join(json.dumps(r) for r in [
+            {'id': 1, 'method': 'initialize'},
+            {'id': 2, 'method': 'initialize', 'params': None},
+            {'id': 3, 'method': 'ping'},
+            {'id': 4, 'method': 'initialize', 'params': {'protocolVersion': '2024-11-05'}},
+            {'id': 5, 'method': 'tools/list'}])
+        with patch('companion.publish_candidate') as publish:
+            serve({'enabled': True}, '/unused-fixture', io.StringIO(requests), outgoing, {})
+            publish.assert_called_once()
+        replies = [json.loads(line) for line in outgoing.getvalue().splitlines()]
+        self.assertEqual([r['id'] for r in replies], [1, 2, 3, 4, 5])
+        self.assertEqual([r['error']['code'] for r in replies[:2]], [-32602, -32602])
+        self.assertEqual(replies[-1]['result'], {'tools': []})
 
     def test_config_binds_existing_paths_and_rejects_unprotected_registration(self):
         with tempfile.TemporaryDirectory() as name:

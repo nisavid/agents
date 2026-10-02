@@ -2,6 +2,7 @@
 import {readFileSync} from 'node:fs';
 import {providerFetch} from './http.mjs';
 import {readCredentials} from './credentials.mjs';
+import {resetResult} from './reset_result.mjs';
 
 try {
   const request = JSON.parse(readFileSync(0, 'utf8'));
@@ -41,8 +42,7 @@ try {
     body: JSON.stringify({credit_id: request.creditId, redeem_request_id: request.idempotencyKey})
   });
   // Do not echo arbitrary response bodies or any credential data.
-  console.log(JSON.stringify({code: result.code, creditId: result.credit?.id ?? request.creditId,
-                             observedAt: new Date().toISOString()}));
+  console.log(JSON.stringify(resetResult(result, request.creditId, new Date().toISOString())));
 } catch {
   console.log(JSON.stringify({error: 'reset_not_confirmed_check_saved_attempt'}));
   process.exitCode = 1;

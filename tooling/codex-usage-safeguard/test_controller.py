@@ -28,6 +28,77 @@ class ReceiptTransport:
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_identical_destinations_cannot_activate(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config['parentThreadId'] = config['foremanThreadId']
+        with self.assertRaisesRegex(ValueError, 'distinct_notification_destinations_required'):
+            validate_config(config)
+
+    def test_combined_timeout_preserves_uncertainty_without_second_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'main.json'; transport = ReceiptTransport(path, fail='parent')
+            state, _ = advance({}, sample(100), ACCOUNT, now=10, policy={'pauseWhenUnmetered': True})
+            with self.assertRaisesRegex(RuntimeError, 'reconciliation'):
+                dispatch(state, ACCOUNT, CONFIG, transport, path)
+            self.assertEqual([t for t, _ in transport.received], ['foreman', 'parent'])
+            recovered = json.loads(path.read_text())
+            confirmation, pause = recovered['episode']['events']
+            receipt = confirmation['deliveries']['parent']
+            self.assertEqual(receipt['status'], 'outcome_unknown')
+            self.assertEqual(receipt['coalescedInto'], pause['id'])
+            with self.assertRaisesRegex(RuntimeError, 'reconciliation'):
+                dispatch(recovered, ACCOUNT, CONFIG, transport, path)
+            self.assertEqual(len(transport.received), 2)
+
+    def test_combined_attempting_receipt_survives_restart_and_destination_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'main.json'; transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100), ACCOUNT, now=10, policy={'pauseWhenUnmetered': True})
+            confirmation, pause = state['episode']['events']
+            pause['deliveries'] = {
+                'foreman': {'status': 'submitted', 'target': 'foreman'},
+                'parent': {'status': 'attempting', 'target': 'old-parent', 'includesEvent': confirmation['id']}}
+            with self.assertRaisesRegex(RuntimeError, 'reconciliation'):
+                dispatch(state, ACCOUNT, CONFIG, transport, path)
+            self.assertEqual(transport.received, [])
+            self.assertEqual(confirmation['deliveries']['parent']['status'], 'attempting')
+            self.assertEqual(confirmation['deliveries']['parent']['target'], 'old-parent')
+
+    def test_stale_daybreak_pause_is_invalidated_and_never_replayed(self):
+        account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'daybreak.json'; transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), account, now=10)
+            old = state['episode']['events'][0]
+            with patch('controller.default_identity', return_value={'accountId': 'different', 'email': 'different'}):
+                dispatch(state, account, CONFIG, transport, path)
+            self.assertEqual(old['invalidated']['reason'], 'daybreak_no_longer_main')
+            recovered = json.loads(path.read_text())
+            with patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('accountId', 'email')}):
+                dispatch(recovered, account, CONFIG, transport, path)
+            self.assertEqual(transport.received, [])
+            # A fresh waiting-budget condition remains effective and uses a new ID.
+            state, _ = advance(recovered, sample(100), dict(account, alsoCurrentMain=False), now=20,
+                               policy={'usdPerCredit': '0.04'})
+            state, events = advance(state, sample(100, balance='800'), dict(account, alsoCurrentMain=False),
+                                    now=30, policy={'usdPerCredit': '0.04'})
+            self.assertEqual(events[0]['reason'], 'waiting_spend_threshold')
+            self.assertNotEqual(events[0]['id'], old['id'])
+
+    def test_daybreak_switch_between_recipients_preserves_submitted_receipt(self):
+        account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
+        identity = {k: ACCOUNT[k] for k in ('accountId', 'email')}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'daybreak.json'; transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), account, now=10)
+            with patch('controller.default_identity', side_effect=[identity, {}]):
+                dispatch(state, account, CONFIG, transport, path)
+            self.assertEqual([t for t, _ in transport.received], ['foreman'])
+            pause = state['episode']['events'][0]
+            self.assertEqual(pause['deliveries']['foreman']['status'], 'submitted')
+            self.assertNotIn('parent', pause['deliveries'])
+            self.assertIn('invalidated', pause)
+
     def test_main_on_daybreak_without_reset_keeps_main_pause_rule_once(self):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         pinned = config['accounts'][1]

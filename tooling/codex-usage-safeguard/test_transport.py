@@ -179,8 +179,28 @@ class TransportTests(unittest.TestCase):
         os.chmod(self.root / 'transport' / 'candidates.json', 0o644)
         with self.assertRaises(RuntimeError): self.manager().connection()
         self.assertEqual(len(self.alerts), 1)
+        before = (self.root / 'transport' / 'candidates.json').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'private_owned_file_required'):
+            self.publish(pipe)
+        self.assertEqual((self.root / 'transport' / 'candidates.json').read_bytes(), before)
         with self.assertRaises(RuntimeError): self.manager().connection()
         self.assertEqual(len(self.alerts), 1)
+
+    def test_publication_recovers_only_malformed_private_route_metadata(self):
+        from storage import save
+        pipe = self.route('app.sock'); self.publish(pipe)
+        path = self.root / 'transport' / 'candidates.json'
+        ledger = self.root / 'main.json'; ledger.write_text('preserved-episode-and-receipts')
+        for malformed in ([], 42, {'bad': {}}, {'bad': {'publishedAt': 'wrong'}}):
+            with self.subTest(malformed=malformed):
+                save(path, malformed)
+                self.publish(pipe)
+                self.assertEqual(len(json.loads(path.read_text())), 1)
+        path.write_text('invalid JSON')
+        self.publish(pipe)
+        self.assertEqual(len(json.loads(path.read_text())), 1)
+        self.assertEqual(ledger.read_text(), 'preserved-episode-and-receipts')
+        self.assertEqual(self.calls, [])
 
     def test_corrupt_candidate_registry_cannot_displace_accepted_route(self):
         pipe = self.route('app.sock'); self.publish(pipe)

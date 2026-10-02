@@ -1,6 +1,10 @@
 import copy
 import unittest
-from reset_once import prepare
+import json
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
+from reset_once import prepare, execute
 from safeguard import advance
 from test_guard import ACCOUNT, sample
 
@@ -29,6 +33,24 @@ class ResetTests(unittest.TestCase):
         inventory = copy.deepcopy(self.inventory); inventory['credentialAccountId'] = 'other'
         with self.assertRaisesRegex(ValueError, 'inventory_account_mismatch'):
             prepare(ACCOUNT, self.state['episode'], sample(100), inventory, 'human-reply', '2026-10-01T00:00:00Z')
+
+    def test_uncertain_reset_requires_reconciliation_without_new_credit_or_replay(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); episode = self.state['episode']
+            (root / 'daybreak.json').write_text(json.dumps(self.state))
+            request = prepare(ACCOUNT, episode, sample(100), self.inventory, 'actual-human-reply', '2026-10-01T00:00:00Z')
+            path = root / ('reset-' + episode['id'] + '.json')
+            path.write_text(json.dumps({'request': request, 'status': 'outcome_unknown'}))
+            config = {'accounts': [{**ACCOUNT, 'name': 'daybreak'}]}
+            with patch('reset_once.read_account') as read, patch('reset_once.subprocess.run') as consume:
+                for _ in range(2):
+                    with self.assertRaisesRegex(ValueError, 'reset_reconciliation_required'):
+                        execute(config, root, 'daybreak', episode['id'], 'actual-human-reply')
+                read.assert_not_called(); consume.assert_not_called()
+            record = json.loads(path.read_text())
+            self.assertEqual(record['request'], request)
+            self.assertEqual(record['status'], 'reconciliation_required')
+            self.assertEqual(record['priorAttemptStatus'], 'outcome_unknown')
         with self.assertRaisesRegex(ValueError, 'no_applicable_reset'):
             prepare(ACCOUNT, self.state['episode'], sample(100, resets=0), self.inventory, 'human-reply', '2026-10-01T00:00:00Z')
 

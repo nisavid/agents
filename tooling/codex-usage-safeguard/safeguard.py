@@ -21,6 +21,12 @@ def decimal(value):
 
 
 def wait_budget(episode, sample, previous, now, policy):
+    target = decimal(policy.get('pauseAtUsd', '8'))
+    if target is None or not 0 < target < 10:
+        raise ValueError('invalid_spend_threshold')
+    used = decimal(episode.get('waitingCredits', '0'))
+    if used is None or used < 0:
+        raise ValueError('invalid_waiting_credits')
     balance = decimal((sample.get('credits') or {}).get('balance'))
     rate = decimal(policy.get('usdPerCredit'))
     last = decimal(episode.get('lastBalance'))
@@ -28,14 +34,10 @@ def wait_budget(episode, sample, previous, now, policy):
     if balance is None or rate is None or rate <= 0:
         episode['budgetStatus'] = 'unmetered_wait_blocked'
         return 'unmetered_confirmation_wait' if policy.get('pauseWhenUnmetered') is True else None
-    used = decimal(episode.get('waitingCredits', '0'))
     if last is not None:
         used += max(Decimal(0), last - balance)
     episode.update(lastBalance=str(balance), waitingCredits=str(used), waitingSpendUsd=str(used * rate),
                    budgetStatus='estimated_from_balance_debits')
-    target = decimal(policy.get('pauseAtUsd', '8'))
-    if target is None or not 0 < target < 10:
-        raise ValueError('invalid_spend_threshold')
     if used * rate >= target:
         return 'waiting_spend_threshold'
     if not fresh:
@@ -46,9 +48,11 @@ def wait_budget(episode, sample, previous, now, policy):
 
 
 def emit(episode, events, kind, reason=None):
-    if any(e['kind'] == kind for e in episode['events']):
+    prior = [e for e in episode['events'] if e['kind'] == kind]
+    if any(not e.get('invalidated') for e in prior):
         return
-    event = {'id': episode['id'] + ':' + kind, 'kind': kind}
+    suffix = ':' + str(len(prior) + 1) if prior else ''
+    event = {'id': episode['id'] + ':' + kind + suffix, 'kind': kind}
     if reason:
         event['reason'] = reason
     episode['events'].append(event)
@@ -130,7 +134,8 @@ def advance(previous, sample, account, *, now, policy=None):
                            waitingCredits='0', waitingSpendUsd='0')
             emit(episode, events, 'reset_confirmation_required')
             pending = True
-        if not any(e['kind'] == 'foreman_pause_required' for e in episode['events']):
+        if not any(e['kind'] == 'foreman_pause_required' and not e.get('invalidated')
+                   for e in episode['events']):
             if count == 0 and main_scope:
                 reason = 'no_applicable_reset'
             elif pending:

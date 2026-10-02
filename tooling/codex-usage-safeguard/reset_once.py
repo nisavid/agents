@@ -62,6 +62,14 @@ def execute(config, runtime, account_name, episode_id, confirmation):
         previous = json.loads(path.read_text()) if path.exists() else None
         if previous and previous.get('status') in ('reset', 'already_redeemed'):
             return previous
+        if previous and previous.get('status') in ('attempting', 'outcome_unknown', 'reconciliation_required'):
+            # A successful provider reset can restore quota before its response
+            # reaches us. Do not bypass exact-zero/credit checks or replay an
+            # uncertain consume automatically; make the reconciliation gate explicit.
+            previous.setdefault('priorAttemptStatus', previous['status'])
+            previous.update(status='reconciliation_required', reason='prior_reset_outcome_unconfirmed')
+            save(path, previous)
+            raise ValueError('reset_reconciliation_required')
         usage = read_account(account, node=config['nodeBinary'])
         inventory = read_account(account, mode='resets', node=config['nodeBinary'])
         request = prepare(account, episode, usage, inventory, confirmation, dt.datetime.now(dt.UTC).isoformat())

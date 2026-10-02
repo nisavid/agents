@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from native_bridge import NativeBridge, NativeBridgeError, verify_bridge
 
@@ -32,7 +33,14 @@ for line in sys.stdin:
 
 
 class NativeTests(unittest.TestCase):
-    def error_bridge(self, reply, fail_target=None):
+    def test_identical_destinations_fail_before_native_reads(self):
+        bridge = Mock()
+        with self.assertRaises(NativeBridgeError) as caught:
+            verify_bridge(bridge, 'foreman', 'foreman')
+        self.assertEqual(caught.exception.kind, 'native_route_identity_mismatch')
+        bridge.call.assert_not_called()
+
+    def error_bridge(self, reply, fail_target=None, noise=None):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         script = Path(temp.name) / 'error_server.py'
@@ -40,6 +48,7 @@ class NativeTests(unittest.TestCase):
 import json, sys
 reply = ERROR_REPLY
 fail_target = FAIL_TARGET
+noise = NOISE
 for line in sys.stdin:
  request = json.loads(line)
  if 'id' not in request: continue
@@ -48,8 +57,9 @@ for line in sys.stdin:
   result = {'result': {'content': [{'type':'text','text':json.dumps({'thread': {
     'id':request['params']['arguments']['threadId'], 'title':'Codex Foreman'}})}]}}
  else: result = reply
+ if request['method'] != 'initialize' and noise is not None: print(noise,flush=True)
  print(json.dumps({'jsonrpc':'2.0','id':request['id'],**result}),flush=True)
-'''.replace('ERROR_REPLY', repr(reply)).replace('FAIL_TARGET', repr(fail_target)))
+'''.replace('ERROR_REPLY', repr(reply)).replace('FAIL_TARGET', repr(fail_target)).replace('NOISE', repr(noise)))
         bridge = NativeBridge({'nodeBinary':sys.executable, 'nativeBridgeScript':str(script),
             'nativeContext':{'threadId':'fixture-owner','turnId':'fixture-turn','host':'fixture-host'}}, '/fixture/socket')
         self.addCleanup(bridge.close)
@@ -96,6 +106,23 @@ for line in sys.stdin:
             verify_bridge(bridge, 'foreman', 'parent')
         self.assertEqual(caught.exception.kind, 'native_rpc_failed')
         self.assertNotIn('secret-account', repr(caught.exception.__dict__))
+
+    def test_malformed_frames_and_tool_payloads_fail_with_bounded_diagnostics(self):
+        for noise in ('private startup banner', '[]', '42', 'null'):
+            with self.subTest(noise=noise):
+                bridge = self.error_bridge({'result': {}}, noise=noise)
+                with self.assertRaises(NativeBridgeError) as caught:
+                    verify_bridge(bridge, 'foreman', 'parent')
+                self.assertEqual(caught.exception.kind, 'native_protocol_error')
+                self.assertNotIn('private startup', repr(caught.exception.__dict__))
+        for result in ([], {}, {'content': None}, {'content': [{'type': 'text', 'text': 'private invalid JSON'}]},
+                       {'content': [{'type': 'text', 'text': '[]'}]}):
+            with self.subTest(result=result):
+                bridge = self.error_bridge({'result': result})
+                with self.assertRaises(NativeBridgeError) as caught:
+                    verify_bridge(bridge, 'foreman', 'parent')
+                self.assertEqual(caught.exception.kind, 'native_protocol_error')
+                self.assertNotIn('private invalid', repr(caught.exception.__dict__))
 
     def test_registration_and_exact_targets_survive_stdio_adapter(self):
         with tempfile.TemporaryDirectory() as name:

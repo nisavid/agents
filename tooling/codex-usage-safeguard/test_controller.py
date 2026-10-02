@@ -28,6 +28,23 @@ class ReceiptTransport:
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_submitted_daybreak_pause_is_invalidated_on_switch_and_new_condition_gets_new_id(self):
+        account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'daybreak.json'; transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), account, now=10)
+            with patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('accountId', 'email')}):
+                dispatch(state, account, CONFIG, transport, path)
+            old_receipts = copy.deepcopy(state['episode']['events'][0]['deliveries'])
+            with patch('controller.default_identity', return_value={}):
+                dispatch(state, account, CONFIG, transport, path)
+            old = state['episode']['events'][0]
+            self.assertTrue(old['invalidated'])
+            self.assertEqual(old['deliveries'], old_receipts)
+            self.assertEqual(len(transport.received), 2)
+            state, events = advance(state, sample(100, resets=0), account, now=20)
+            self.assertNotEqual(events[0]['id'], old['id'])
+
     def test_identical_destinations_cannot_activate(self):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         config['parentThreadId'] = config['foremanThreadId']

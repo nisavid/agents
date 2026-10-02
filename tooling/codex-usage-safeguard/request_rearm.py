@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 from controller import ROOT, save
+from safeguard import pause_requires_release
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--account', required=True, choices=['main', 'daybreak'])
@@ -16,7 +17,7 @@ runtime = Path(args.state_dir)
 episode = json.loads((runtime / f'{args.account}.json').read_text())['episode']
 if episode['id'] != args.episode or not args.evidence_reference.strip():
     parser.error('Exact current episode and actual release/reset evidence required')
-if any(e['kind'] == 'foreman_pause_required' for e in episode['events']) and not args.hold_released:
+if pause_requires_release(episode) and not args.hold_released:
     parser.error('Foreman must first verify authorization to release the protective hold')
 save(runtime / f'release-{args.account}.json', {'episodeId': args.episode,
      'accountId': episode['accountId'], 'evidenceReference': args.evidence_reference,

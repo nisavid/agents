@@ -69,7 +69,7 @@ def settle(previous, sample, release):
             or not release.get('evidenceReference') or sample.get('accountId') != episode['accountId']
             or sample.get('email') != episode['email']):
         return state
-    paused = any(e['kind'] == 'foreman_pause_required' for e in episode['events'])
+    paused = pause_requires_release(episode)
     if paused and release.get('holdReleased') is not True:
         return state
     rate = sample.get('rate_limit') or {}
@@ -79,6 +79,25 @@ def settle(previous, sample, release):
         return state
     episode.update(active=False, release=release, settledAt=sample['observedAt'])
     return state
+
+
+def pause_requires_release(episode):
+    """Unsent invalidated intents did not request a hold; attempts still may have."""
+    return any(e['kind'] == 'foreman_pause_required' and (
+        not e.get('invalidated') or 'foreman' in e.get('deliveries', {}))
+        for e in episode['events'])
+
+
+def invalidate_daybreak_pauses(episode, account, now):
+    """Retain receipts while invalidating a main-only condition on a known switch."""
+    changed = False
+    if account['name'] == 'daybreak' and account.get('alsoCurrentMain') is False:
+        for event in episode['events']:
+            if (event['kind'] == 'foreman_pause_required' and
+                    event.get('reason') == 'no_applicable_reset' and not event.get('invalidated')):
+                event['invalidated'] = {'reason': 'daybreak_no_longer_main', 'at': now}
+                changed = True
+    return changed
 
 
 def reset_count(sample):
@@ -115,6 +134,7 @@ def advance(previous, sample, account, *, now, policy=None):
     events = []
     episode = state.get('episode')
     if episode and episode.get('active'):
+        invalidate_daybreak_pauses(episode, account, now)
         # An available blip never rearms. A deliberate, verified release is needed.
         if not exhausted:
             if used and len(used) == len(windows):

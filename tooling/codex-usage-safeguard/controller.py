@@ -12,7 +12,7 @@ import subprocess
 import time
 import uuid
 
-from safeguard import advance, settle, observation_failed, decimal
+from safeguard import advance, settle, observation_failed, decimal, invalidate_daybreak_pauses
 from transport import Transport, publish_candidate
 from storage import save
 from configuration import load_config, runtime_arguments
@@ -146,6 +146,15 @@ def dispatch(state, account, config, bridge, path):
         if event['kind'] == 'foreman_pause_required':
             targets.insert(0, ('foreman', config['foremanThreadId']))
         for key, target in targets:
+            if (account['name'] == 'daybreak' and event['kind'] == 'foreman_pause_required'
+                    and event.get('reason') == 'no_applicable_reset'):
+                current = default_identity() == {'email': account['email'], 'accountId': account['accountId']}
+                if invalidate_daybreak_pauses(episode, dict(account, alsoCurrentMain=current), time.time()):
+                    save(path, state)
+                if event.get('invalidated'):
+                    if any(d['status'] != 'submitted' for d in event.get('deliveries', {}).values()):
+                        failures.append('delivery_outcome_requires_reconciliation')
+                    break
             delivery = event.setdefault('deliveries', {}).get(key)
             if delivery:
                 if delivery['status'] == 'submitted':
@@ -166,14 +175,6 @@ def dispatch(state, account, config, bridge, path):
                     if delivered['status'] != 'submitted':
                         failures.append('delivery_outcome_requires_reconciliation')
                     continue
-            if (account['name'] == 'daybreak' and event['kind'] == 'foreman_pause_required'
-                    and event.get('reason') == 'no_applicable_reset' and default_identity() != {
-                        'email': account['email'], 'accountId': account['accountId']}):
-                # Keep all receipts, but never send the stale conditional event.
-                # A later fresh policy decision gets a distinct event identifier.
-                event['invalidated'] = {'reason': 'daybreak_no_longer_main', 'at': time.time()}
-                save(path, state)
-                break
             event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
             if event['kind'] == 'foreman_pause_required' and key == 'parent':
                 confirmation = next((e for e in episode['events'] if e['kind'] in (
@@ -289,7 +290,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                     account = {**account, 'alsoCurrentMain': default_identity() == {
                                         'email': account['email'], 'accountId': account['accountId']}}
                                 except Exception:
-                                    account = {**account, 'alsoCurrentMain': False}
+                                    account = {**account, 'alsoCurrentMain': None}
                             release_path = state_dir / f'release-{name}.json'
                             release = json.loads(release_path.read_text()) if release_path.exists() else None
                             prior_episode = state.get('episode')
@@ -307,7 +308,8 @@ def run(config, state_dir, *, once=False, observe_only=False):
                         except Exception as error:
                             health['accounts'][name] = {'status': 'degraded', 'errorType': type(error).__name__,
                                                        'reason': str(error) if isinstance(error, (RuntimeError, ValueError)) else 'read_or_dispatch_failed'}
-                            if bridge is not None and isinstance(error, RuntimeError) and 'delivery' in str(error):
+                            if (bridge is not None and isinstance(error, RuntimeError) and
+                                    'delivery_outcome_unknown' in str(error).split(';')):
                                 transport.close(); bridge = None
                             if not observation_acquired and not observe_only and path.exists():
                                 try:

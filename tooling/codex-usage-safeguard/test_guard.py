@@ -11,6 +11,29 @@ def sample(used, resets=1, balance='1000'):
             'credits': {'balance': balance}}
 
 class GuardTests(unittest.TestCase):
+    def test_daybreak_switch_invalidates_main_only_pause_without_transport(self):
+        account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
+        state, _ = advance({}, sample(100, resets=0), account, now=10)
+        pause = state['episode']['events'][0]
+        pause['deliveries'] = {'foreman': {'status': 'submitted', 'target': 'foreman'}}
+        state, events = advance(state, sample(100, resets=0), dict(account, alsoCurrentMain=False), now=20)
+        self.assertEqual(events, [])
+        self.assertTrue(state['episode']['events'][0]['invalidated'])
+        self.assertEqual(state['episode']['events'][0]['deliveries'], pause['deliveries'])
+
+    def test_unsent_invalidated_pause_needs_no_hold_release_but_attempted_pause_does(self):
+        for receipt in (None, 'submitted', 'attempting', 'outcome_unknown'):
+            with self.subTest(receipt=receipt):
+                state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
+                pause = state['episode']['events'][0]
+                pause['invalidated'] = {'reason': 'daybreak_no_longer_main'}
+                if receipt:
+                    pause['deliveries'] = {'foreman': {'status': receipt}}
+                available = sample(0); available['rate_limit']['allowed'] = True
+                release = {'episodeId': state['episode']['id'], 'accountId': ACCOUNT['accountId'],
+                           'evidenceReference': 'actual-release-reference', 'holdReleased': False}
+                self.assertEqual(settle(state, available, release)['episode']['active'], receipt is not None)
+
     def test_only_zero_creates_confirmation_request(self):
         state = {}
         for used in (0, 90, 99, 99.999):

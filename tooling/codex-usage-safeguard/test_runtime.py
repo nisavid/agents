@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +22,45 @@ from test_controller import CONFIG, ReceiptTransport
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_main_receipt_reconciliation_does_not_starve_daybreak_delivery(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+            def read(account, **kwargs):
+                if account['name'] == 'main': return sample(100)
+                value = sample(100); value.update(email=pinned['email'], accountId=pinned['accountId'])
+                return value
+            with patch('controller.read_account', side_effect=read), \
+                 patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
+                 patch.dict(os.environ, {}, clear=True), patch('controller.time.time', return_value=20):
+                run(config, root, once=True, observe_only=True)
+                state = json.loads((root / 'main.json').read_text())
+                state['episode']['events'][0]['deliveries'] = {'parent': {'status': 'outcome_unknown', 'target': 'parent'}}
+                save(root / 'main.json', state)
+                with patch('controller.Transport') as transport:
+                    health = run(config, root, once=True)
+                    bridge = transport.return_value.connection.return_value
+                    bridge.send.assert_called_once()
+                    self.assertIn('for daybreak account', bridge.send.call_args.args[1])
+                    transport.return_value.close.assert_called_once()
+                self.assertEqual(health['accounts']['main']['status'], 'degraded')
+                self.assertEqual(health['accounts']['daybreak']['status'], 'healthy')
+
+    def test_rearm_cli_accepts_unsent_invalidated_pause_without_false_hold_claim(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
+            state['episode']['events'][0]['invalidated'] = {'reason': 'daybreak_no_longer_main'}
+            save(root / 'daybreak.json', state)
+            command = [sys.executable, '-B', str(Path(__file__).with_name('request_rearm.py')),
+                       '--state-dir', str(root), '--account', 'daybreak', '--episode', state['episode']['id'],
+                       '--evidence-reference', 'fixture-restored-quota-evidence']
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(json.loads((root / 'release-daybreak.json').read_text())['holdReleased'])
+            state['episode']['events'][0]['deliveries'] = {'foreman': {'status': 'attempting'}}
+            save(root / 'daybreak.json', state)
+            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+
     def test_only_quota_read_failure_can_start_observation_fallback(self):
         for failure in ('transport', 'delivery', 'read'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as name:

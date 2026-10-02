@@ -1,0 +1,16 @@
+{
+  "name": "codex-usage-safeguard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test_*.mjs"
+  },
+  "dependencies": {
+    "proxy-from-env": "2.1.0",
+    "undici": "6.29.0"
+  }
+}

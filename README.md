@@ -18,6 +18,8 @@ does not distribute or validate those members.
 - [`tooling/chatgpt-ffs`](tooling/chatgpt-ffs/) and
   [`tooling/codex-ns-proxy`](tooling/codex-ns-proxy/) are personal tools with
   their own documentation and operating boundaries.
+- [`tooling/codex-usage-safeguard`](tooling/codex-usage-safeguard/) owns the local
+  quota observer, validated app connection renewal, and operating procedure.
 - `.scratch` contains unrelated experiments and is not a supported package
   surface.
 

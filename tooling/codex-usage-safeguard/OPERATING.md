@@ -179,8 +179,10 @@ python3 activation.py --config "$private_config" --state-dir "$existing_state" \
 ```
 
 Persist maintenance **before** stopping the service or staging an upgrade. The
-controller checks it each poll and before each new send intent; already-started
-sends may complete, so inspect receipts before claiming delivery stopped. Keep
+controller checks it each poll and serializes each new intent/send/receipt with
+maintenance decisions. The maintenance command waits for an already-started
+send to finish; inspect its receipt before claiming a stop. A newer maintenance
+decision supersedes an older activation still running preflight. Keep
 both locks and all account/approval/delivery state. Observe the recorded
 maintenance mode before proceeding with a handoff.
 
@@ -188,7 +190,8 @@ Activation writes maintenance first, then performs fresh read-only account and
 exact-destination preflight, then binds the approved activation to this private
 configuration. A failed check leaves maintenance intact. Inspect existing
 pending episodes and uncertain receipts before activation; do not rewind or
-replay them. Configuration edits require a new activation decision/preflight.
+replay them. Fresh restored or unknown core allowance blocks new sends from an
+old pending episode while preserving its receipts and any separate hold. Configuration edits require a new activation decision/preflight.
 A route renewal alone never clears maintenance. This helper does not release
 Foreman holds or redeem quota resets.
 

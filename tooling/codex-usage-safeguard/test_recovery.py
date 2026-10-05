@@ -5,9 +5,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from activation import configuration_binding, delivery_status, set_mode
+from activation import configuration_binding, delivery_status, set_mode, decision_lock
 from controller import dispatch, run
 from native_bridge import NativeBridgeError
 from safeguard import advance
@@ -90,6 +92,24 @@ class RecipientRecoveryTests(TransportFixture):
         with self.assertRaises(RuntimeError): self.manager().connection()
         self.assertEqual(len(self.alerts), 2)
 
+    def test_malformed_parent_health_cannot_discard_verified_foreman(self):
+        pipe = self.route('app.sock', {'fixture-parent': 'deny'}); self.publish(pipe)
+        manager = self.manager()
+        save(self.root / 'transport/parent/health.json', {'retryAt': 'bad', 'candidateSet': []})
+        router = manager.connection()
+        self.assertIsNotNone(router.for_recipient('foreman'))
+        self.assertIsNone(router.for_recipient('parent'))
+        self.assertTrue(manager.health['recipients']['foreman']['healthy'])
+        manager.close()
+
+    def test_unexpected_parent_local_failure_isolated_from_foreman(self):
+        pipe = self.route('app.sock'); self.publish(pipe); manager=self.manager()
+        with patch.object(manager.destinations['parent'], 'connection', side_effect=TypeError('fixture')):
+            router=manager.connection()
+        self.assertIsNotNone(router.for_recipient('foreman'))
+        self.assertFalse(manager.health['recipients']['parent']['healthy'])
+        manager.close()
+
 
 class MaintenanceTests(unittest.TestCase):
     def config(self, root):
@@ -154,6 +174,62 @@ class MaintenanceTests(unittest.TestCase):
                          delivery_guard=lambda:next(answers))
             self.assertEqual([t for t,_ in bridge.received],['foreman'])
             self.assertEqual(set(state['episode']['events'][0]['deliveries']), {'foreman'})
+
+    def test_older_activation_cannot_overwrite_newer_maintenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); config=self.config(root)
+            def preflight(*args, **kwargs):
+                set_mode(config, root, 'maintenance', 'newer-hold')
+            with self.assertRaisesRegex(RuntimeError, 'superseded'):
+                set_mode(config, root, 'active', 'older-activation', live_preflight=preflight)
+            self.assertEqual(delivery_status(config,root), {'mode':'maintenance','reason':'operator_maintenance','reference':'newer-hold'})
+
+    def test_disk_configuration_edit_inhibits_still_running_old_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); config=self.config(root); path=root/'config.json'
+            save(path,config); config['_configPath']=str(path)
+            set_mode(config,root,'active','operator',live_preflight=lambda *a,**k:None)
+            changed=copy.deepcopy(config); changed['parentThreadId']='new-parent'; save(path,changed)
+            self.assertEqual(delivery_status(config,root)['reason'],'activation_configuration_changed')
+
+    def test_restored_quota_blocks_old_unsent_pause_without_changing_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'main.json'; bridge=ReceiptTransport(path)
+            state,_=advance({},sample(100,resets=0),ACCOUNT,now=10)
+            key=state['episode']['resetIdempotencyKey']
+            state,_=advance(state,sample(50,resets=0),ACCOUNT,now=20)
+            with self.assertRaisesRegex(RuntimeError,'current_zero_required_before_delivery'):
+                dispatch(state,ACCOUNT,{'foremanThreadId':'foreman','parentThreadId':'parent'},bridge,path)
+            self.assertEqual(bridge.received,[])
+            self.assertFalse(state['episode']['events'][0].get('deliveries'))
+            self.assertEqual(state['episode']['resetIdempotencyKey'],key)
+            self.assertTrue(state['episode']['active'])  # No invented release of any hold.
+
+    def test_maintenance_and_send_are_serialized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); config=self.config(root); path=root/'main.json'
+            set_mode(config,root,'active','operator',live_preflight=lambda *a,**k:None)
+            started=threading.Event(); hold_started=threading.Event(); held=threading.Event()
+            bridge=ReceiptTransport(path); send=bridge.send; observed=[]
+            def blocking_send(target,prompt):
+                started.set(); self.assertTrue(hold_started.wait(2))
+                self.assertFalse(held.wait(0.05))
+                observed.append(delivery_status(config,root)['mode'])
+                send(target,prompt)
+            bridge.send=blocking_send
+            def hold():
+                self.assertTrue(started.wait(2)); hold_started.set()
+                set_mode(config,root,'maintenance','operator-hold'); held.set()
+            state,_=advance({},sample(100),ACCOUNT,now=10)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future=pool.submit(hold)
+                dispatch(state,ACCOUNT,config,bridge,path,
+                         delivery_guard=lambda:delivery_status(config,root)['mode']=='active',
+                         delivery_lock=lambda:decision_lock(root))
+                future.result(timeout=3)
+            self.assertEqual(observed,['active']); self.assertTrue(held.is_set())
+            self.assertEqual(delivery_status(config,root)['mode'],'maintenance')
+            self.assertEqual(state['episode']['events'][0]['deliveries']['parent']['status'],'submitted')
 
 
 if __name__ == '__main__': unittest.main()

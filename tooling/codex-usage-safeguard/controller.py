@@ -2,6 +2,7 @@
 """Single local service: fresh reads, durable intents, native Steer dispatch."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import datetime as dt
 import fcntl
 import json
@@ -12,9 +13,9 @@ import subprocess
 import time
 import uuid
 
-from safeguard import advance, settle, observation_failed, decimal, invalidate_daybreak_pauses
+from safeguard import advance, settle, observation_failed, decimal, invalidate_daybreak_pauses, exhausted
 from transport import Transport, publish_candidate
-from activation import delivery_status
+from activation import delivery_status, decision_lock
 from storage import save
 from configuration import load_config, runtime_arguments
 
@@ -126,7 +127,7 @@ def make_prompt(event, episode, account, state_path, recipient):
             "is unknown, describe it as unknown and investigate once. Preserve independent holds.")
 
 
-def dispatch(state, account, config, bridge, path, *, delivery_guard=None):
+def dispatch(state, account, config, bridge, path, *, delivery_guard=None, delivery_lock=None):
     episode = state.get('episode')
     if not episode or not episode.get('active'):
         return
@@ -176,29 +177,33 @@ def dispatch(state, account, config, bridge, path, *, delivery_guard=None):
                     if delivered['status'] != 'submitted':
                         failures.append('delivery_outcome_requires_reconciliation')
                     continue
-            if delivery_guard is not None and not delivery_guard():
-                failures.append('maintenance_delivery_inhibited')
-                continue
-            recipient_bridge = bridge.for_recipient(key) if hasattr(bridge, 'for_recipient') else bridge
-            if recipient_bridge is None:
-                failures.append(key + '_destination_unavailable')
-                continue  # Known unsent: no uncertain receipt and no replay permission needed.
-            event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
-            if event['kind'] == 'foreman_pause_required' and key == 'parent':
-                confirmation = next((e for e in episode['events'] if e['kind'] in (
-                    'reset_confirmation_required', 'reset_availability_unknown')), None)
-                if confirmation:
-                    event['deliveries'][key]['includesEvent'] = confirmation['id']
-            save(path, state)
-            try:
-                recipient_bridge.send(target, make_prompt(event, episode, account, path, key))
-            except Exception:
-                event['deliveries'][key]['status'] = 'outcome_unknown'
+            with delivery_lock() if delivery_lock is not None else nullcontext():
+                if not exhausted(state.get('lastSample', {})):
+                    failures.append('current_zero_required_before_delivery')
+                    continue
+                if delivery_guard is not None and not delivery_guard():
+                    failures.append('maintenance_delivery_inhibited')
+                    continue
+                recipient_bridge = bridge.for_recipient(key) if hasattr(bridge, 'for_recipient') else bridge
+                if recipient_bridge is None:
+                    failures.append(key + '_destination_unavailable')
+                    continue  # Known unsent: no uncertain receipt and no replay permission needed.
+                event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
+                if event['kind'] == 'foreman_pause_required' and key == 'parent':
+                    confirmation = next((e for e in episode['events'] if e['kind'] in (
+                        'reset_confirmation_required', 'reset_availability_unknown')), None)
+                    if confirmation:
+                        event['deliveries'][key]['includesEvent'] = confirmation['id']
                 save(path, state)
-                failures.append('delivery_outcome_unknown')
-                continue
-            event['deliveries'][key]['status'] = 'submitted'
-            save(path, state)
+                try:
+                    recipient_bridge.send(target, make_prompt(event, episode, account, path, key))
+                except Exception:
+                    event['deliveries'][key]['status'] = 'outcome_unknown'
+                    save(path, state)
+                    failures.append('delivery_outcome_unknown')
+                    continue
+                event['deliveries'][key]['status'] = 'submitted'
+                save(path, state)
     if failures:
         raise RuntimeError(';'.join(sorted(set(failures))))
 
@@ -322,7 +327,8 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                 if bridge is None:
                                     raise RuntimeError('native_transport_unavailable')
                                 dispatch(state, account, config, bridge, path,
-                                         delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active')
+                                         delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',
+                                         delivery_lock=lambda: decision_lock(state_dir))
                             health['accounts'][name] = {'status': 'healthy', 'observationStatus': 'healthy',
                                                        'deliveryStatus': health.get('transport', 'unavailable') if armed else activation['mode'],
                                                        'sampleAt': reading['observedAt'],
@@ -351,7 +357,8 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                         save(path, retained)
                                         bridge = transport.connection()
                                         dispatch(retained, account, config, bridge, path,
-                                                 delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active')
+                                                 delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',
+                                         delivery_lock=lambda: decision_lock(state_dir))
                                 except Exception:
                                     health['accounts'][name]['fallbackDelivery'] = 'unconfirmed'
                 save(state_dir / 'health.json', health)

@@ -81,8 +81,11 @@ withheld activation. Activation requires an explicit verified decision
 reference and fresh read-only preflight of both accounts and exact recipients.
 The helper persists maintenance before preflight, so a failed check stays held.
 Activation never changes credentials, caller identity, destinations or ledgers.
-The controller also rechecks maintenance before every new delivery intent.
-A send already in flight may finish; stopping work remains the Foreman's job.
+The controller serializes each intent/send/receipt with maintenance decisions;
+an older activation preflight cannot overwrite a newer decision. It rechecks
+maintenance and current exact-zero evidence before every new intent. Restored
+allowance blocks unsent old events without releasing holds or changing receipts.
+A send already in flight may finish before the maintenance command returns; stopping work remains the Foreman's job.
 
 
 ## Acceptance and installation

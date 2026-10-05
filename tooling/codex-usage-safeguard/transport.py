@@ -112,6 +112,14 @@ class _Destination:
         try:
             value = read_private(self.root / 'health.json', {})
             if not isinstance(value, dict): raise ValueError('invalid_health_record')
+            for key in ('retryAt', 'observedAt', 'lastFailureAt'):
+                if key in value and (type(value[key]) not in (int, float) or not math.isfinite(value[key])):
+                    raise ValueError('invalid_health_record')
+            if 'attempts' in value and (type(value['attempts']) is not int or value['attempts'] < 0):
+                raise ValueError('invalid_health_record')
+            if 'candidateSet' in value and (not isinstance(value['candidateSet'], list)
+                    or not all(isinstance(item, str) for item in value['candidateSet'])):
+                raise ValueError('invalid_health_record')
             return value
         except (OSError, ValueError):
             # Health is reconstructible; never apply this recovery to delivery,
@@ -218,13 +226,16 @@ class Transport:
                              for role in ('foreman', 'parent')}
         self.health = {}
 
-    def _record_health(self):
+    def _record_health(self, failures):
         try:
             old = read_private(self.root / 'health.json', {})
             if not isinstance(old, dict): old = {}
         except (OSError, ValueError):
             old = {}
         recipients = {role: destination._health() for role, destination in self.destinations.items()}
+        for role, diagnostic in failures.items():
+            recipients[role] = {**recipients[role], 'healthy': False}
+            if diagnostic is not None: recipients[role]['lastFailures'] = [diagnostic]
         healthy = all(value.get('healthy') is True for value in recipients.values())
         now = self.clock()
         if healthy:
@@ -232,11 +243,16 @@ class Transport:
                      'lastRecoveredIncident': old.get('incident') or old.get('lastRecoveredIncident')}
         else:
             value = dict(old)
-            if not value.get('incident'):
+            if (not isinstance(value.get('incident'), str) or not value['incident']
+                    or type(value.get('startedAt')) not in (int, float) or not math.isfinite(value['startedAt'])):
                 value = {'incident': str(uuid.uuid4()), 'startedAt': now}
             value.update(healthy=False, observedAt=now, recipients=recipients,
                          reason='one_or_more_destinations_unavailable')
             notice = value.get('notice', {})
+            if not isinstance(notice, dict): notice = {}
+            for key in ('attemptedAt', 'attempts'):
+                if key in notice and (type(notice[key]) not in (int, float) or not math.isfinite(notice[key])):
+                    notice = {}; break
             # Old records had no attempt timestamp: use the incident start.
             last = notice.get('attemptedAt', value['startedAt'])
             due = not notice or now - last >= self.reminder_seconds
@@ -259,14 +275,17 @@ class Transport:
         self.health = value
 
     def connection(self):
-        available = False
-        for destination in self.destinations.values():
+        available = False; failures = {}
+        for role, destination in self.destinations.items():
             try:
                 destination.connection()
                 available = True
-            except RuntimeError:
-                pass
-        self._record_health()
+            except Exception as error:
+                destination.close()
+                # One malformed/unreadable recipient record cannot discard a
+                # different recipient's successfully verified connection.
+                failures[role] = None if isinstance(error, RuntimeError) else failure_diagnostic(error)
+        self._record_health(failures)
         if not available:
             raise RuntimeError('transport_unavailable_requires_registration_or_app_recovery')
         return self

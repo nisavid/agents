@@ -52,7 +52,12 @@ a later pause will be acknowledged.
    and delivery receipts. Backups are evidence; never restore them over later
    actions. Run the new release's read-only preflight with the actual config and
    state. Resolve failures before stopping the existing observer.
-3. After the approved handoff starts, stop the existing
+3. Before an intentional stop or withheld activation on a maintenance-aware
+   release, persist the hold using the command below. For the **first upgrade
+   from an older release that ignores activation.json**, explicitly stop and
+   disable the same unit during the approved deployment, recording its previous
+   enablement. Otherwise the old controller could restart at boot while the
+   upgrade is incomplete. After the approved handoff starts, stop the existing
    `codex-usage-safeguard.service`. Confirm it stopped. Materialize only the reviewed
    launcher, immutable release and unit selection; retain the same unit identity,
    private config, state paths and both locks. Install locked dependencies if they
@@ -70,15 +75,22 @@ a later pause will be acknowledged.
    it. Preserve all unrelated MCP settings. The app must load the new normal MCP
    entry; its startup publishes the route. A launch from a CLI without the app
    route is a no-op. Do not embed a socket path or caller identity in this block.
-5. Reload systemd and start the same unit. Inspect `codex-quota-safeguard status`
+5. Reload systemd and start the same unit in maintenance. Restore previous
+   enablement only within the approved deployment. Quota observation should be
+   fresh, with delivery held. After reviewing current episodes and obtaining the
+   explicit activation decision, run the activation command below; it repeats
+   exact live preflight and the running observer notices the transition.
+   Inspect `codex-quota-safeguard status`
    and the journal. Require fresh samples for both accounts and transport health
    `healthy=true` with exact destination checks. Compare the preserved episode,
    reset and delivery fields; expect fresh observations, not identical whole-file
    hashes after polling. Submitted or uncertain deliveries must not reappear as
    new sends. No live reset or pause is a test.
-6. If checks fail, stop the new unit and restore the previously verified **code
+6. If checks fail, persist maintenance, stop the new unit and restore the previously verified **code
    selection and unit**, retaining current state. Roll back only to code that
-   understands this state schema. Restart the previous observer and verify its
+   understands this state schema and enforces activation.json. An older release
+   that ignores maintenance cannot be restarted as a safe rollback; keep its
+   unit disabled until a separately approved compatible recovery. Restart the previous observer and verify its
    genuine route and health. Never rewind receipts, approvals or reset keys.
 
 The dotfiles adapter materializes files but does not enable/start services,
@@ -87,32 +99,36 @@ its selection does not stop an already installed observer.
 
 ## Connection and delivery incidents
 
-`transport/accepted.json` records the last verified route. The companion registry
-is private, coalesces duplicate socket generations, and retains at most 16.
-The observer checks liveness every 60 seconds, tries at most two candidate
-connections per poll, and backs off locally up to five minutes after failure.
-Native RPC timeout is five seconds; quota reads begin concurrently. These are
-best-effort safeguards, not a hard spending cap or an app-boot guarantee.
+`transport/foreman/accepted.json` and `transport/parent/accepted.json` retain
+independently verified routes; the old shared accepted record is a read-only
+fallback. The companion registry coalesces duplicate generations and retains at
+most 16. Each destination checks liveness every 60 seconds, tries at most two
+candidates per poll and backs off locally up to five minutes. RPC timeout is five
+seconds; quota reads begin concurrently. These are best-effort safeguards, not a
+hard spending cap or an app-boot guarantee.
 
-Failed checks retain bounded `lastFailures` diagnostics in transport health:
-the category, check stage, numeric RPC code when available, and the recipient
-role. They omit raw error prose, credentials, and response payloads. Diagnostics
-survive retry cooldowns and clear only on a verified recovery. A missing old
-socket and rejection through a newer candidate can therefore be distinguished.
-`native_socket_access_denied` means the diagnostic process could not connect;
-it does not establish invalid caller authorization. Use the supported execution
-approval flow for a narrowly scoped read-only check, never an alternate socket
-or substituted identity. `native_app_request_failed` is deliberately inconclusive:
-the app may mask a caller rejection behind this response. Inspect the app's local
-diagnostic log for the matching owner and time before proposing a repair.
+The controller can send through a verified Foreman connection even when the
+parent is unreadable. An unavailable recipient remains unsent without an
+`attempting` or uncertain receipt. A real send with unknown outcome retains its
+original reconciliation requirement, even if another destination later works.
+`status` reports persistent delivery mode, observation freshness and per-recipient
+availability separately. A healthy systemd process alone is not acceptance.
 
-An incident is persisted in `transport/health.json`. The observer attempts one
-`notify-send` alert per incident, persisting intent before delivery. `submitted`
-means the notification command succeeded, not that a person saw it; `failed`
-means no delivery claim is possible. A crash after intent leaves it uncertain
-and does not trigger repeated alerts. Inspect local status/journal if the desktop
-notification service is unavailable. Verified connection recovery closes the
-incident without resetting quota state.
+Failed checks keep bounded `lastFailures` in each recipient's health: category,
+stage, numeric RPC code and recipient role when available. Raw error text and
+credentials are excluded. A socket access denial does not establish invalid
+caller authorization. Use the supported approval flow for a bounded diagnostic;
+never substitute caller metadata or discover an alternative socket.
+
+The aggregate `transport/health.json` keeps one incident while either destination
+is unavailable. It attempts one local desktop notification initially and at most
+once per hour thereafter, including across process/host restarts. Each attempt's
+intent and timestamp are durable before `notify-send`; failed and uncertain
+attempts wait the same hour. Legacy notices use their incident start as the old
+attempt time. `submitted` means command success, not user acknowledgment. Both
+verified destinations close the incident. These reminders create no model turns
+or pause/reset requests. Inspect status and the journal if desktop notifications
+are unavailable.
 
 If opening the app and loading a Codex session supplies a valid route, renewal
 is automatic for the existing registration. If caller authorization is rejected,
@@ -148,6 +164,33 @@ For `attempting` or `outcome_unknown` delivery, read the exact destination threa
 and search for that episode/event marker. Reconcile the receipt from actual
 thread evidence before any explicit resend decision. A reconnect is never resend
 permission. Parent submission is not a second Foreman or proof of a stopped root.
+
+## Hold or activate delivery
+
+Use the selected release's helper, the existing private config and state, and a
+reference to the verified operator decision. A typed reference is audit evidence,
+not consent by itself. These commands do not change enablement or service state.
+
+```sh
+python3 activation.py --config "$private_config" --state-dir "$existing_state" \
+  --mode maintenance --reference "$verified_maintenance_decision"
+python3 activation.py --config "$private_config" --state-dir "$existing_state" \
+  --mode active --reference "$verified_activation_decision"
+```
+
+Persist maintenance **before** stopping the service or staging an upgrade. The
+controller checks it each poll and before each new send intent; already-started
+sends may complete, so inspect receipts before claiming delivery stopped. Keep
+both locks and all account/approval/delivery state. Observe the recorded
+maintenance mode before proceeding with a handoff.
+
+Activation writes maintenance first, then performs fresh read-only account and
+exact-destination preflight, then binds the approved activation to this private
+configuration. A failed check leaves maintenance intact. Inspect existing
+pending episodes and uncertain receipts before activation; do not rewind or
+replay them. Configuration edits require a new activation decision/preflight.
+A route renewal alone never clears maintenance. This helper does not release
+Foreman holds or redeem quota resets.
 
 ## Confirm a reset and release a hold
 

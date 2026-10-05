@@ -137,18 +137,26 @@ class NativeBridge:
         self.proc.stdout.close()
 
 
+def verify_destination(bridge, thread_id, recipient):
+    """Verify one exact configured recipient without coupling its availability."""
+    if recipient not in ('foreman', 'parent'):
+        raise ValueError('unknown_recipient')
+    try:
+        value = bridge.call('read_thread', {'threadId': thread_id, 'turnLimit': 1,
+                                           'includeOutputs': False, 'maxOutputCharsPerItem': 1})
+    except NativeBridgeError as error:
+        error.recipient = recipient
+        raise
+    thread = value.get('thread', {})
+    if thread.get('id') != thread_id or (recipient == 'foreman' and thread.get('title') != 'Codex Foreman'):
+        raise NativeBridgeError('native_route_identity_mismatch', stage='read_thread', recipient=recipient)
+    return True
+
+
 def verify_bridge(bridge, foreman, parent):
-    """Read-only identity/route check; never creates a turn or sends a marker."""
+    """Strict read-only preflight still requires both exact destinations."""
     if foreman == parent:
         raise NativeBridgeError('native_route_identity_mismatch', stage='verify_destinations')
-    for recipient, thread_id, expected_title in [('foreman', foreman, 'Codex Foreman'), ('parent', parent, None)]:
-        try:
-            value = bridge.call('read_thread', {'threadId': thread_id, 'turnLimit': 1,
-                                               'includeOutputs': False, 'maxOutputCharsPerItem': 1})
-        except NativeBridgeError as error:
-            error.recipient = recipient
-            raise
-        thread = value.get('thread', {})
-        if thread.get('id') != thread_id or (expected_title and thread.get('title') != expected_title):
-            raise NativeBridgeError('native_route_identity_mismatch', stage='read_thread', recipient=recipient)
+    verify_destination(bridge, foreman, 'foreman')
+    verify_destination(bridge, parent, 'parent')
     return True

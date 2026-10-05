@@ -17,6 +17,7 @@ from safeguard import advance
 from status import status
 from preflight import preflight
 from storage import save
+from activation import configuration_binding
 from test_guard import ACCOUNT, sample
 from test_controller import CONFIG, ReceiptTransport
 
@@ -37,6 +38,7 @@ class RuntimeTests(unittest.TestCase):
                 state['episode']['events'][0]['deliveries'] = {'parent': {'status': 'outcome_unknown', 'target': 'parent'}}
                 save(root / 'main.json', state)
                 with patch('controller.Transport') as transport:
+                    transport.return_value.connection.return_value.for_recipient.return_value = transport.return_value.connection.return_value
                     health = run(config, root, once=True)
                     bridge = transport.return_value.connection.return_value
                     bridge.send.assert_called_once()
@@ -67,6 +69,7 @@ class RuntimeTests(unittest.TestCase):
                 root = Path(name); config = self.config(root)
                 config['policy'].update(pauseWhenUnmetered=True,
                     fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+                save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config), 'reference': 'fixture-approval'})
                 pinned = config['accounts'][1]
                 value = sample(100); value.update(email=pinned['email'], accountId=pinned['accountId'])
                 state, _ = advance({}, value, pinned, now=10, policy=config['policy'])
@@ -80,6 +83,7 @@ class RuntimeTests(unittest.TestCase):
                      patch('controller.default_identity', return_value={'email': ACCOUNT['email'], 'accountId': ACCOUNT['accountId']}), \
                      patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True), \
                      patch('controller.time.time', return_value=20):
+                    transport.return_value.connection.return_value.for_recipient.return_value = transport.return_value.connection.return_value
                     if failure == 'transport':
                         transport.return_value.connection.side_effect = RuntimeError('fixture_transport_down')
                     elif failure == 'delivery':
@@ -93,6 +97,7 @@ class RuntimeTests(unittest.TestCase):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         config.update(stateDir=str(root), sharedLock=str(root / 'legacy.lock'), enabled=True)
         (root / 'legacy.lock').touch()
+        save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config), 'reference': 'fixture-approval'})
         return config
 
     def test_companion_has_no_action_tools_and_never_fabricates_a_route(self):

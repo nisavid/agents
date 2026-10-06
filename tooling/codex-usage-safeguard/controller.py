@@ -17,6 +17,7 @@ from safeguard import advance, settle, observation_failed, decimal, invalidate_d
 from transport import Transport, publish_candidate
 from activation import delivery_status, decision_lock
 from storage import save
+from pause_completion import completion_status
 from configuration import load_config, runtime_arguments
 
 ROOT = Path(__file__).resolve().parent
@@ -109,7 +110,16 @@ def make_prompt(event, episode, account, state_path, recipient):
                 "orders to all currently active Codex root threads, including Codex work using "
                 "another account; preserve work, relay to their owned Codex children and track "
                 "actual safe-stop acknowledgments and continuation wakes. Never count delivery as "
-                "stopped. Keep Claude-only work running. Use your established limited Claude-Foreman "
+                "stopped. Retain verified human authorization with its source, target and scope; "
+                "do not require repeated approval solely because it was relayed. Check the actual "
+                "tool permission boundary before acting. If blocked, distinguish an instruction-based "
+                "refusal from a tool/reviewer denial, record the exact action and evidence, and "
+                "report the unresolved stop through the existing parent route. Never bypass a denial. "
+                "Reconcile recipient state through supported readback when a return message is "
+                "unavailable. Require root, owned-worker and continuation evidence before marking "
+                "the pause complete; preserve unknown coverage explicitly. Use OPERATING.md, "
+                "Protective-stop completion, in the safeguard source to record that evidence. "
+                "Keep Claude-only work running. Use your established limited Claude-Foreman "
                 "relay only for Claude-managed Codex work. Do not replay historical episodes. "
                 "No reset or purchase is authorized by this event. Notify Ivan through the current "
                 "parent. Do not resume paused work automatically. No hard dollar cap is guaranteed.")
@@ -361,6 +371,8 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                          delivery_lock=lambda: decision_lock(state_dir))
                                 except Exception:
                                     health['accounts'][name]['fallbackDelivery'] = 'unconfirmed'
+                for name, account_health in health['accounts'].items():
+                    account_health['protectiveStop'] = completion_status(config, state_dir, name)
                 save(state_dir / 'health.json', health)
                 if once:
                     return health

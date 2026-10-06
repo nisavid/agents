@@ -251,3 +251,73 @@ that are null are not substitutes for that evidence. Keep API assumptions in the
 small adapters and fail visibly when they no longer hold. Account-wide debit
 estimates include other concurrent activity and can undercount when grants mask
 consumption; the configured $8 threshold leaves headroom, not a guarantee.
+
+## Protective-stop completion
+
+After a pause request, collect the actual root roster, each root's stopped state,
+its owned workers or processes, and held continuation wakes. Record coverage
+limits and evidence references. A submitted message proves delivery only;
+missing return messages require supported readback or an explicit unknown.
+Retain verified human approval with its source, target, and scope. Distinguish
+an instruction refusal from an actual tool denial and escalate either unresolved
+stop through the existing parent route without bypassing a denial.
+
+Use the maintained producer from this package after collecting those observations:
+
+```sh
+python3 record_pause_completion.py --config "$private_config" \
+  --state-dir "$existing_state" --account main --record "$private_observations"
+```
+
+The private input has exactly these fields (identifiers and evidence below are
+synthetic; read the current identifiers from private state before invoking):
+
+```json
+{
+  "schemaVersion": 1,
+  "episodeId": "current-episode",
+  "eventId": "current-episode:foreman_pause_required",
+  "accountId": "current-account",
+  "identityGeneration": "current-main-generation",
+  "foremanThreadId": "configured-foreman",
+  "observedAt": 1791240000,
+  "inventory": {"complete": true, "evidenceReferences": ["private-roster-observation"]},
+  "roots": [{
+    "threadId": "observed-root",
+    "status": "stopped",
+    "workersComplete": true,
+    "workers": [{"id": "owned-worker-or-process", "status": "stopped"}],
+    "continuationHeld": true,
+    "failureKind": null,
+    "evidenceReferences": ["private-root-worker-and-wake-observations"]
+  }]
+}
+```
+
+Use `--account daybreak` with its pinned account ID and `identityGeneration: null`.
+Root and worker states are `stopped`, `blocked`, `unknown`, or `running`.
+`failureKind` is null, `instruction_refusal`, `tool_denial`, or `unknown`; blocked
+roots require a non-null kind. Stopped roots require complete worker coverage,
+all workers stopped, held continuation wakes, and a null failure kind. An empty
+root roster can establish a stop only with a complete, evidenced inventory.
+Incomplete inventories stay unknown or partial. Mixed root states stay partial;
+uniform blocked roots stay blocked; running or unknown roots never count as
+stopped. Evidence references must be nonempty; their contents and authority must
+be verified by the caller. This file interface does not authenticate its writer
+as Foreman or attest product state.
+
+The producer validates private ownership and modes, current account, main
+selection generation, active episode, latest valid pause event, and configured
+Foreman. It retains observations in `pause-completions/<sha256>.json` and updates
+`pause-completion-main.json` or `pause-completion-daybreak.json` separately from
+policy and delivery receipts. Older observations cannot replace newer ones for
+the same episode and event. The observer's one-pass run and `status.py` revalidate
+that record and expose `protectiveStop` independently of delivery health. Invalid,
+missing, or stale records report unconfirmed. A restart performs no completion
+message replay, release, reset, or automatic resume.
+
+Read this procedure at the reviewed source revision before producing a record.
+Preserve that revision with the observation evidence. Qualification uses the CLI
+and observer boundaries in `test_pause_completion.py`, with disposable state.
+Installing this producer or writing live completion evidence remains a separate
+approved rollout; source tests do not establish either.

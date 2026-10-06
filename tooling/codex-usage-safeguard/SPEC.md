@@ -42,6 +42,39 @@ tools. Configuration and all runtime state remain private and outside releases.
 - Restored allowance does not resume work or rearm an episode. Exact episode
   release evidence and any required Foreman hold release are mandatory.
 
+## Protective-stop completion
+
+Transport receipts remain unchanged. A Foreman completion record describes an
+observed protective stop; it never grants pause, reset, release, or route authority.
+The record binds its schema version, account ID, identity generation, episode,
+current pause-event ID, configured Foreman ID, observation time, and evidence
+references. Main records require the current main-selection generation; pinned
+Daybreak records bind the account and exact episode rather than inventing a main
+generation.
+
+Foreman records the full observed root inventory, its coverage limits, each root's
+stop status, owned-worker/process coverage, and continuation holds. A root without
+verified worker and continuation evidence cannot count as stopped. An empty root
+inventory can count as complete only with an explicit verified-empty inventory
+observation. Missing inventory coverage remains unknown. Denied authorization is
+blocked; uncertain outcomes remain unknown; mixed coverage remains partial.
+An instruction-based refusal is distinguished from an actual tool/reviewer denial.
+
+The local producer validates a supplied private record against current private
+configuration and state. It retains each accepted record immutably and updates a
+separate latest-record pointer. Restart may reread records but cannot replay pause
+requests or rewrite transport receipts. The observer and local status consumer
+validate that pointer and retained bytes against the current binding. Missing,
+malformed, stale, superseded, or mismatched records never indicate completed stops.
+Unconfirmed coverage remains visible even when the transport is healthy.
+
+The producer stores Foreman's observations; it does not authenticate an arbitrary
+writer as Foreman or independently attest the described native actions. Publication
+of the record requires the existing acting workflow's authority. Its evidence
+references must permit the supervising agent to audit actual native returns.
+No transcript scraping, additional model polling, timed reminders, caller rebind,
+or automatic pause or release is introduced by this interface.
+
 ## Connection renewal
 
 The companion publishes only its inherited `CODEX_APP_TOOLS_PIPE_PATH`, bound

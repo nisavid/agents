@@ -93,6 +93,7 @@ def bind(record, config, directory, name):
               if e.get('kind') == 'foreman_pause_required' and not e.get('invalidated')]
     require(bool(events), 'no_current_pause_event')
     require(record['episodeId'] == episode.get('id') and record['eventId'] == events[-1].get('id'), 'completion_episode_or_event_mismatch')
+    require(record['observedAt'] >= episode['openedAt'], 'completion_before_episode')
     require(record['accountId'] == state.get('accountId') == episode.get('accountId'), 'completion_account_mismatch')
     require(record['foremanThreadId'] == config['foremanThreadId'], 'completion_foreman_mismatch')
     if name == 'main':
@@ -130,6 +131,8 @@ def record_completion(record, config, directory, name):
             previous = read_archive(archive, pointer['sha256'])
             if previous.get('episodeId') == record['episodeId'] and previous.get('eventId') == record['eventId']:
                 require(record['observedAt'] >= previous['observedAt'], 'older_completion_observation')
+                if record['observedAt'] == previous['observedAt']:
+                    require(fingerprint == pointer['sha256'], 'conflicting_completion_observation_time')
         if path.exists():
             require(read_archive(archive, fingerprint) == record, 'completion_archive_mismatch')
         else:

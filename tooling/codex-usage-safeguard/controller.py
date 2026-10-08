@@ -74,7 +74,7 @@ def select_main_identity(root, template, reading):
     return {**template, **identity, 'identityGeneration': selected['generation']}, old
 
 
-def make_prompt(event, episode, account, state_path, recipient):
+def make_prompt(event, episode, account, state_path, recipient, approval_thread_id):
     common = (f"Quota safeguard event {event['id']} for {account['name']} account "
               f"{account['email']} ({account['accountId']}). Core Codex quota first reached "
               f"0% at {episode['observedAt']}. Deduplicate by episode {episode['id']}. "
@@ -93,7 +93,8 @@ def make_prompt(event, episode, account, state_path, recipient):
             return (common + f"Pause condition: {event['reason']}. The named Codex Foreman is the "
                     "sole pause coordinator. Inspect the recorded foreman delivery status before "
                     "reporting delivery; submitted does not mean acknowledged or stopped. Notify "
-                    "Ivan in the main chat, reconcile missing/uncertain delivery by reading the "
+                    f"Ivan here in the configured approval/status chat {approval_thread_id}; "
+                    "reconcile missing/uncertain delivery by reading the "
                     "Foreman thread, and do not create a second pause coordinator or replay this "
                     f"episode. Applicable reset count at detection: {episode['resetCount']!r}; "
                     f"saved reset idempotency key: {episode['resetIdempotencyKey']}. "
@@ -114,17 +115,19 @@ def make_prompt(event, episode, account, state_path, recipient):
                 "do not require repeated approval solely because it was relayed. Check the actual "
                 "tool permission boundary before acting. If blocked, distinguish an instruction-based "
                 "refusal from a tool/reviewer denial, record the exact action and evidence, and "
-                "report the unresolved stop through the existing parent route. Never bypass a denial. "
+                f"report the unresolved stop through the configured approval/status chat {approval_thread_id}. "
+                "Never bypass a denial. "
                 "Reconcile recipient state through supported readback when a return message is "
                 "unavailable. Require root, owned-worker and continuation evidence before marking "
                 "the pause complete; preserve unknown coverage explicitly. Use OPERATING.md, "
                 "Protective-stop completion, in the safeguard source to record that evidence. "
                 "Keep Claude-only work running. Use your established limited Claude-Foreman "
                 "relay only for Claude-managed Codex work. Do not replay historical episodes. "
-                "No reset or purchase is authorized by this event. Notify Ivan through the current "
-                "parent. Do not resume paused work automatically. No hard dollar cap is guaranteed.")
+                "No reset or purchase is authorized by this event. "
+                f"Notify Ivan through the configured approval/status chat {approval_thread_id}. "
+                "Do not resume paused work automatically. No hard dollar cap is guaranteed.")
     return (common + f"Reset applicability count at detection: {episode['resetCount']!r}. "
-            "Wake the current parent to request explicit human confirmation in Ivan's main chat "
+            f"Request explicit human confirmation here in the configured approval/status chat {approval_thread_id} "
             "for ONE reset for this exact account and episode, after refreshing applicable reset "
             "availability. This standing monitoring request is not redemption confirmation. Use "
             f"idempotency key {episode['resetIdempotencyKey']} for this logical attempt. "
@@ -206,7 +209,8 @@ def dispatch(state, account, config, bridge, path, *, delivery_guard=None, deliv
                         event['deliveries'][key]['includesEvent'] = confirmation['id']
                 save(path, state)
                 try:
-                    recipient_bridge.send(target, make_prompt(event, episode, account, path, key))
+                    recipient_bridge.send(target, make_prompt(event, episode, account, path, key,
+                                                             config['parentThreadId']))
                 except Exception:
                     event['deliveries'][key]['status'] = 'outcome_unknown'
                     save(path, state)

@@ -40,6 +40,92 @@ it sends nothing and redeems nothing. Capture its output privately. A successful
 read is evidence only for that app generation and registration, not proof that
 a later pause will be acknowledged.
 
+## Capture and adopt a local caller
+
+Use this procedure when an explicitly appointed local control chat needs genuine
+caller capture or when the operator chooses to replace an inaccessible caller.
+Read it at the reviewed source revision and retain that revision with the private
+evidence. [SPEC.md, Local caller and approval inbox](SPEC.md#local-caller-and-approval-inbox)
+defines the candidate and its evidence. Source tests qualify synthetic boundaries;
+live enrollment, installation, inbox transfer, and activation need their own
+explicit operational scope.
+
+1. Obtain authority for the reviewed installation, temporary MCP exposure, local
+   chat creation, and bounded initial capture turn. Keep the current account and
+   exact Foreman unless the approved scope expressly changes them. Complete
+   source review and package/repository checks before installation. Creating a
+   chat, selecting a title, or reading history does not establish caller context.
+2. Create the approved ordinary local chat through the native app. Retain its
+   actual final creation result privately as a user-owned `0600` JSON file. Its
+   direct `threadId` and `hostId: "local"` fields constrain enrollment. A queued
+   `clientThreadId` is insufficient; wait for the final result. Keep the complete
+   receipt bytes unchanged after capture. The receipt is a constraint against
+   enrolling another chat, not an authenticated substitute for the invocation.
+3. Configure a temporary MCP entry to run the reviewed package directly in capture
+   mode. Supply the private receipt and reviewed adapter paths:
+
+   ```sh
+   python3 companion.py --capture-receipt "$private_creation_receipt" \
+     --node-binary "$reviewed_node_binary" --native-bridge-script "$native_adapter"
+   ```
+
+   This is the MCP server command, not a shell capture invocation. Forward only
+   the genuinely inherited `CODEX_APP_TOOLS_PIPE_PATH` and, when supplied by the
+   runtime, `CODEX_APP_TOOLS_CALLER_HOST_ID`. Preserve the normal companion entry
+   and unrelated MCP settings. Capture mode requires no production configuration
+   or state and publishes no route. A configured or copied host/socket value is
+   not runtime provenance. Absence of the host variable qualifies local only
+   with all independent checks defined in the specification.
+4. Have the approved initial turn in that exact chat explicitly invoke
+   `capture_native_context` with `{}`. The tool must receive its thread, turn, and
+   model/native tool-call ID in actual runtime metadata. It uses the inherited
+   native route for one bounded read of that chat and checks returned ID, Codex
+   kind, and local host. If it returns `unsupported_capture`, retain the bounded
+   reason and stop before adoption. Missing tool-call metadata is a supported
+   refusal; request IDs, shell variables, and transcripts cannot repair it.
+   Malformed MCP frames produce an unsupported-capture parse error.
+5. Retain the returned `candidateJson` string as exact UTF-8 bytes without adding
+   a newline, together with the returned lowercase hexadecimal SHA-256. Recompute
+   that digest independently. Verify the recorded receipt digest against the
+   retained file, the runtime metadata sources, explicit or default-derived host
+   provenance, and exact local native readback. A mismatch rejects the candidate.
+   Remove only the temporary MCP entry within the approved cleanup scope. This
+   step ends with a reviewable candidate and evidence; it changes no stored caller,
+   inbox, activation, route registry, receipt, or quota policy.
+6. Before adoption, obtain explicit decisions appointing the captured chat as
+   native caller and as approval/status inbox. Those are separate responsibilities;
+   the Foreman remains the pause coordinator. Authorize the minimal context
+   handoff to the new inbox and exact Foreman. Refresh current episodes and
+   receipts. Retain submitted, `attempting`, and `outcome_unknown` receipts with
+   their original targets; uncertain outcomes require reconciliation rather than
+   retry. Define whether known-unsent active events may transfer. Preserve the
+   previous inbox as history, without fallback delivery or archived-event backfill.
+7. Qualify the captured context through the current inherited app route and read
+   both exact proposed recipients. A read proves access in that app generation.
+   If delivery proof is required, separately authorize one harmless, uniquely
+   marked message to each recipient and verify readback. Qualify saved-caller use
+   after the originating turn and after an approved app restart before claiming
+   persistence. An actual account switch requires its own approved test and
+   observations; synthetic account-environment changes do not establish it.
+   Self-delivery remains unqualified until observed. A real pause or reset is
+   never a qualification test.
+8. Adopt only within the controlled release handoff below, preserving both locks
+   and all current ledgers. Caller changes invalidate caller-bound routes, and
+   configuration changes invalidate activation. Start the normal companion to
+   renew the inherited route. Obtain fresh activation approval and strict live
+   preflight of both recipients before enabling delivery. Observe quota and
+   delivery health separately. Compatible rollback retains current ledgers;
+   restoring an inaccessible historical caller is not a verified recovery.
+
+Fixture qualification runs through `test_runtime.py` at the companion process/MCP
+boundary. It exercises discovery, capture success/refusal, metadata conflicts,
+exact receipt bytes, inherited-route and local-readback requirements, stable output
+across fixture process restarts and changed account environment, and production
+file preservation. No live capture, new chat, self-send, restart, account switch,
+installation, or adoption is established by that suite. Future capture consumers
+load this procedure before execution, retain its reviewed revision, and compare
+their actual result to its completion criteria.
+
 ## Controlled release handoff
 
 1. Complete local tests, independent review, source publication approval, and
@@ -132,10 +218,9 @@ are unavailable.
 
 If opening the app and loading a Codex session supplies a valid route, renewal
 is automatic for the existing registration. If caller authorization is rejected,
-stop at that boundary. Establish whether the app can supply fresh genuine caller
-context through its normal integration, and verify that context's permitted use
-before changing the stored caller. Do not assume a separate persistent grant is
-required or available. Creating or reading a task alone does not establish this
+stop at that boundary. Use [Capture and adopt a local caller](#capture-and-adopt-a-local-caller)
+when the operator authorizes that recovery direction. A candidate is not a
+persistent grant, and creating or reading a task alone does not establish caller
 context. The current sending method requires an explicit recipient thread ID;
 successful sending does not imply automatic discovery of the current dot.
 Normal companion startup supplies a connection route, not that recipient.

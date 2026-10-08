@@ -2,7 +2,7 @@
 """Operator-only Daybreak redemption after a specific human confirmation.
 
 The observer never invokes this module. A confirmation reference is an audit
-pointer; the calling agent must actually verify the human reply in the main chat.
+pointer; the calling agent must verify the human reply in the configured approval chat.
 """
 import argparse
 import datetime as dt

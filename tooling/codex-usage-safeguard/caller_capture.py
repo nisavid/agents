@@ -40,7 +40,7 @@ def runtime_identity(meta):
     if isinstance(turn_metadata, str):
         try:
             turn_metadata = json.loads(turn_metadata, object_pairs_hook=unique_object)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise ValueError('malformed_runtime_metadata') from None
     if not isinstance(turn_metadata, dict):
         raise ValueError('malformed_runtime_metadata')
@@ -80,7 +80,7 @@ def capture_settings(receipt_path, node_binary, native_bridge_script):
             return settings
         settings['receipt'] = json.loads(raw, object_pairs_hook=unique_object)
         settings['receiptSha256'] = hashlib.sha256(raw).hexdigest()
-    except (OSError, ValueError, UnicodeError):
+    except (OSError, ValueError, UnicodeError, RecursionError):
         pass
     return settings
 

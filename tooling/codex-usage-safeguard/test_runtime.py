@@ -24,7 +24,7 @@ from test_controller import CONFIG, ReceiptTransport
 
 class RuntimeTests(unittest.TestCase):
     def capture_process(self, root, requests, *, receipt=None, receipt_bytes=None,
-                        environment=None, bridge_script=None):
+                        environment=None, bridge_script=None, output_limit=None):
         receipt_path = root / 'creation-receipt.json'
         if receipt_bytes is None:
             save(receipt_path, receipt if receipt is not None else {'threadId': 'control-fixture', 'hostId': 'local'})
@@ -39,6 +39,9 @@ class RuntimeTests(unittest.TestCase):
                                 for r in requests) + '\n',
                                 capture_output=True, text=True, env=env, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
+        if output_limit is not None:
+            self.assertLess(len(result.stdout.encode('utf-8')), output_limit)
+            self.assertEqual(result.stderr, '')
         return [json.loads(line) for line in result.stdout.splitlines()]
 
     def capture_request(self, *, metadata=None, arguments=None):
@@ -197,6 +200,55 @@ for line in sys.stdin:
             self.assertEqual(replies[0], {'jsonrpc': '2.0', 'id': None,
                 'error': {'code': -32700, 'message': 'unsupported_capture: malformed_runtime_metadata'}})
             self.assertEqual(replies[1]['result'], {})
+
+    def test_capture_nested_frame_has_bounded_response_and_keeps_serving(self):
+        with tempfile.TemporaryDirectory() as name:
+            nested = '[' * 20000 + '0' + ']' * 20000
+            frame = '{"id":7,"method":"ping","params":' + nested + '}'
+            replies = self.capture_process(Path(name), [frame, {'id': 8, 'method': 'ping'}], output_limit=512)
+            self.assertEqual(len(replies), 2)
+            self.assertIn(replies[0], [
+                {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700,
+                    'message': 'unsupported_capture: malformed_runtime_metadata'}},
+                {'jsonrpc': '2.0', 'id': 7, 'result': {}}])
+            self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+            self.assertNotIn('candidateJson', json.dumps(replies))
+
+    def test_capture_nested_encoded_metadata_refuses_without_losing_next_ping(self):
+        with tempfile.TemporaryDirectory() as name:
+            nested = '[' * 20000 + '0' + ']' * 20000
+            metadata = self.capture_request()['params']['_meta']
+            metadata['x-codex-turn-metadata'] = '{"unused":' + nested + '}'
+            metadata['turnId'] = 'actual-turn'
+            replies = self.capture_process(Path(name), [self.capture_request(metadata=metadata),
+                                                        {'id': 8, 'method': 'ping'}], output_limit=512)
+            self.assertEqual(len(replies), 2)
+            self.assertEqual(replies[0]['id'], 7)
+            self.assertTrue(replies[0]['result']['isError'])
+            report = json.loads(replies[0]['result']['content'][0]['text'])
+            self.assertIn(report, [
+                {'status': 'unsupported_capture', 'reason': 'malformed_runtime_metadata'},
+                {'status': 'unsupported_capture', 'reason': 'inherited_native_route_required'}])
+            self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+            self.assertEqual(sorted(p.name for p in Path(name).iterdir()), ['creation-receipt.json'])
+
+    def test_capture_nested_receipt_refuses_without_losing_next_ping(self):
+        with tempfile.TemporaryDirectory() as name:
+            nested = '[' * 20000 + '0' + ']' * 20000
+            receipt = ('{"threadId":"control-fixture","hostId":"local","unused":' + nested + '}').encode()
+            self.assertLess(len(receipt), 65536)
+            replies = self.capture_process(Path(name), [self.capture_request(), {'id': 8, 'method': 'ping'}],
+                                           receipt_bytes=receipt, output_limit=512)
+            self.assertEqual(len(replies), 2)
+            self.assertEqual(replies[0]['id'], 7)
+            self.assertTrue(replies[0]['result']['isError'])
+            report = json.loads(replies[0]['result']['content'][0]['text'])
+            self.assertIn(report, [
+                {'status': 'unsupported_capture', 'reason': 'expected_local_creation_receipt_required'},
+                {'status': 'unsupported_capture', 'reason': 'inherited_native_route_required'}])
+            self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+            self.assertEqual((Path(name) / 'creation-receipt.json').read_bytes(), receipt)
+            self.assertEqual(sorted(p.name for p in Path(name).iterdir()), ['creation-receipt.json'])
 
     def test_capture_never_uses_rpc_ids_transcripts_or_shell_identity_as_missing_provenance(self):
         valid = self.capture_request()['params']['_meta']

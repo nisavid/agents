@@ -126,7 +126,7 @@ def capture_context(settings, params, environment):
         candidate_json = json.dumps(candidate, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
         report = {'status': 'captured_candidate', 'candidateJson': candidate_json,
                   'sha256': hashlib.sha256(candidate_json.encode('utf-8')).hexdigest()}
-    except (ValueError, OSError, NativeBridgeError) as error:
+    except (ValueError, OSError, NativeBridgeError, RecursionError) as error:
         report = {'status': 'unsupported_capture', 'reason': 'capture_evidence_unavailable'}
         # Error categories contain no raw native response or private payload.
         if isinstance(error, ValueError) and str(error) in (

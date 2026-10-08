@@ -28,6 +28,22 @@ class ReceiptTransport:
 
 
 class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        attempts = []
+        original_read_text = Path.read_text
+
+        def fixture_read_text(path, *args, **kwargs):
+            if path.name == 'auth.json' and path.parent.name == '.codex':
+                attempts.append(True)
+                raise PermissionError('ambient credential read refused by controller fixture')
+            return original_read_text(path, *args, **kwargs)
+
+        guard = patch.object(Path, 'read_text', fixture_read_text)
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.addCleanup(self.assertEqual, attempts, [],
+                        'controller fixture attempted an ambient credential read')
+
     def test_submitted_daybreak_pause_is_invalidated_on_switch_and_new_condition_gets_new_id(self):
         account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
         with tempfile.TemporaryDirectory() as directory:
@@ -134,8 +150,10 @@ class DeliveryTests(unittest.TestCase):
     def test_main_on_daybreak_uses_one_canonical_episode(self):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         pinned = next(a for a in config['accounts'] if a['name'] == 'daybreak')
-        reading = sample(100); reading.update(email=pinned['email'], accountId=pinned['accountId'])
-        with tempfile.TemporaryDirectory() as directory, patch('controller.read_account', return_value=reading):
+        identity = {'email': pinned['email'], 'accountId': pinned['accountId']}
+        reading = sample(100); reading.update(identity)
+        with tempfile.TemporaryDirectory() as directory, patch('controller.read_account', return_value=reading), \
+             patch('controller.default_identity', return_value=identity):
             root = Path(directory)
             health = run(config, root, once=True, observe_only=True)
             self.assertEqual(health['accounts']['main']['status'], 'covered_by_daybreak')

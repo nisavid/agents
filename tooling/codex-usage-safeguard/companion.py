@@ -15,7 +15,9 @@ def serve(config, state_dir, incoming, outgoing, environment, *, capture=None):
     for line in incoming:
         try:
             request = json.loads(line, object_pairs_hook=unique_object) if capture is not None else json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError) as error:
+            if capture is None and isinstance(error, RecursionError):
+                raise
             if capture is not None:
                 outgoing.write(json.dumps({'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700,
                     'message': 'unsupported_capture: malformed_runtime_metadata'}}) + '\n')

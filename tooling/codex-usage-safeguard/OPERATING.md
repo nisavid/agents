@@ -396,7 +396,19 @@ selection generation, active episode, latest valid pause event, and configured
 Foreman. It retains observations in `pause-completions/<sha256>.json` and updates
 `pause-completion-main.json` or `pause-completion-daybreak.json` separately from
 policy and delivery receipts. Older observations cannot replace newer ones for
-the same episode and event. The observer's one-pass run and `status.py` revalidate
+the same episode and event. At an equal timestamp, only a retry with the identical
+currently selected record digest is accepted. A conflicting tie is rejected and
+leaves the pointer, archives, and receipts intact. Inspect the producer's exit
+status: the retained record does not prove that a rejected submission was accepted.
+Use the actual observation time; do not alter it to bypass a rejection.
+
+The producer and consumers compare `observedAt` directly with the active episode's
+`openedAt`, with no tolerance: an earlier time is rejected on submission and reads
+as unconfirmed if already retained. Equal or later times satisfy this lower bound,
+subject to the other checks. It is not an expiry interval or proof of observation
+after the current pause request; collect the evidence after that request as above.
+
+The observer's one-pass run and `status.py` revalidate
 that record and expose `protectiveStop` independently of delivery health. Invalid,
 missing, or stale records report unconfirmed. A restart performs no completion
 message replay, release, reset, or automatic resume.

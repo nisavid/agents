@@ -41,13 +41,34 @@ class CompletionTests(unittest.TestCase):
                        'evidenceReferences': ['fixture-root-child-final-and-held-wakes']}],
         }
 
-    def produce(self, record=None):
+    def produce(self, record=None, account='main'):
         path = self.root / 'input.json'
         save(path, self.record if record is None else record)
         return subprocess.run([
             sys.executable, '-B', str(PACKAGE / 'record_pause_completion.py'),
             '--config', str(self.config_path), '--state-dir', str(self.root),
-            '--account', 'main', '--record', str(path)], text=True, capture_output=True)
+            '--account', account, '--record', str(path)], text=True, capture_output=True)
+
+    def retained_bytes(self):
+        paths = [self.root / name for name in ('main.json', 'daybreak.json', 'main-selection.json')]
+        paths += list(self.root.glob('reset-*.json'))
+        paths += list(self.root.glob('pause-completion-*.json'))
+        paths += list((self.root / 'pause-completions').glob('*.json'))
+        return {str(path.relative_to(self.root)): path.read_bytes() for path in paths if path.exists()}
+
+    def daybreak_record(self):
+        import copy
+        pinned = self.config['accounts'][1]
+        value = sample(100, resets=1)
+        value.update(email=pinned['email'], accountId=pinned['accountId'])
+        state, _ = advance({}, value, pinned, now=10, policy=self.config['policy'])
+        value['credits']['balance'] = '800'
+        state, _ = advance(state, value, pinned, now=10, policy=self.config['policy'])
+        save(self.root / 'daybreak.json', state)
+        record = copy.deepcopy(self.record)
+        record.update(episodeId=state['episode']['id'], eventId=state['episode']['events'][-1]['id'],
+                      accountId=pinned['accountId'], identityGeneration=None)
+        return record
 
     def test_cli_records_completion_without_rewriting_delivery_or_reset_state(self):
         before = (self.root / 'main.json').read_bytes()
@@ -94,10 +115,11 @@ class CompletionTests(unittest.TestCase):
     def test_denied_unknown_and_partial_are_never_complete(self):
         import copy
         from status import status
-        for case, expected in [('tool_denial', 'blocked'), ('instruction_refusal', 'blocked'),
-                               ('unknown', 'unknown'), ('partial', 'partial')]:
+        for offset, (case, expected) in enumerate([('tool_denial', 'blocked'), ('instruction_refusal', 'blocked'),
+                                                  ('unknown', 'unknown'), ('partial', 'partial')]):
             with self.subTest(case=case):
                 record = copy.deepcopy(self.record)
+                record['observedAt'] += offset
                 root = record['roots'][0]
                 root.update(status='unknown', workersComplete=False, continuationHeld=False)
                 if case in ('tool_denial', 'instruction_refusal'):
@@ -156,6 +178,160 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(self.produce(newer).returncode, 0)
         self.assertNotEqual(self.produce().returncode, 0)
         self.assertEqual(len(list((self.root / 'pause-completions').glob('*.json'))), 2)
+
+    def test_equal_time_retry_is_idempotent_only_for_current_record(self):
+        import copy
+        from status import status
+        first = self.produce()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        retained = self.retained_bytes()
+        retry = self.produce()
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout), json.loads(first.stdout))
+        self.assertEqual(self.retained_bytes(), retained)
+        conflicting = copy.deepcopy(self.record)
+        conflicting['roots'][0].update(status='unknown', workersComplete=False)
+        result = self.produce(conflicting)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('conflicting_completion_observation_time', result.stderr)
+        self.assertEqual(self.retained_bytes(), retained)
+        self.assertEqual(status(self.config_path, self.root)['episodes']['main']['protectiveStop']['status'], 'stopped')
+
+        conflicting['observedAt'] = 21
+        result = self.produce(conflicting)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['status'], 'unknown')
+        retained = self.retained_bytes()
+        result = self.produce()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('older_completion_observation', result.stderr)
+        self.assertEqual(self.retained_bytes(), retained)
+        self.assertEqual(len(list((self.root / 'pause-completions').glob('*.json'))), 2)
+        self.assertEqual(status(self.config_path, self.root)['episodes']['main']['protectiveStop']['status'], 'unknown')
+
+    def test_equal_time_replay_cannot_restore_superseded_retained_record(self):
+        import copy
+        from pause_completion import digest
+        from status import status
+        self.assertEqual(self.produce().returncode, 0)
+        uncertain = copy.deepcopy(self.record)
+        uncertain['roots'][0].update(status='unknown', workersComplete=False)
+        # Retain the equal-time history that the predecessor producer accepted.
+        fingerprint = digest(uncertain)
+        save(self.root / 'pause-completions' / (fingerprint + '.json'), uncertain)
+        save(self.root / 'pause-completion-main.json', {'schemaVersion': 1, 'sha256': fingerprint})
+        retained = self.retained_bytes()
+        self.assertEqual(status(self.config_path, self.root)['episodes']['main']['protectiveStop']['status'], 'unknown')
+        retry = self.produce(uncertain)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(self.retained_bytes(), retained)
+        result = self.produce()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('conflicting_completion_observation_time', result.stderr)
+        self.assertEqual(self.retained_bytes(), retained)
+        self.assertEqual(status(self.config_path, self.root)['episodes']['main']['protectiveStop']['status'], 'unknown')
+
+    def test_cli_rejects_pre_episode_time_and_accepts_boundary_and_later(self):
+        import copy
+        from status import status
+        for name, original in [('main', self.record), ('daybreak', self.daybreak_record())]:
+            with self.subTest(account=name):
+                state_path = self.root / (name + '.json')
+                state = json.loads(state_path.read_text())
+                event = next(event for event in state['episode']['events'] if event['id'] == original['eventId'])
+                event['deliveries'] = {'foreman': {'status': 'submitted', 'target': self.config['foremanThreadId']}}
+                save(state_path, state)
+                if name == 'daybreak':
+                    save(self.root / ('reset-' + state['episode']['id'] + '.json'), {
+                        'request': {'episodeId': state['episode']['id'], 'accountId': original['accountId'],
+                                    'email': state['episode']['email'], 'idempotencyKey': state['episode']['resetIdempotencyKey'],
+                                    'creditId': 'fixture-credit', 'confirmationReference': 'fixture-human-reply',
+                                    'preparedAt': '2026-10-01T00:00:00Z'},
+                        'status': 'no_credit', 'response': {'code': 'no_credit'}})
+                policy = state_path.read_bytes()
+                record = copy.deepcopy(original)
+                record['observedAt'] = 9
+                retained = self.retained_bytes()
+                result = self.produce(record, account=name)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('completion_before_episode', result.stderr)
+                self.assertEqual(self.retained_bytes(), retained)
+                self.assertFalse((self.root / ('pause-completion-' + name + '.json')).exists())
+                for observed in (10, 20):
+                    record['observedAt'] = observed
+                    result = self.produce(record, account=name)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    completion = status(self.config_path, self.root)['episodes'][name]['protectiveStop']
+                    self.assertEqual(completion['status'], 'stopped')
+                    self.assertEqual(completion['observedAt'], observed)
+                    self.assertEqual(state_path.read_bytes(), policy)
+                    retained = self.retained_bytes()
+                    record['observedAt'] = 9
+                    result = self.produce(record, account=name)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn('completion_before_episode', result.stderr)
+                    self.assertEqual(self.retained_bytes(), retained)
+
+    def test_retained_pre_episode_time_is_unconfirmed_in_status_and_armed_health(self):
+        import copy
+        import os
+        from unittest.mock import patch
+        from activation import configuration_binding
+        from controller import run
+        from pause_completion import digest
+        from status import status
+        records = {'main': self.record, 'daybreak': self.daybreak_record()}
+        self.config['enabled'] = True
+        save(self.config_path, self.config)
+        (self.root / 'legacy.lock').touch(mode=0o600)
+        save(self.root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(self.config),
+                                            'reference': 'fixture-active-approval'})
+        for name, original in records.items():
+            state_path = self.root / (name + '.json')
+            state = json.loads(state_path.read_text())
+            for event in state['episode']['events']:
+                recipients = [('parent', 'parentThreadId')]
+                if event['kind'] == 'foreman_pause_required':
+                    recipients.append(('foreman', 'foremanThreadId'))
+                event['deliveries'] = {recipient: {'status': 'submitted', 'target': self.config[key]}
+                                       for recipient, key in recipients}
+            save(state_path, state)
+            self.assertEqual(self.produce(original, account=name).returncode, 0)
+            record = copy.deepcopy(original)
+            record['observedAt'] = 9
+            fingerprint = digest(record)
+            save(self.root / 'pause-completions' / (fingerprint + '.json'), record)
+            save(self.root / ('pause-completion-' + name + '.json'), {'schemaVersion': 1, 'sha256': fingerprint})
+            completion = status(self.config_path, self.root)['episodes'][name]['protectiveStop']
+            self.assertEqual(completion, {'status': 'unconfirmed', 'reason': 'completion_before_episode'})
+        retained = self.retained_bytes()
+        episodes = {name: json.loads((self.root / (name + '.json')).read_text())['episode'] for name in records}
+        pinned = self.config['accounts'][1]
+        def read(account, **kwargs):
+            value = sample(100, resets=0)
+            if account['name'] == 'daybreak':
+                value.update(email=pinned['email'], accountId=pinned['accountId'])
+            return value
+        with patch('controller.read_account', side_effect=read), \
+             patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
+             patch.dict(os.environ, {}, clear=True), patch('controller.Transport') as transport:
+            bridge = transport.return_value.connection.return_value
+            bridge.for_recipient.return_value = bridge
+            for _ in range(2):
+                health = run(self.config, self.root, once=True)
+                for name in records:
+                    self.assertEqual(health['accounts'][name]['status'], 'healthy')
+                    self.assertEqual(health['accounts'][name]['protectiveStop'],
+                                     {'status': 'unconfirmed', 'reason': 'completion_before_episode'})
+                self.assertEqual(json.loads((self.root / 'health.json').read_text()), health)
+            bridge.send.assert_not_called()
+        for name in records:
+            self.assertEqual(json.loads((self.root / (name + '.json')).read_text())['episode'], episodes[name])
+        self.assertEqual(list(self.root.glob('reset-*.json')), [])
+        after = self.retained_bytes()
+        for path, contents in retained.items():
+            if path.startswith('pause-completion'):
+                self.assertEqual(after[path], contents)
 
     def test_daybreak_uses_pinned_identity_without_main_generation(self):
         import copy

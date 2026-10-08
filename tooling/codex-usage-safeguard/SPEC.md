@@ -127,7 +127,17 @@ An instruction-based refusal is distinguished from an actual tool/reviewer denia
 
 The local producer validates a supplied private record against current private
 configuration and state. It retains each accepted record immutably and updates a
-separate latest-record pointer. Restart may reread records but cannot replay pause
+separate latest-record pointer. For the same episode and event, observation time
+must increase unless the submission has the identical currently selected record
+digest. A conflicting equal-time submission is rejected without changing retained
+records or the pointer. Observation time is compared directly with the active
+episode's `openedAt`: earlier observations are rejected by the producer and remain
+unconfirmed when read from retained records; equal and later times satisfy this
+lower bound. There is no clock tolerance or expiry interval. This comparison does
+not establish ordering after the current pause request; the caller must still
+collect evidence after that request.
+
+Restart may reread records but cannot replay pause
 requests or rewrite transport receipts. The observer and local status consumer
 validate that pointer and retained bytes against the current binding. Missing,
 malformed, stale, superseded, or mismatched records never indicate completed stops.

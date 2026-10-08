@@ -51,7 +51,7 @@ class RuntimeTests(unittest.TestCase):
                 'x-codex-turn-metadata': {'session_id': 'control-fixture', 'turn_id': 'actual-turn'},
                 'openai/toolCallId': 'actual-tool-call'}}}
 
-    def capture_bridge(self, root, readback, *, replace_route=False):
+    def capture_bridge(self, root, readback, *, replace_route=False, readback_text=None):
         script = root / 'native-fixture.py'
         script.write_text('''import json, os, sys, socket
 for line in sys.stdin:
@@ -69,7 +69,8 @@ for line in sys.stdin:
 ''' + ('''        route = os.environ['CODEX_APP_TOOLS_PIPE_PATH']
         os.unlink(route); replacement = socket.socket(socket.AF_UNIX); replacement.bind(route)
 ''' if replace_route else '') + '''
-        result = {'content': [{'type': 'text', 'text': ''' + repr(json.dumps(readback)) + '''}]}
+        result = {'content': [{'type': 'text', 'text': ''' + repr(
+            json.dumps(readback) if readback_text is None else readback_text) + '''}]}
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
 ''')
         return script
@@ -249,6 +250,29 @@ for line in sys.stdin:
             self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
             self.assertEqual((Path(name) / 'creation-receipt.json').read_bytes(), receipt)
             self.assertEqual(sorted(p.name for p in Path(name).iterdir()), ['creation-receipt.json'])
+
+    def test_capture_nested_native_result_refuses_without_losing_next_ping(self):
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                private_marker = 'PRIVATE-MARKER-FIXTURE'
+                nested = '[' * 20000 + json.dumps(private_marker) + ']' * 20000
+                bridge = self.capture_bridge(root, None, readback_text='{"thread":' + nested + '}')
+                replies = self.capture_process(root, [self.capture_request(), {'id': 8, 'method': 'ping'}],
+                    bridge_script=bridge, environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)},
+                    output_limit=512)
+                self.assertEqual(len(replies), 2)
+                self.assertEqual(replies[0]['id'], 7)
+                self.assertTrue(replies[0]['result']['isError'])
+                report = json.loads(replies[0]['result']['content'][0]['text'])
+                self.assertIn(report, [
+                    {'status': 'unsupported_capture', 'reason': 'capture_evidence_unavailable'},
+                    {'status': 'unsupported_capture', 'reason': 'exact_local_native_readback_required'}])
+                self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+                self.assertNotIn('candidateJson', json.dumps(replies))
+                self.assertNotIn(private_marker, json.dumps(replies))
 
     def test_capture_never_uses_rpc_ids_transcripts_or_shell_identity_as_missing_provenance(self):
         valid = self.capture_request()['params']['_meta']

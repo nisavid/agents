@@ -19,10 +19,11 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`,
 
 ### Domain docs
 
-This repository uses the single-context layout: a root `CONTEXT.md` and
+This repository uses the single-context layout: a root `GLOSSARY.md` and
 system-wide ADRs under `docs/adr/`, created when domain modeling first needs
 them. Neither exists yet. The Hindsight glossary lives at
-`tooling/hindsight/lib/hindsight_memory_control_plane/CONTEXT.md`. See
+`tooling/hindsight/lib/hindsight_memory_control_plane/CONTEXT.md`, which serves
+as that context's domain glossary. See
 `docs/agents/domain.md`.
 
 ## Ownership boundary

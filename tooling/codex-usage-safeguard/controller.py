@@ -127,7 +127,8 @@ def make_prompt(event, episode, account, state_path, recipient):
             "is unknown, describe it as unknown and investigate once. Preserve independent holds.")
 
 
-def dispatch(state, account, config, bridge, path, *, delivery_guard=None, delivery_lock=None):
+def dispatch(state, account, config, bridge, path, *, current_observation=None,
+             fallback_event_ids=(), delivery_guard=None, delivery_lock=None):
     episode = state.get('episode')
     if not episode or not episode.get('active'):
         return
@@ -178,7 +179,10 @@ def dispatch(state, account, config, bridge, path, *, delivery_guard=None, deliv
                         failures.append('delivery_outcome_requires_reconciliation')
                     continue
             with delivery_lock() if delivery_lock is not None else nullcontext():
-                if not exhausted(state.get('lastSample', {})):
+                fallback_pause = (event['id'] in fallback_event_ids and
+                                  event['kind'] == 'foreman_pause_required' and
+                                  event.get('reason') == 'observation_failed_during_confirmed_exhaustion')
+                if not exhausted(current_observation or {}) and not fallback_pause:
                     failures.append('current_zero_required_before_delivery')
                     continue
                 if delivery_guard is not None and not delivery_guard():
@@ -327,6 +331,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                 if bridge is None:
                                     raise RuntimeError('native_transport_unavailable')
                                 dispatch(state, account, config, bridge, path,
+                                         current_observation=reading,
                                          delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',
                                          delivery_lock=lambda: decision_lock(state_dir))
                             health['accounts'][name] = {'status': 'healthy', 'observationStatus': 'healthy',
@@ -357,8 +362,9 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                         save(path, retained)
                                         bridge = transport.connection()
                                         dispatch(retained, account, config, bridge, path,
+                                                 fallback_event_ids={e['id'] for e in new_events},
                                                  delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',
-                                         delivery_lock=lambda: decision_lock(state_dir))
+                                                 delivery_lock=lambda: decision_lock(state_dir))
                                 except Exception:
                                     health['accounts'][name]['fallbackDelivery'] = 'unconfirmed'
                 save(state_dir / 'health.json', health)

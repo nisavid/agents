@@ -152,6 +152,15 @@ repair the service is not approval to transfer owner authorization or change the
 notification parent. Resolve those decisions separately, preserve the ledger and
 both locks, then verify the exact owner/Foreman/parent route before restarting.
 
+Ordinary new sends require a successful exhausted core-window reading from the
+current observer poll. Retained `lastSample`, activation preflight, and earlier
+successful polls cannot supply that evidence after a failed read. During an
+existing reset-confirmation wait, a separately approved observation-failure
+fallback can send the newly generated pause and its parent status notification,
+including the existing confirmation coalescing. That exception does not admit
+separate sends for other pending events. Submitted and uncertain receipts retain
+their no-replay rules.
+
 A Daybreak no-reset pause is conditional on Daybreak still being the default
 main account. Dispatch checks that identity before each unsent recipient. A
 verified mismatch durably invalidates the stale event while preserving existing
@@ -190,8 +199,10 @@ Activation writes maintenance first, then performs fresh read-only account and
 exact-destination preflight, then binds the approved activation to this private
 configuration. A failed check leaves maintenance intact. Inspect existing
 pending episodes and uncertain receipts before activation; do not rewind or
-replay them. Fresh restored or unknown core allowance blocks new sends from an
-old pending episode while preserving its receipts and any separate hold. Configuration edits require a new activation decision/preflight.
+replay them. A current observer reading with restored or unknown core allowance
+blocks new sends from an old pending episode while preserving its receipts and
+any separate hold. A successful preflight does not replace the next observer
+poll's evidence. Configuration edits require a new activation decision/preflight.
 A route renewal alone never clears maintenance. This helper does not release
 Foreman holds or redeem quota resets.
 

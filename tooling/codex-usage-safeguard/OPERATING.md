@@ -104,8 +104,10 @@ independently verified routes; the old shared accepted record is a read-only
 fallback. The companion registry coalesces duplicate generations and retains at
 most 16. Each destination checks liveness every 60 seconds, tries at most two
 candidates per poll and backs off locally up to five minutes. RPC timeout is five
-seconds; quota reads begin concurrently. These are best-effort safeguards, not a
-hard spending cap or an app-boot guarantee.
+seconds; quota reads begin concurrently. Observation-failure fallback uses the
+connections checked in that poll; unavailable recipients can be checked again
+in a later poll. These are best-effort safeguards, not a hard spending cap or an
+app-boot guarantee.
 
 The controller can send through a verified Foreman connection even when the
 parent is unreadable. An unavailable recipient remains unsent without an

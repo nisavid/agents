@@ -83,8 +83,15 @@ The helper persists maintenance before preflight, so a failed check stays held.
 Activation never changes credentials, caller identity, destinations or ledgers.
 The controller serializes each intent/send/receipt with maintenance decisions;
 an older activation preflight cannot overwrite a newer decision. It rechecks
-maintenance and current exact-zero evidence before every new intent. Restored
-allowance blocks unsent old events without releasing holds or changing receipts.
+maintenance before every new intent. Ordinary new delivery attempts also require
+a successful reading from the current observer poll with a finite exhausted core
+window. Retained `lastSample` and earlier preflight readings do not qualify.
+During an existing reset-confirmation wait, the separately approved
+observation-failure fallback admits only its newly generated pause and that
+pause's parent status notification, including the existing confirmation
+coalescing. It cannot admit separate sends for unrelated pending events.
+A current observer reading with restored or unknown allowance blocks unsent old
+events without releasing holds or changing receipts.
 A send already in flight may finish before the maintenance command returns; stopping work remains the Foreman's job.
 
 

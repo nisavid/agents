@@ -100,6 +100,190 @@ class RuntimeTests(unittest.TestCase):
         save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config), 'reference': 'fixture-approval'})
         return config
 
+    def fixture_poll(self, root, config, read, bridge, *, now=30, observe_only=False):
+        with patch('controller.read_account', side_effect=read), \
+             patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
+             patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True), \
+             patch('controller.time.time', return_value=now):
+            transport.return_value.connection.return_value = bridge
+            return run(config, root, once=True, observe_only=observe_only)
+
+    def fixture_restored_preflight(self, root, config):
+        pinned = config['accounts'][1]
+        def restored(account, **kwargs):
+            value = sample(50)
+            if account['name'] == 'daybreak':
+                value.update({k: pinned[k] for k in ('email', 'accountId')})
+            return value
+        with patch('preflight.read_account', side_effect=restored), \
+             patch('preflight.socket_identity'), patch('preflight.NativeBridge') as native, \
+             patch.dict(os.environ, {'CODEX_APP_TOOLS_PIPE_PATH': '/fixture/route.sock'}, clear=True):
+            native.return_value.call.side_effect = lambda tool, arguments: {
+                'thread': {'id': arguments['threadId'], 'title': 'Codex Foreman'}}
+            return preflight(config, root, check_live=True)
+
+    def test_failed_read_fallback_does_not_send_unrelated_pending_confirmation(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+            config['policy'].update(pauseWhenUnmetered=True,
+                fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+            save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config), 'reference': 'fixture-approval'})
+            unknown = sample(100); unknown.update(email=pinned['email'], accountId=pinned['accountId'])
+            unknown['rate_limit_reset_credits'] = {}
+            state, _ = advance({}, unknown, pinned, now=10, policy=config['policy'])
+            zero = sample(100); zero.update(email=pinned['email'], accountId=pinned['accountId'])
+            state, _ = advance(state, zero, pinned, now=20, policy=config['policy'])
+            episode = copy.deepcopy(state['episode'])
+            save(root / 'daybreak.json', state)
+            bridge = ReceiptTransport(root / 'daybreak.json')
+            def read(account, **kwargs):
+                if account['name'] == 'daybreak': raise RuntimeError('fixture_quota_read_failed')
+                return sample(0)
+            with patch('controller.read_account', side_effect=read), \
+                 patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
+                 patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True), \
+                 patch('controller.time.time', return_value=30):
+                transport.return_value.connection.return_value = bridge
+                run(config, root, once=True)
+            self.assertEqual([target for target, _ in bridge.received],
+                             [config['foremanThreadId'], config['parentThreadId']])
+            retained = json.loads((root / 'daybreak.json').read_text())
+            unknown_event, confirmation, pause = retained['episode']['events']
+            self.assertEqual(pause['reason'], 'observation_failed_during_confirmed_exhaustion')
+            self.assertEqual(unknown_event['deliveries']['parent']['coalescedInto'], pause['id'])
+            self.assertFalse(confirmation.get('deliveries'))
+            self.assertEqual(retained['lastSample'], zero)
+            for key in ('id', 'resetIdempotencyKey', 'accountId', 'email', 'resetCount'):
+                self.assertEqual(retained['episode'][key], episode[key])
+
+    def test_failed_poll_without_fallback_preserves_backlog_after_restored_preflight(self):
+        for check_preflight in (False, True):
+            with self.subTest(check_preflight=check_preflight), tempfile.TemporaryDirectory() as name:
+                root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+                zero = sample(100); zero.update({k: pinned[k] for k in ('email', 'accountId')})
+                state, _ = advance({}, zero, pinned, now=10, policy=config['policy'])
+                save(root / 'daybreak.json', state)
+                before = (root / 'daybreak.json').read_bytes()
+                if check_preflight:
+                    report = self.fixture_restored_preflight(root, config)
+                    self.assertEqual(report['liveChecks'], 'both_accounts_and_exact_destinations_verified')
+                    self.assertEqual((root / 'daybreak.json').read_bytes(), before)
+                def failed(account, **kwargs):
+                    if account['name'] == 'daybreak': raise RuntimeError('fixture_quota_read_failed')
+                    return sample(0)
+                bridge = ReceiptTransport(root / 'daybreak.json')
+                for _ in range(2):
+                    health = self.fixture_poll(root, config, failed, bridge)
+                    self.assertEqual(health['accounts']['daybreak']['observationStatus'], 'unavailable')
+                    self.assertEqual((root / 'daybreak.json').read_bytes(), before)
+                self.assertEqual(bridge.received, [])
+
+    def test_restored_or_unknown_current_poll_blocks_pending_pause_and_confirmation(self):
+        for used, budget in ((50, 'allowance_restored_pending_rearm'), (None, 'quota_unknown_wait_blocked')):
+            with self.subTest(used=used), tempfile.TemporaryDirectory() as name:
+                root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+                zero = sample(100); zero.update({k: pinned[k] for k in ('email', 'accountId')})
+                state, _ = advance({}, zero, pinned, now=10, policy=config['policy'])
+                spent = copy.deepcopy(zero); spent['credits']['balance'] = '790'
+                state, _ = advance(state, spent, pinned, now=20, policy=config['policy'])
+                episode = copy.deepcopy(state['episode'])
+                self.assertEqual([event['kind'] for event in episode['events']],
+                                 ['reset_confirmation_required', 'foreman_pause_required'])
+                save(root / 'daybreak.json', state)
+                current = sample(used); current.update({k: pinned[k] for k in ('email', 'accountId')})
+                def read(account, **kwargs):
+                    return current if account['name'] == 'daybreak' else sample(0)
+                bridge = ReceiptTransport(root / 'daybreak.json')
+                health = self.fixture_poll(root, config, read, bridge)
+                self.assertEqual(health['accounts']['daybreak']['observationStatus'], 'healthy')
+                self.assertIn('current_zero_required_before_delivery', health['accounts']['daybreak']['reason'])
+                self.assertEqual(bridge.received, [])
+                retained = json.loads((root / 'daybreak.json').read_text())
+                self.assertEqual(retained['lastSample'], current)
+                self.assertEqual(retained['episode']['budgetStatus'], budget)
+                self.assertEqual(retained['episode']['events'], episode['events'])
+                self.assertTrue(retained['episode']['active'])
+                for key in ('id', 'resetIdempotencyKey', 'accountId', 'email', 'resetCount'):
+                    self.assertEqual(retained['episode'][key], episode[key])
+
+    def test_failed_poll_fallback_keeps_recipient_outages_independent_without_backlog_sends(self):
+        for unavailable in ('foreman', 'parent'):
+            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory() as name:
+                root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+                config['policy'].update(pauseWhenUnmetered=True,
+                    fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+                save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config), 'reference': 'fixture-approval'})
+                unknown = sample(100); unknown.update({k: pinned[k] for k in ('email', 'accountId')})
+                unknown['rate_limit_reset_credits'] = {}
+                state, _ = advance({}, unknown, pinned, now=10, policy=config['policy'])
+                zero = sample(100); zero.update({k: pinned[k] for k in ('email', 'accountId')})
+                state, _ = advance(state, zero, pinned, now=20, policy=config['policy'])
+                save(root / 'daybreak.json', state)
+                bridge = ReceiptTransport(root / 'daybreak.json')
+                bridge.for_recipient = lambda key: None if key == unavailable else bridge
+                def failed(account, **kwargs):
+                    if account['name'] == 'daybreak': raise RuntimeError('fixture_quota_read_failed')
+                    return sample(0)
+                before = (root / 'daybreak.json').read_bytes()
+                report = self.fixture_restored_preflight(root, config)
+                self.assertEqual(report['liveChecks'], 'both_accounts_and_exact_destinations_verified')
+                self.assertEqual((root / 'daybreak.json').read_bytes(), before)
+                for _ in range(2):
+                    self.fixture_poll(root, config, failed, bridge)
+                available = 'parent' if unavailable == 'foreman' else 'foreman'
+                self.assertEqual([target for target, _ in bridge.received], [config[available + 'ThreadId']])
+                retained = json.loads((root / 'daybreak.json').read_text())
+                unknown_event, confirmation, pause = retained['episode']['events']
+                self.assertEqual(pause['reason'], 'observation_failed_during_confirmed_exhaustion')
+                self.assertEqual(set(pause['deliveries']), {available})
+                self.assertEqual(pause['deliveries'][available]['status'], 'submitted')
+                self.assertFalse(confirmation.get('deliveries'))
+                if available == 'parent':
+                    self.assertEqual(unknown_event['deliveries']['parent']['coalescedInto'], pause['id'])
+                else:
+                    self.assertFalse(unknown_event.get('deliveries'))
+                self.assertEqual(retained['lastSample'], zero)
+
+    def test_failed_poll_fallback_preserves_main_receipts_and_generation_across_restart(self):
+        for receipt_status in ('submitted', 'attempting', 'outcome_unknown'):
+            with self.subTest(receipt_status=receipt_status), tempfile.TemporaryDirectory() as name:
+                root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+                config['policy'].update(pauseWhenUnmetered=True,
+                    fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+                save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config), 'reference': 'fixture-approval'})
+                def exhausted_main(account, **kwargs):
+                    if account['name'] == 'main': return sample(100)
+                    value = sample(0); value.update({k: pinned[k] for k in ('email', 'accountId')})
+                    return value
+                bridge = ReceiptTransport(root / 'main.json')
+                self.fixture_poll(root, config, exhausted_main, bridge, now=10, observe_only=True)
+                state = json.loads((root / 'main.json').read_text())
+                receipt = {'status': receipt_status, 'target': config['parentThreadId'], 'at': 11}
+                state['episode']['events'][0]['deliveries'] = {'parent': receipt}
+                save(root / 'main.json', state)
+                episode = copy.deepcopy(state['episode'])
+                generation = state['identityGeneration']
+                selection = (root / 'main-selection.json').read_bytes()
+                def failed_main(account, **kwargs):
+                    if account['name'] == 'main': raise RuntimeError('fixture_quota_read_failed')
+                    return exhausted_main(account, **kwargs)
+                for _ in range(2):
+                    self.fixture_poll(root, config, failed_main, bridge, now=20)
+                self.fixture_poll(root, config, exhausted_main, bridge, now=30)
+                self.assertEqual([target for target, _ in bridge.received],
+                                 [config['foremanThreadId'], config['parentThreadId']])
+                retained = json.loads((root / 'main.json').read_text())
+                confirmation, pause = retained['episode']['events']
+                self.assertEqual(confirmation['deliveries']['parent'], receipt)
+                self.assertEqual(pause['reason'], 'observation_failed_during_confirmed_exhaustion')
+                self.assertEqual({key: delivery['status'] for key, delivery in pause['deliveries'].items()},
+                                 {'foreman': 'submitted', 'parent': 'submitted'})
+                self.assertEqual(retained['lastSample'], sample(100))
+                self.assertEqual(retained['identityGeneration'], generation)
+                self.assertEqual((root / 'main-selection.json').read_bytes(), selection)
+                for key in ('id', 'resetIdempotencyKey', 'accountId', 'email', 'resetCount'):
+                    self.assertEqual(retained['episode'][key], episode[key])
+
     def test_companion_has_no_action_tools_and_never_fabricates_a_route(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name); config = self.config(root)
@@ -162,10 +346,10 @@ class RuntimeTests(unittest.TestCase):
             path = Path(name) / 'main.json'
             state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
             failing = ReceiptTransport(path, fail='foreman')
-            with self.assertRaises(RuntimeError): dispatch(state, ACCOUNT, CONFIG, failing, path)
+            with self.assertRaises(RuntimeError): dispatch(state, ACCOUNT, CONFIG, failing, path, current_observation=sample(100))
             replacement = ReceiptTransport(path)
             with self.assertRaises(RuntimeError):
-                dispatch(json.loads(path.read_text()), ACCOUNT, CONFIG, replacement, path)
+                dispatch(json.loads(path.read_text()), ACCOUNT, CONFIG, replacement, path, current_observation=sample(100))
             self.assertEqual(replacement.received, [])
 
     def test_total_reset_inventory_is_not_applicability_evidence(self):
@@ -188,10 +372,10 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / 'main.json'; transport = ReceiptTransport(path)
             state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
-            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             state, events = advance(state, sample(100, resets=1), ACCOUNT, now=20)
             self.assertEqual([e['kind'] for e in events], ['reset_confirmation_required'])
-            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([target for target, _ in transport.received], ['foreman', 'parent', 'parent'])
 
     def test_new_pause_does_not_overwrite_uncertain_confirmation_receipt(self):
@@ -200,10 +384,10 @@ class RuntimeTests(unittest.TestCase):
             policy = {'usdPerCredit': '0.04', 'pauseAtUsd': '8'}
             state, _ = advance({}, sample(100), ACCOUNT, now=10, policy=policy)
             with self.assertRaises(RuntimeError):
-                dispatch(state, ACCOUNT, CONFIG, ReceiptTransport(path, fail='parent'), path)
+                dispatch(state, ACCOUNT, CONFIG, ReceiptTransport(path, fail='parent'), path, current_observation=sample(100))
             old_receipt = copy.deepcopy(state['episode']['events'][0]['deliveries']['parent'])
             state, _ = advance(state, sample(100, balance='800'), ACCOUNT, now=20, policy=policy)
-            with self.assertRaises(RuntimeError): dispatch(state, ACCOUNT, CONFIG, ReceiptTransport(path), path)
+            with self.assertRaises(RuntimeError): dispatch(state, ACCOUNT, CONFIG, ReceiptTransport(path), path, current_observation=sample(100))
             self.assertEqual(state['episode']['events'][0]['deliveries']['parent'], old_receipt)
 
     def test_daybreak_no_reset_outage_cannot_start_unapproved_wait(self):

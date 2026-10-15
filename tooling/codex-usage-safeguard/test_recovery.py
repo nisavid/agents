@@ -28,7 +28,7 @@ class RecipientRecoveryTests(TransportFixture):
         state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
         path = self.root / 'main.json'
         with self.assertRaisesRegex(RuntimeError, 'parent_destination_unavailable'):
-            dispatch(state, ACCOUNT, CONFIG, router, path)
+            dispatch(state, ACCOUNT, CONFIG, router, path, current_observation=sample(100))
         receipts = json.loads(path.read_text())['episode']['events'][0]['deliveries']
         self.assertEqual(set(receipts), {'foreman'})
         self.assertEqual(receipts['foreman']['status'], 'submitted')
@@ -37,7 +37,7 @@ class RecipientRecoveryTests(TransportFixture):
         self.assertTrue(manager.health['recipients']['foreman']['healthy'])
         self.registry[pipe] = 'valid'; self.now += 301
         router = manager.connection()
-        dispatch(json.loads(path.read_text()), ACCOUNT, CONFIG, router, path)
+        dispatch(json.loads(path.read_text()), ACCOUNT, CONFIG, router, path, current_observation=sample(100))
         self.assertEqual([call[2] for call in self.calls if call[1] == 'send'], ['fixture-foreman', 'fixture-parent'])
         self.assertTrue(manager.health['healthy'])
         manager.close()
@@ -48,7 +48,7 @@ class RecipientRecoveryTests(TransportFixture):
         state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
         path = self.root / 'main.json'
         with self.assertRaisesRegex(RuntimeError, 'foreman_destination_unavailable'):
-            dispatch(state, ACCOUNT, CONFIG, router, path)
+            dispatch(state, ACCOUNT, CONFIG, router, path, current_observation=sample(100))
         receipts = json.loads(path.read_text())['episode']['events'][0]['deliveries']
         self.assertEqual(set(receipts), {'parent'})
         self.assertEqual([call[2] for call in self.calls if call[1] == 'send'], ['fixture-parent'])
@@ -135,6 +135,28 @@ class MaintenanceTests(unittest.TestCase):
                 transport.assert_not_called()
             self.assertFalse(json.loads((root / 'main.json').read_text())['episode']['events'][0].get('deliveries'))
 
+    def test_maintenance_restart_keeps_failed_read_fallback_inhibited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); config = self.config(root); pinned = config['accounts'][1]
+            config['policy'].update(pauseWhenUnmetered=True,
+                fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+            zero = sample(100); zero.update({k: pinned[k] for k in ('email', 'accountId')})
+            state, _ = advance({}, zero, pinned, now=10, policy=config['policy'])
+            save(root / 'daybreak.json', state)
+            before = (root / 'daybreak.json').read_bytes()
+            def failed(account, **kwargs):
+                if account['name'] == 'daybreak': raise RuntimeError('fixture_quota_read_failed')
+                return sample(0)
+            with patch('controller.read_account', side_effect=failed), \
+                 patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
+                 patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True):
+                for _ in range(2):
+                    health = run(config, root, once=True)
+                    self.assertEqual(health['delivery']['mode'], 'maintenance')
+                    self.assertEqual(health['accounts']['daybreak']['observationStatus'], 'unavailable')
+                    self.assertEqual((root / 'daybreak.json').read_bytes(), before)
+                transport.assert_not_called()
+
     def test_activation_and_persistent_hold_preserve_ledger_and_require_live_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); config = self.config(root)
@@ -170,7 +192,7 @@ class MaintenanceTests(unittest.TestCase):
             state,_=advance({}, sample(100,resets=0), ACCOUNT, now=10)
             answers=iter([True,False])
             with self.assertRaisesRegex(RuntimeError,'maintenance_delivery_inhibited'):
-                dispatch(state,ACCOUNT,{'foremanThreadId':'foreman','parentThreadId':'parent'},bridge,path,
+                dispatch(state,ACCOUNT,{'foremanThreadId':'foreman','parentThreadId':'parent'},bridge,path,current_observation=sample(100),
                          delivery_guard=lambda:next(answers))
             self.assertEqual([t for t,_ in bridge.received],['foreman'])
             self.assertEqual(set(state['episode']['events'][0]['deliveries']), {'foreman'})
@@ -199,7 +221,7 @@ class MaintenanceTests(unittest.TestCase):
             key=state['episode']['resetIdempotencyKey']
             state,_=advance(state,sample(50,resets=0),ACCOUNT,now=20)
             with self.assertRaisesRegex(RuntimeError,'current_zero_required_before_delivery'):
-                dispatch(state,ACCOUNT,{'foremanThreadId':'foreman','parentThreadId':'parent'},bridge,path)
+                dispatch(state,ACCOUNT,{'foremanThreadId':'foreman','parentThreadId':'parent'},bridge,path,current_observation=sample(50,resets=0))
             self.assertEqual(bridge.received,[])
             self.assertFalse(state['episode']['events'][0].get('deliveries'))
             self.assertEqual(state['episode']['resetIdempotencyKey'],key)
@@ -223,7 +245,7 @@ class MaintenanceTests(unittest.TestCase):
             state,_=advance({},sample(100),ACCOUNT,now=10)
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future=pool.submit(hold)
-                dispatch(state,ACCOUNT,config,bridge,path,
+                dispatch(state,ACCOUNT,config,bridge,path,current_observation=sample(100),
                          delivery_guard=lambda:delivery_status(config,root)['mode']=='active',
                          delivery_lock=lambda:decision_lock(root))
                 future.result(timeout=3)

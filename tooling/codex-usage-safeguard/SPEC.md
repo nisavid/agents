@@ -61,6 +61,8 @@ caller synthesis, credential refresh, permission change, or model polling.
 
 Each destination independently checks liveness every 60 seconds and tries at
 most two candidate routes per poll, with retry backoff capped at five minutes.
+Observation-failure fallback reuses that poll's verified recipient connections;
+it does not begin another round of route checks.
 Health separates quota observation, delivery mode and destination availability.
 An outage retains one incident until both destinations recover. A desktop
 notice is attempted initially and at most hourly thereafter, including after

@@ -20,6 +20,65 @@ from test_transport import CONFIG, TransportFixture
 
 
 class RecipientRecoveryTests(TransportFixture):
+    def test_slow_failed_poll_keeps_route_budget_and_recovers_without_replay(self):
+        config = MaintenanceTests().config(self.root)
+        config.update(copy.deepcopy(CONFIG))
+        config['policy'].update(pauseWhenUnmetered=True,
+            fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+        pinned = config['accounts'][1]
+        zero = sample(100); zero.update({k: pinned[k] for k in ('email', 'accountId')})
+        state, _ = advance({}, zero, pinned, now=10, policy=config['policy'])
+        save(self.root / 'daybreak.json', state)
+        save(self.root / 'activation.json', {'mode': 'active',
+            'binding': configuration_binding(config), 'reference': 'fixture-approval'})
+        routes = []
+        for index in range(4):
+            self.now += 1
+            route = self.route(f'route-{index}.sock', {'fixture-parent': 'deny'})
+            self.publish(route, config); routes.append(route)
+        checked = threading.Event()
+        def notice(message):
+            self.alerts.append(message); checked.set()
+        manager = self.manager(config, notifier=notice)
+        polls = []
+        def read(account, **kwargs):
+            if account['name'] == 'main': return sample(0)
+            if polls: return zero
+            if not checked.wait(2): raise AssertionError('fixture route checks did not complete')
+            self.now += 6  # The initial five-second transport retry delay has elapsed.
+            raise RuntimeError('fixture_quota_read_failed')
+        class PollsComplete(Exception):
+            pass
+        def next_poll(_):
+            polls.append({'calls': list(self.calls),
+                          'state': json.loads((self.root / 'daybreak.json').read_text())})
+            if len(polls) == 3: raise PollsComplete
+            self.registry[routes[1]] = 'valid'
+            self.now += 1
+        # Keep the production controller and transport; only account/IPC, time,
+        # desktop notification, and ambient identity boundaries are fixtures.
+        with patch('controller.read_account', side_effect=read), \
+             patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
+             patch('controller.Transport', new=lambda *args: manager), \
+             patch('controller.time.sleep', side_effect=next_poll), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(PollsComplete): run(config, self.root)
+        first = polls[0]
+        self.assertEqual([call[0] for call in first['calls']
+                          if call[1:] == ('read_thread', 'fixture-parent')], [routes[3], routes[2]])
+        self.assertEqual([call[2] for call in first['calls'] if call[1] == 'send'], ['fixture-foreman'])
+        confirmation, pause = first['state']['episode']['events']
+        self.assertFalse(confirmation.get('deliveries'))
+        self.assertEqual(pause['reason'], 'observation_failed_during_confirmed_exhaustion')
+        self.assertEqual(set(pause['deliveries']), {'foreman'})
+        self.assertEqual([call[0] for call in polls[1]['calls'][len(first['calls']):]
+                          if call[1:] == ('read_thread', 'fixture-parent')], [routes[1]])
+        self.assertEqual([call[2] for call in self.calls if call[1] == 'send'],
+                         ['fixture-foreman', 'fixture-parent'])
+        final_confirmation, final_pause = polls[-1]['state']['episode']['events']
+        self.assertEqual(final_pause['deliveries']['foreman'], pause['deliveries']['foreman'])
+        self.assertEqual(final_confirmation['deliveries']['parent']['coalescedInto'], final_pause['id'])
+        self.assertEqual(polls[1]['state']['episode']['events'], polls[2]['state']['episode']['events'])
+
     def test_parent_outage_cannot_block_pause_and_recovery_does_not_repeat_foreman(self):
         pipe = self.route('app.sock', {'fixture-parent': NativeBridgeError('native_tool_rejected', stage='read_thread')})
         self.publish(pipe); manager = self.manager(); router = manager.connection()

@@ -360,7 +360,10 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                     retained, new_events = observation_failed(retained, config['policy'])
                                     if new_events:
                                         save(path, retained)
-                                        bridge = transport.connection()
+                                        # Reuse this poll's recipient checks so a slow
+                                        # quota failure cannot reset its route budget.
+                                        if bridge is None:
+                                            raise RuntimeError('native_transport_unavailable')
                                         dispatch(retained, account, config, bridge, path,
                                                  fallback_event_ids={e['id'] for e in new_events},
                                                  delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',

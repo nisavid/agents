@@ -23,6 +23,379 @@ from test_controller import CONFIG, ReceiptTransport
 
 
 class RuntimeTests(unittest.TestCase):
+    def capture_process(self, root, requests, *, receipt=None, receipt_bytes=None,
+                        environment=None, bridge_script=None, output_limit=None):
+        receipt_path = root / 'creation-receipt.json'
+        if receipt_bytes is None:
+            save(receipt_path, receipt if receipt is not None else {'threadId': 'control-fixture', 'hostId': 'local'})
+        else:
+            receipt_path.write_bytes(receipt_bytes); receipt_path.chmod(0o600)
+        command = [sys.executable, '-B', str(Path(__file__).with_name('companion.py')),
+                   '--capture-receipt', str(receipt_path), '--node-binary', sys.executable,
+                   '--native-bridge-script', str(bridge_script or root / 'unused-bridge.py')]
+        env = {key: value for key, value in os.environ.items() if not key.startswith('CODEX_')}
+        env.update(environment or {})
+        result = subprocess.run(command, input='\n'.join(r if isinstance(r, str) else json.dumps(r)
+                                for r in requests) + '\n',
+                                capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        if output_limit is not None:
+            self.assertLess(len(result.stdout.encode('utf-8')), output_limit)
+            self.assertEqual(result.stderr, '')
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def capture_request(self, *, metadata=None, arguments=None):
+        return {'id': 7, 'method': 'tools/call', 'params': {
+            'name': 'capture_native_context', 'arguments': arguments or {}, '_meta': metadata or {
+                'threadId': 'control-fixture',
+                'x-codex-turn-metadata': {'session_id': 'control-fixture', 'turn_id': 'actual-turn'},
+                'openai/toolCallId': 'actual-tool-call'}}}
+
+    def capture_bridge(self, root, readback, *, replace_route=False, readback_text=None):
+        script = root / 'native-fixture.py'
+        script.write_text('''import json, os, sys, socket
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request: continue
+    if request['method'] == 'initialize': result = {}
+    else:
+        params = request['params']
+        assert request['method'] == 'tools/call' and params['name'] == 'read_thread'
+        assert params['arguments'] == {'threadId': 'control-fixture', 'hostId': 'local',
+            'turnLimit': 1, 'includeOutputs': False, 'maxOutputCharsPerItem': 1}
+        assert params['_meta']['openai/threadId'] == 'control-fixture'
+        assert params['_meta']['openai/turnId'] == 'actual-turn'
+        assert os.environ['CODEX_APP_TOOLS_CALLER_HOST_ID'] == 'local'
+''' + ('''        route = os.environ['CODEX_APP_TOOLS_PIPE_PATH']
+        os.unlink(route); replacement = socket.socket(socket.AF_UNIX); replacement.bind(route)
+''' if replace_route else '') + '''
+        result = {'content': [{'type': 'text', 'text': ''' + repr(
+            json.dumps(readback) if readback_text is None else readback_text) + '''}]}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+''')
+        return script
+
+    def test_capture_returns_genuine_metadata_and_exact_local_readback_without_adoption(self):
+        import hashlib
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                bridge = self.capture_bridge(root, {'thread': {
+                    'id': 'control-fixture', 'kind': 'codex', 'hostId': 'local'}})
+                save(root / 'config.json', {'nativeContext': {'threadId': 'rejected-old-owner'}})
+                save(root / 'activation.json', {'mode': 'maintenance'})
+                save(root / 'main.json', {'episode': {'deliveries': {'parent': {'status': 'outcome_unknown'}}}})
+                before = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+                replies = self.capture_process(root, [self.capture_request()], bridge_script=bridge,
+                    environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route),
+                                 'CODEX_APP_TOOLS_CALLER_HOST_ID': 'local'})
+                report = json.loads(replies[0]['result']['content'][0]['text'])
+                self.assertEqual(report['status'], 'captured_candidate')
+                candidate = json.loads(report['candidateJson'])
+                self.assertEqual(candidate['nativeContext'], {
+                    'threadId': 'control-fixture', 'turnId': 'actual-turn', 'host': 'local'})
+                self.assertEqual(candidate['evidence']['runtimeToolCallId'], 'actual-tool-call')
+                self.assertEqual(candidate['evidence']['hostProvenance'], 'explicit_runtime_host')
+                self.assertEqual(candidate['evidence']['nativeReadback'], {
+                    'threadId': 'control-fixture', 'kind': 'codex', 'hostId': 'local'})
+                self.assertEqual(hashlib.sha256(report['candidateJson'].encode('utf-8')).hexdigest(),
+                                 report['sha256'])
+                self.assertFalse(replies[0]['result']['isError'])
+                self.assertEqual({p.name: p.read_bytes() for p in root.iterdir() if p.is_file()
+                                  and p.name != 'creation-receipt.json'}, before)
+                self.assertEqual(sorted(p.name for p in root.iterdir()),
+                    ['activation.json', 'config.json', 'creation-receipt.json', 'main.json',
+                     'native-fixture.py', 'native.sock'])
+
+    def test_capture_accepts_source_supported_local_default_only_with_all_independent_checks(self):
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                bridge = self.capture_bridge(root, {'thread': {
+                    'id': 'control-fixture', 'kind': 'codex', 'hostId': 'local'}})
+                reports = []
+                for account in ('first-fixture-account', 'changed-fixture-account'):
+                    replies = self.capture_process(root, [self.capture_request()], bridge_script=bridge,
+                        environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route),
+                                     'CODEX_ACCOUNT_ID': account})
+                    reports.append(json.loads(replies[0]['result']['content'][0]['text']))
+                self.assertEqual(reports[0]['status'], 'captured_candidate')
+                self.assertEqual(json.loads(reports[0]['candidateJson'])['evidence']['hostProvenance'],
+                                 'constrained_local_protocol_default')
+                self.assertEqual(reports[0], reports[1])
+
+                bridge = self.capture_bridge(root, {'thread': {
+                    'id': 'control-fixture', 'kind': 'chatgpt', 'hostId': 'local'}})
+                reply = self.capture_process(root, [self.capture_request()], bridge_script=bridge,
+                    environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)})[0]
+                self.assertEqual(json.loads(reply['result']['content'][0]['text']),
+                    {'status': 'unsupported_capture', 'reason': 'exact_local_native_readback_required'})
+
+    def test_capture_rejects_conflicting_or_malformed_runtime_provenance(self):
+        valid = self.capture_request()['params']['_meta']
+        cases = [
+            (dict(valid, **{'openai/threadId': 'foreign-chat'}), 'conflicting_runtime_metadata'),
+            (dict(valid, **{'turnId': 'invented-turn'}), 'conflicting_runtime_metadata'),
+            (dict(valid, **{'call': {'id': 'invented-call'}}), 'conflicting_runtime_metadata'),
+            (dict(valid, **{'openai/threadId': 17}), 'malformed_runtime_metadata'),
+            (dict(valid, **{'x-codex-turn-metadata': 'not-json'}), 'malformed_runtime_metadata'),
+            (dict(valid, **{'call': []}), 'malformed_runtime_metadata'),
+        ]
+        for metadata, reason in cases:
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as name:
+                reply = self.capture_process(Path(name), [self.capture_request(metadata=metadata)])[0]
+                self.assertEqual(json.loads(reply['result']['content'][0]['text']),
+                                 {'status': 'unsupported_capture', 'reason': reason})
+
+    def test_capture_accepts_matching_native_metadata_aliases_and_json_turn_bag(self):
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                bridge = self.capture_bridge(root, {'thread': {
+                    'id': 'control-fixture', 'kind': 'codex', 'hostId': 'local'}})
+                reply = self.capture_process(root, [self.capture_request(metadata={
+                    'codex_thread_id': 'control-fixture', 'thread': {'id': 'control-fixture'},
+                    'x-codex-turn-metadata': '{"turn_id":"actual-turn"}',
+                    'turn': {'id': 'actual-turn'}, 'codex_call_id': 'actual-tool-call'})],
+                    bridge_script=bridge, environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)})[0]
+                report = json.loads(reply['result']['content'][0]['text'])
+                self.assertEqual(report['status'], 'captured_candidate')
+                sources = json.loads(report['candidateJson'])['evidence']['runtimeMetadataSources']
+                self.assertEqual(sources['threadId'], ['codex_thread_id', 'thread.id'])
+                self.assertEqual(sources['turnId'], ['turn.id', 'x-codex-turn-metadata.turn_id'])
+                self.assertEqual(sources['toolCallId'], ['codex_call_id'])
+
+    def test_capture_binds_exact_private_creation_receipt_bytes(self):
+        import hashlib
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                bridge = self.capture_bridge(root, {'thread': {
+                    'id': 'control-fixture', 'kind': 'codex', 'hostId': 'local'}})
+                receipt_bytes = b'{"hostId":"local", "threadId":"control-fixture"}\n'
+                reply = self.capture_process(root, [self.capture_request()], receipt_bytes=receipt_bytes,
+                    bridge_script=bridge, environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)})[0]
+                candidate = json.loads(json.loads(reply['result']['content'][0]['text'])['candidateJson'])
+                self.assertEqual(candidate['evidence']['expectedReceiptSha256'],
+                                 hashlib.sha256(receipt_bytes).hexdigest())
+                for invalid in (b'not-json', b'{"threadId":"foreign","threadId":"control-fixture","hostId":"local"}'):
+                    reply = self.capture_process(root, [self.capture_request()], receipt_bytes=invalid,
+                        bridge_script=bridge, environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)})[0]
+                    self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                        'status': 'unsupported_capture', 'reason': 'expected_local_creation_receipt_required'})
+
+    def test_capture_rejects_duplicate_metadata_keys_without_using_the_last_identity(self):
+        with tempfile.TemporaryDirectory() as name:
+            request = json.dumps(self.capture_request())
+            request = request.replace('"threadId": "control-fixture"',
+                '"threadId": "foreign-chat", "threadId": "control-fixture"')
+            replies = self.capture_process(Path(name), [request, {'id': 8, 'method': 'ping'}])
+            self.assertEqual(replies[0], {'jsonrpc': '2.0', 'id': None,
+                'error': {'code': -32700, 'message': 'unsupported_capture: malformed_runtime_metadata'}})
+            self.assertEqual(replies[1]['result'], {})
+
+    def test_capture_nested_frame_has_bounded_response_and_keeps_serving(self):
+        with tempfile.TemporaryDirectory() as name:
+            nested = '[' * 20000 + '0' + ']' * 20000
+            frame = '{"id":7,"method":"ping","params":' + nested + '}'
+            replies = self.capture_process(Path(name), [frame, {'id': 8, 'method': 'ping'}], output_limit=512)
+            self.assertEqual(len(replies), 2)
+            self.assertIn(replies[0], [
+                {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700,
+                    'message': 'unsupported_capture: malformed_runtime_metadata'}},
+                {'jsonrpc': '2.0', 'id': 7, 'result': {}}])
+            self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+            self.assertNotIn('candidateJson', json.dumps(replies))
+
+    def test_capture_nested_encoded_metadata_refuses_without_losing_next_ping(self):
+        with tempfile.TemporaryDirectory() as name:
+            nested = '[' * 20000 + '0' + ']' * 20000
+            metadata = self.capture_request()['params']['_meta']
+            metadata['x-codex-turn-metadata'] = '{"unused":' + nested + '}'
+            metadata['turnId'] = 'actual-turn'
+            replies = self.capture_process(Path(name), [self.capture_request(metadata=metadata),
+                                                        {'id': 8, 'method': 'ping'}], output_limit=512)
+            self.assertEqual(len(replies), 2)
+            self.assertEqual(replies[0]['id'], 7)
+            self.assertTrue(replies[0]['result']['isError'])
+            report = json.loads(replies[0]['result']['content'][0]['text'])
+            self.assertIn(report, [
+                {'status': 'unsupported_capture', 'reason': 'malformed_runtime_metadata'},
+                {'status': 'unsupported_capture', 'reason': 'inherited_native_route_required'}])
+            self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+            self.assertEqual(sorted(p.name for p in Path(name).iterdir()), ['creation-receipt.json'])
+
+    def test_capture_nested_receipt_refuses_without_losing_next_ping(self):
+        with tempfile.TemporaryDirectory() as name:
+            nested = '[' * 20000 + '0' + ']' * 20000
+            receipt = ('{"threadId":"control-fixture","hostId":"local","unused":' + nested + '}').encode()
+            self.assertLess(len(receipt), 65536)
+            replies = self.capture_process(Path(name), [self.capture_request(), {'id': 8, 'method': 'ping'}],
+                                           receipt_bytes=receipt, output_limit=512)
+            self.assertEqual(len(replies), 2)
+            self.assertEqual(replies[0]['id'], 7)
+            self.assertTrue(replies[0]['result']['isError'])
+            report = json.loads(replies[0]['result']['content'][0]['text'])
+            self.assertIn(report, [
+                {'status': 'unsupported_capture', 'reason': 'expected_local_creation_receipt_required'},
+                {'status': 'unsupported_capture', 'reason': 'inherited_native_route_required'}])
+            self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+            self.assertEqual((Path(name) / 'creation-receipt.json').read_bytes(), receipt)
+            self.assertEqual(sorted(p.name for p in Path(name).iterdir()), ['creation-receipt.json'])
+
+    def test_capture_nested_native_result_refuses_without_losing_next_ping(self):
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                private_marker = 'PRIVATE-MARKER-FIXTURE'
+                nested = '[' * 20000 + json.dumps(private_marker) + ']' * 20000
+                bridge = self.capture_bridge(root, None, readback_text='{"thread":' + nested + '}')
+                replies = self.capture_process(root, [self.capture_request(), {'id': 8, 'method': 'ping'}],
+                    bridge_script=bridge, environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)},
+                    output_limit=512)
+                self.assertEqual(len(replies), 2)
+                self.assertEqual(replies[0]['id'], 7)
+                self.assertTrue(replies[0]['result']['isError'])
+                report = json.loads(replies[0]['result']['content'][0]['text'])
+                self.assertIn(report, [
+                    {'status': 'unsupported_capture', 'reason': 'capture_evidence_unavailable'},
+                    {'status': 'unsupported_capture', 'reason': 'exact_local_native_readback_required'}])
+                self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 8, 'result': {}})
+                self.assertNotIn('candidateJson', json.dumps(replies))
+                self.assertNotIn(private_marker, json.dumps(replies))
+
+    def test_capture_never_uses_rpc_ids_transcripts_or_shell_identity_as_missing_provenance(self):
+        valid = self.capture_request()['params']['_meta']
+        cases = [
+            {key: value for key, value in valid.items() if key != 'openai/toolCallId'},
+            dict({key: value for key, value in valid.items() if key != 'openai/toolCallId'},
+                 _codex_apps={'call_id': 'actual-tool-call'}),
+            {'threadId': 'control-fixture', 'openai/toolCallId': 'actual-tool-call',
+             'turns': [{'id': 'actual-turn'}]},
+            {'x-codex-turn-metadata': {'session_id': 'control-fixture', 'turn_id': 'actual-turn'},
+             'openai/toolCallId': 'actual-tool-call'},
+        ]
+        for metadata in cases:
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as name:
+                reply = self.capture_process(Path(name), [self.capture_request(metadata=metadata)],
+                    environment={'CODEX_THREAD_ID': 'control-fixture', 'CODEX_TURN_ID': 'actual-turn'})[0]
+                self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                    'status': 'unsupported_capture', 'reason': 'complete_runtime_metadata_required'})
+
+    def test_capture_refuses_foreign_or_queued_enrollment_and_nonlocal_explicit_host(self):
+        receipts = [
+            {'threadId': 'foreign-chat', 'hostId': 'local'},
+            {'threadId': 'control-fixture', 'hostId': 'durable'},
+            {'clientThreadId': 'control-fixture', 'hostId': 'local'},
+            {'threadId': 'control-fixture', 'hostId': 'local', 'clientThreadId': 'queued-chat'},
+            [],
+        ]
+        for receipt in receipts:
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as name:
+                reply = self.capture_process(Path(name), [self.capture_request()], receipt=receipt)[0]
+                self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                    'status': 'unsupported_capture', 'reason': 'expected_local_creation_receipt_required'})
+        for host in ('durable', '', 'unknown-host'):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as name:
+                reply = self.capture_process(Path(name), [self.capture_request()],
+                    environment={'CODEX_APP_TOOLS_CALLER_HOST_ID': host})[0]
+                self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                    'status': 'unsupported_capture', 'reason': 'explicit_local_runtime_host_required'})
+
+    def test_capture_requires_actual_local_readback_despite_a_preferred_local_host(self):
+        import socket
+        variants = [
+            {'id': 'foreign-chat', 'kind': 'codex', 'hostId': 'local'},
+            {'id': 'control-fixture', 'kind': 'codex', 'hostId': 'durable'},
+            {'id': 'control-fixture', 'kind': 'chatgpt', 'hostId': 'local'},
+            {'id': 'control-fixture', 'hostId': 'local'},
+            None,
+        ]
+        for thread in variants:
+            with self.subTest(thread=thread), tempfile.TemporaryDirectory() as name:
+                root = Path(name); route = root / 'native.sock'
+                with socket.socket(socket.AF_UNIX) as inherited:
+                    inherited.bind(str(route)); bridge = self.capture_bridge(root, {'thread': thread})
+                    reply = self.capture_process(root, [self.capture_request()], bridge_script=bridge,
+                        environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)})[0]
+                    self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                        'status': 'unsupported_capture', 'reason': 'exact_local_native_readback_required'})
+
+    def test_capture_without_inherited_route_does_not_discover_one(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); (root / 'plausible-native-route').write_text('fixture')
+            reply = self.capture_process(root, [self.capture_request()])[0]
+            self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                'status': 'unsupported_capture', 'reason': 'inherited_native_route_required'})
+            self.assertEqual(sorted(p.name for p in root.iterdir()),
+                             ['creation-receipt.json', 'plausible-native-route'])
+
+    def test_capture_refuses_a_native_route_replaced_during_readback(self):
+        import socket
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); route = root / 'native.sock'
+            with socket.socket(socket.AF_UNIX) as inherited:
+                inherited.bind(str(route))
+                bridge = self.capture_bridge(root, {'thread': {
+                    'id': 'control-fixture', 'kind': 'codex', 'hostId': 'local'}}, replace_route=True)
+                reply = self.capture_process(root, [self.capture_request()], bridge_script=bridge,
+                    environment={'CODEX_APP_TOOLS_PIPE_PATH': str(route)})[0]
+                self.assertEqual(json.loads(reply['result']['content'][0]['text']), {
+                    'status': 'unsupported_capture', 'reason': 'inherited_route_generation_changed'})
+
+    def test_opt_in_capture_lists_one_read_only_no_argument_tool_without_live_config(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            replies = self.capture_process(root, [
+                {'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2024-11-05'}},
+                {'id': 2, 'method': 'tools/list'}])
+            tools = replies[-1]['result']['tools']
+            self.assertEqual(len(tools), 1)
+            self.assertEqual(tools[0]['name'], 'capture_native_context')
+            self.assertEqual(tools[0]['inputSchema'],
+                             {'type': 'object', 'properties': {}, 'additionalProperties': False})
+            self.assertTrue(tools[0]['annotations']['readOnlyHint'])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['creation-receipt.json'])
+
+    def test_capture_rejects_caller_identity_arguments_and_missing_runtime_metadata(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            replies = self.capture_process(root, [
+                {'id': 1, 'method': 'tools/call', 'params': {
+                    'name': 'capture_native_context', 'arguments': {'threadId': 'control-fixture',
+                    'turnId': 'invented-turn', 'host': 'local'}}},
+                {'id': 2, 'method': 'tools/call', 'params': {
+                    'name': 'capture_native_context', 'arguments': {}}}])
+            reports = [json.loads(r['result']['content'][0]['text']) for r in replies]
+            self.assertEqual(reports, [
+                {'status': 'unsupported_capture', 'reason': 'capture_arguments_forbidden'},
+                {'status': 'unsupported_capture', 'reason': 'complete_runtime_metadata_required'}])
+            self.assertTrue(all(r['result']['isError'] for r in replies))
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['creation-receipt.json'])
+
+    def test_notifications_name_configured_approval_chat_for_both_recipients(self):
+        for resets in (0, 1):
+            with self.subTest(resets=resets), tempfile.TemporaryDirectory() as name:
+                path = Path(name) / 'main.json'; transport = ReceiptTransport(path)
+                config = dict(CONFIG, parentThreadId='appointed-approval-chat')
+                state, _ = advance({}, sample(100, resets=resets), ACCOUNT, now=10)
+                dispatch(state, ACCOUNT, config, transport, path)
+                for target, prompt in transport.received:
+                    self.assertIn('configured approval/status chat appointed-approval-chat', prompt)
+                    self.assertNotIn('main chat', prompt)
+                    self.assertNotIn('current parent', prompt)
+                self.assertEqual(transport.received[-1][0], 'appointed-approval-chat')
+
     def test_main_receipt_reconciliation_does_not_starve_daybreak_delivery(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name); config = self.config(root); pinned = config['accounts'][1]

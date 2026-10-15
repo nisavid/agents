@@ -7,6 +7,7 @@ import time
 
 from storage import read_private
 from activation import delivery_status
+from pause_completion import completion_status
 
 
 def status(config_path, state_dir, now=None):
@@ -20,6 +21,7 @@ def status(config_path, state_dir, now=None):
         episode = read_private(root / f'{name}.json', {}).get('episode')
         if episode:
             episodes[name] = {key: episode.get(key) for key in ('id', 'active', 'budgetStatus', 'waitingSpendUsd')}
+            episodes[name]['protectiveStop'] = completion_status(config, root, name)
             episodes[name]['deliveries'] = {event['kind']: event.get('deliveries', {}) for event in episode['events']}
     modified = (root / 'health.json').stat().st_mtime if (root / 'health.json').exists() else 0
     age = (time.time() if now is None else now) - modified

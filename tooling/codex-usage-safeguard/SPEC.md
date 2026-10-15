@@ -2,8 +2,9 @@
 
 One local observer protects a default Codex account and a separately pinned
 Daybreak profile. A normal MCP companion can renew its connection to the app.
-It owns no quota policy, never launches another observer, and exposes no action
-tools. Configuration and all runtime state remain private and outside releases.
+It owns no quota policy, never launches another observer, and normally exposes
+no tools. Opt-in caller capture returns a read-only candidate. Configuration and
+all runtime state remain private and outside releases.
 
 ## Quota and account policy
 
@@ -35,12 +36,119 @@ tools. Configuration and all runtime state remain private and outside releases.
 - The verified Codex Foreman alone coordinates protective pauses using native
   Steer to active Codex root threads, including other accounts and owned children.
   Claude-only work is excluded; only the established relay covers Claude-managed
-  Codex work. The parent receives approval requests and delivery status.
+  Codex work. The explicitly configured approval/status chat (`parentThreadId`)
+  receives approval requests and delivery status. Notifications name that chat's
+  exact ID; Foreman receives the same ID for reporting and escalation.
 - Delivery intent is durable before sending. Submitted is not acknowledged or
   stopped. An uncertain result requires reconciliation against the same episode
   marker, and cannot be automatically retried after restart or renewal.
 - Restored allowance does not resume work or rearm an episode. Exact episode
   release evidence and any required Foreman hold release are mandatory.
+
+## Local caller and approval inbox
+
+A genuine local Codex chat may be explicitly appointed as both native caller
+and approval/status inbox. It remains an ordinary chat whose native access must
+succeed through the running app. `nativeContext` stores its originating thread,
+turn, and host; `parentThreadId` names the appointed inbox. The configured
+Foreman remains the sole pause coordinator and must have a distinct ID. Account
+selection does not discover or replace this inbox. A previous inbox is retained
+as history, without an automatic delivery fallback.
+
+`companion.py --capture-receipt ... --node-binary ... --native-bridge-script ...`
+selects capture mode without production configuration or state. Initialization
+publishes no route in this mode. Its sole tool, `capture_native_context`, accepts
+an empty argument object and reads actual invocation metadata from `params._meta`.
+Caller identity arguments are rejected. The expected final local creation receipt
+is a private enrollment constraint, never the identity source. Queued creation
+IDs and another chat's receipt cannot enroll a caller.
+
+Capture requires a complete runtime thread, turn, and model/native tool-call ID.
+The supported native metadata aliases are recorded with the candidate. Matching
+aliases may corroborate each other; malformed, duplicate, or conflicting values
+fail closed. `x-codex-turn-metadata` supports an object or JSON-encoded object
+with `thread_id` and `turn_id`. Its `session_id` is not a substitute thread source.
+RPC IDs, generated UUIDs, shell identity, and transcript contents cannot complete
+missing invocation metadata. The installed receiver's fallback call/turn IDs are
+not capture evidence. An ordinary companion is not proven to receive a required
+model/native tool-call ID; a live invocation may return unsupported capture.
+
+Only the inherited `CODEX_APP_TOOLS_PIPE_PATH` is eligible. Capture validates its
+owned socket before and after one bounded native `read_thread` call. Returned
+`thread.id` must match both the runtime thread and creation receipt;
+`thread.kind` must be `codex`, and `thread.hostId` must be `local`. A preferred
+local host argument alone is insufficient because native readback can resolve
+another host or history source. Raw thread content and native errors are excluded
+from the candidate.
+
+An explicit inherited `CODEX_APP_TOOLS_CALLER_HOST_ID=local` records
+`explicit_runtime_host` provenance. When that variable is absent, only the
+matching expected local receipt, complete runtime metadata, and exact local
+native readback jointly qualify `constrained_local_protocol_default`. A present
+empty, durable, or unrecognized host fails. Absence alone never classifies a chat
+as local.
+
+The tool returns `captured_candidate`, `candidateJson`, and lowercase hexadecimal
+`sha256`. `candidateJson` is the exact UTF-8 JSON string to retain and hash, with
+sorted keys, compact separators, ASCII escapes, and no trailing newline. It
+contains `schemaVersion: 1`, the proposed `nativeContext`, runtime tool-call ID
+and source fields, host provenance, the SHA-256 of the exact creation-receipt
+file bytes, exact local readback fields, and inherited socket identity. Identical
+evidence yields identical candidate bytes. Unavailable evidence returns
+`unsupported_capture` with a bounded reason and no candidate; malformed MCP
+frames return a parse error. Candidate return grants no persistent authorization.
+
+Capture writes no production configuration, state, routes, activation, or
+receipts, and sends no message or quota action. Caller adoption and approval-inbox
+transfer require explicit decisions. Retain submitted and uncertain receipts
+with their original targets; uncertainty blocks automatic retry across recipient
+changes and restart. Known-unsent active events need an explicit transfer decision.
+Archived episodes are not backfilled. Changing caller invalidates caller-bound
+routes; changing configuration invalidates activation. Strict fresh preflight
+still requires both exact recipients before delivery can activate.
+
+## Protective-stop completion
+
+Transport receipts remain unchanged. A Foreman completion record describes an
+observed protective stop; it never grants pause, reset, release, or route authority.
+The record binds its schema version, account ID, identity generation, episode,
+current pause-event ID, configured Foreman ID, observation time, and evidence
+references. Main records require the current main-selection generation; pinned
+Daybreak records bind the account and exact episode rather than inventing a main
+generation.
+
+Foreman records the full observed root inventory, its coverage limits, each root's
+stop status, owned-worker/process coverage, and continuation holds. A root without
+verified worker and continuation evidence cannot count as stopped. An empty root
+inventory can count as complete only with an explicit verified-empty inventory
+observation. Missing inventory coverage remains unknown. Denied authorization is
+blocked; uncertain outcomes remain unknown; mixed coverage remains partial.
+An instruction-based refusal is distinguished from an actual tool/reviewer denial.
+
+The local producer validates a supplied private record against current private
+configuration and state. It retains each accepted record immutably and updates a
+separate latest-record pointer. For the same episode and event, observation time
+must increase unless the submission has the identical currently selected record
+digest. A conflicting equal-time submission is rejected without changing retained
+records or the pointer. Observation time is compared directly with the active
+episode's `openedAt`: earlier observations are rejected by the producer and remain
+unconfirmed when read from retained records; equal and later times satisfy this
+lower bound. There is no clock tolerance or expiry interval. This comparison does
+not establish ordering after the current pause request; the caller must still
+collect evidence after that request.
+
+Restart may reread records but cannot replay pause
+requests or rewrite transport receipts. The observer and local status consumer
+validate that pointer and retained bytes against the current binding. Missing,
+malformed, stale, superseded, or mismatched records never indicate completed stops.
+Unconfirmed coverage remains visible even when the transport is healthy.
+
+The producer stores Foreman's observations; it does not authenticate an arbitrary
+writer as Foreman or independently attest the described native actions. Publication
+of the record requires the existing acting workflow's authority. Its evidence
+references must permit the supervising agent to audit actual native returns.
+No transcript scraping, additional model polling, timed reminders, caller rebind,
+or automatic pause or release is introduced by this interface.
 
 ## Connection renewal
 
@@ -105,6 +213,14 @@ receipts, concurrent publication, missing/stale routes, exact targets, rejected
 registration, independent destination outages, maintenance across boots, hourly
 notice bounds across restart, and preservation of open
 episodes through code upgrade and rollback.
+
+Caller-capture acceptance uses the companion process/MCP boundary with synthetic
+metadata, receipts, native subprocesses, and sockets. It covers normal empty tool
+discovery, opt-in discovery, success, unsupported capture, host provenance,
+conflicts, foreign enrollment/readback, stable output after a fixture restart and
+changed account environment, and preservation of production-file fixtures. These
+checks do not qualify live metadata, self-delivery, caller reuse after the turn,
+app restart survival, or persistence across actual account switches.
 
 Source belongs in `nisavid/agents`; the opt-in immutable-release adapter belongs
 in `nisavid/dotfiles`. Keep the same systemd identity and both existing singleton

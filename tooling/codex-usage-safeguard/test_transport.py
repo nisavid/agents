@@ -24,6 +24,7 @@ class FixtureBridge:
     def call(self, tool, arguments):
         self.calls.append((self.route, tool, arguments['threadId']))
         mode = self.registry[self.route]
+        if isinstance(mode, dict): mode = mode.get(arguments['threadId'], 'valid')
         if isinstance(mode, Exception):
             raise mode
         if mode == 'deny':
@@ -39,7 +40,7 @@ class FixtureBridge:
         self.closed = True
 
 
-class TransportTests(unittest.TestCase):
+class TransportFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -64,6 +65,8 @@ class TransportTests(unittest.TestCase):
     def publish(self, route, config=None):
         return publish_candidate(self.root, config or CONFIG, {'CODEX_APP_TOOLS_PIPE_PATH': route}, now=self.now)
 
+
+class TransportTests(TransportFixture):
     def test_concurrent_companions_coalesce_and_missing_pipe_keeps_candidate(self):
         pipe = self.route('app.sock')
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -77,16 +80,16 @@ class TransportTests(unittest.TestCase):
     def test_adopts_only_after_both_exact_destinations_then_renews_after_failure(self):
         first = self.route('one.sock'); second = self.route('two.sock')
         self.publish(first); transport = self.manager()
-        old = transport.connection()
+        old = transport.connection().for_recipient('foreman')
         self.assertEqual([c[2] for c in self.calls], ['fixture-foreman', 'fixture-parent'])
         self.now += 1; self.publish(second)
-        self.assertIs(transport.connection(), old)  # A healthy accepted route remains stable.
+        self.assertIs(transport.connection().for_recipient('foreman'), old)  # A healthy accepted route remains stable.
         self.registry[first] = 'deny'; self.now += 61
-        new = transport.connection()
+        new = transport.connection().for_recipient('foreman')
         self.assertEqual(new.route, second); self.assertTrue(old.closed)
         self.assertEqual(self.alerts, [])
         transport.close()
-        self.assertEqual(self.manager().connection().route, second)
+        self.assertEqual(self.manager().connection().for_recipient('foreman').route, second)
 
     def test_rejected_registration_latches_one_actionable_alert_until_recovery(self):
         pipe = self.route('rejected.sock', 'deny'); self.publish(pipe)
@@ -116,15 +119,15 @@ class TransportTests(unittest.TestCase):
         self.publish(second)
         with self.assertRaises(RuntimeError): transport.connection()
         health = json.loads((self.root / 'transport' / 'health.json').read_text())
-        self.assertEqual([x['kind'] for x in health['lastFailures']],
+        self.assertEqual([x['kind'] for x in health['recipients']['foreman']['lastFailures']],
                          ['native_socket_missing', 'native_app_request_failed'])
-        self.assertEqual(health['lastFailures'][1]['recipient'], 'foreman')
-        failed_at = health['lastFailureAt']
+        self.assertEqual(health['recipients']['foreman']['lastFailures'][1]['recipient'], 'foreman')
+        failed_at = health['recipients']['foreman']['lastFailureAt']
         self.now += 6  # Health retry expires before the per-route retry cooldown.
         with self.assertRaises(RuntimeError): transport.connection()
         retained = json.loads((self.root / 'transport' / 'health.json').read_text())
-        self.assertEqual(retained['lastFailures'], health['lastFailures'])
-        self.assertEqual(retained['lastFailureAt'], failed_at)
+        self.assertEqual(retained['recipients']['foreman']['lastFailures'], health['recipients']['foreman']['lastFailures'])
+        self.assertEqual(retained['recipients']['foreman']['lastFailureAt'], failed_at)
         self.assertEqual(len(self.alerts), 1)
         self.assertFalse(any(c[1] == 'send' for c in self.calls))
         self.registry[second] = 'valid'; self.now += 301
@@ -141,7 +144,7 @@ class TransportTests(unittest.TestCase):
         raw = (self.root / 'transport' / 'health.json').read_text()
         self.assertNotIn('secret-token', raw)
         self.assertNotIn('fixture@example.test', raw)
-        self.assertEqual(json.loads(raw)['lastFailures'][0]['kind'], 'native_route_check_failed')
+        self.assertEqual(json.loads(raw)['recipients']['foreman']['lastFailures'][0]['kind'], 'native_route_check_failed')
 
     def test_changed_context_and_wrong_foreman_cannot_be_adopted(self):
         pipe = self.route('app.sock')
@@ -151,7 +154,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.publish(pipe); self.registry[pipe] = 'wrong'; self.now += 301
         with self.assertRaises(RuntimeError): self.manager().connection()
-        self.assertFalse((self.root / 'transport' / 'accepted.json').exists())
+        self.assertFalse((self.root / 'transport' / 'foreman' / 'accepted.json').exists())
 
     def test_failed_notification_is_recorded_without_repetition_after_restart(self):
         def broken(message): raise RuntimeError('desktop_unavailable')
@@ -206,7 +209,7 @@ class TransportTests(unittest.TestCase):
         pipe = self.route('app.sock'); self.publish(pipe)
         manager = self.manager(); manager.connection(); manager.close()
         (self.root / 'transport' / 'candidates.json').write_text('invalid JSON')
-        self.assertEqual(self.manager().connection().route, pipe)
+        self.assertEqual(self.manager().connection().for_recipient('foreman').route, pipe)
         self.assertEqual(self.alerts, [])
 
     def test_unreadable_health_and_malformed_registry_record_one_recovery_incident(self):

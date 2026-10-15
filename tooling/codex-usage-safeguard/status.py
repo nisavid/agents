@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 from storage import read_private
+from activation import delivery_status
 
 
 def status(config_path, state_dir, now=None):
@@ -22,7 +23,8 @@ def status(config_path, state_dir, now=None):
             episodes[name]['deliveries'] = {event['kind']: event.get('deliveries', {}) for event in episode['events']}
     modified = (root / 'health.json').stat().st_mtime if (root / 'health.json').exists() else 0
     age = (time.time() if now is None else now) - modified
-    return {'enabledInConfig': config.get('enabled') is True, 'observer': health,
+    return {'enabledInConfig': config.get('enabled') is True, 'delivery': delivery_status(config, root),
+            'observer': health,
             'observerFresh': bool(modified and 0 <= age < max(120, config['intervalSeconds'] * 3)),
             'transport': read_private(root / 'transport' / 'health.json', {'healthy': False, 'reason': 'not_started'}),
             'episodes': episodes}

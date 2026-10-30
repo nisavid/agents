@@ -11,6 +11,6 @@
   },
   "dependencies": {
     "proxy-from-env": "2.1.0",
-    "undici": "6.29.0"
+    "undici": "6.29.1"
   }
 }

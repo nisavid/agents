@@ -30,7 +30,7 @@ def wait_budget(episode, sample, previous, now, policy):
     balance = decimal((sample.get('credits') or {}).get('balance'))
     rate = decimal(policy.get('usdPerCredit'))
     last = decimal(episode.get('lastBalance'))
-    fresh = now - previous.get('lastReadAt', now) <= 30
+    fresh = 0 <= now - previous.get('lastReadAt', now) <= 30
     if balance is None or rate is None or rate <= 0:
         episode['budgetStatus'] = 'unmetered_wait_blocked'
         return 'unmetered_confirmation_wait' if policy.get('pauseWhenUnmetered') is True else None
@@ -106,13 +106,21 @@ def reset_count(sample):
     return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
 
 
+def fallback_eligible(state, policy):
+    episode = state.get('episode')
+    sample = state.get('lastSample')
+    return bool(episode and episode.get('active') and policy.get('pauseWhenUnmetered') is True
+                and state.get('fallbackEvidenceValid') is not False
+                and isinstance(sample, dict) and exhausted(sample)
+                and any(e['kind'] == 'reset_confirmation_required' for e in episode['events']))
+
+
 def observation_failed(previous, policy):
     """The approved fallback applies only during an existing reset-confirmation wait."""
     state = copy.deepcopy(previous)
     episode = state.get('episode')
     events = []
-    if (episode and episode.get('active') and policy.get('pauseWhenUnmetered') is True
-            and any(e['kind'] == 'reset_confirmation_required' for e in episode['events'])):
+    if fallback_eligible(state, policy):
         emit(episode, events, 'foreman_pause_required', 'observation_failed_during_confirmed_exhaustion')
     return state, events
 

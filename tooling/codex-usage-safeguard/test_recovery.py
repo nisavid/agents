@@ -59,7 +59,7 @@ class RecipientRecoveryTests(TransportFixture):
         # desktop notification, and ambient identity boundaries are fixtures.
         with patch('controller.read_account', side_effect=read), \
              patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
-             patch('controller.Transport', new=lambda *args: manager), \
+             patch('controller.Transport', new=lambda *args, **kwargs: manager), \
              patch('controller.time.sleep', side_effect=next_poll), patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(PollsComplete): run(config, self.root)
         first = polls[0]
@@ -175,6 +175,7 @@ class MaintenanceTests(unittest.TestCase):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         config.update(stateDir=str(root), sharedLock=str(root / 'legacy.lock'), enabled=True)
         (root / 'legacy.lock').touch()
+        (root / 'legacy.lock').chmod(0o600)
         return config
 
     def test_missing_activation_observes_zero_but_never_dispatches_after_boot(self):
@@ -302,6 +303,7 @@ class MaintenanceTests(unittest.TestCase):
                 self.assertTrue(started.wait(2)); hold_started.set()
                 set_mode(config,root,'maintenance','operator-hold'); held.set()
             state,_=advance({},sample(100),ACCOUNT,now=10)
+            save(path,state)
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future=pool.submit(hold)
                 dispatch(state,ACCOUNT,config,bridge,path,current_observation=sample(100),

@@ -137,9 +137,9 @@ class NativeBridge:
         self.proc.stdout.close()
 
 
-def verify_destination(bridge, thread_id, recipient):
+def verify_destination(bridge, thread_id, recipient, *, role_binding=None):
     """Verify one exact configured recipient without coupling its availability."""
-    if recipient not in ('foreman', 'parent'):
+    if recipient not in ('foreman', 'parent', 'concierge', 'repairOwner'):
         raise ValueError('unknown_recipient')
     try:
         value = bridge.call('read_thread', {'threadId': thread_id, 'turnLimit': 1,
@@ -148,15 +148,32 @@ def verify_destination(bridge, thread_id, recipient):
         error.recipient = recipient
         raise
     thread = value.get('thread', {})
-    if thread.get('id') != thread_id or (recipient == 'foreman' and thread.get('title') != 'Codex Foreman'):
+    binding_valid = (isinstance(role_binding, dict) and role_binding.get('thread_id') == thread_id
+                     and role_binding.get('host_id') == thread.get('hostId')
+                     and isinstance(role_binding.get('host_id'), str) and bool(role_binding['host_id'])
+                     and role_binding.get('role') == {'foreman': 'dispatch', 'concierge': 'concierge',
+                                                     'repairOwner': 'repair_owner'}.get(recipient)
+                     and isinstance(role_binding.get('acceptance_ref'), str)
+                     and bool(role_binding['acceptance_ref'].strip()))
+    if (thread.get('id') != thread_id or (role_binding is not None and not binding_valid)
+            or (recipient in ('concierge', 'repairOwner') and not binding_valid)
+            or (recipient == 'foreman' and role_binding is None and thread.get('title') != 'Codex Foreman')):
         raise NativeBridgeError('native_route_identity_mismatch', stage='read_thread', recipient=recipient)
     return True
 
 
-def verify_bridge(bridge, foreman, parent):
+def verify_bridge(bridge, foreman, parent, *, dispatch_binding=None, concierge=None, concierge_binding=None,
+                  owner_binding=None):
     """Strict read-only preflight still requires both exact destinations."""
-    if foreman == parent:
+    targets = [foreman, parent] + ([concierge] if concierge is not None else [])
+    if owner_binding is not None:
+        targets.append(owner_binding.get('thread_id'))
+    if len(set(targets)) != len(targets):
         raise NativeBridgeError('native_route_identity_mismatch', stage='verify_destinations')
-    verify_destination(bridge, foreman, 'foreman')
+    verify_destination(bridge, foreman, 'foreman', role_binding=dispatch_binding)
     verify_destination(bridge, parent, 'parent')
+    if concierge is not None:
+        verify_destination(bridge, concierge, 'concierge', role_binding=concierge_binding)
+    if owner_binding is not None:
+        verify_destination(bridge, owner_binding.get('thread_id'), 'repairOwner', role_binding=owner_binding)
     return True

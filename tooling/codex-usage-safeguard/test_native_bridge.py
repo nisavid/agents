@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from native_bridge import NativeBridge, NativeBridgeError, verify_bridge
+from native_bridge import NativeBridge, NativeBridgeError, verify_bridge, verify_destination
 
 
 SERVER = '''
@@ -33,6 +33,33 @@ for line in sys.stdin:
 
 
 class NativeTests(unittest.TestCase):
+    def test_new_preflight_checks_every_bound_recipient(self):
+        bridge = Mock()
+        bridge.call.side_effect = lambda _tool, args: {'thread': {'id': args['threadId'], 'hostId': 'local',
+                                                                  'title': 'Renamed'}}
+        dispatch = {'thread_id': 'dispatch', 'host_id': 'local', 'role': 'dispatch', 'acceptance_ref': 'accepted'}
+        concierge = {'thread_id': 'concierge', 'host_id': 'local', 'role': 'concierge', 'acceptance_ref': 'accepted'}
+        owner = {'thread_id': 'owner', 'host_id': 'local', 'role': 'repair_owner', 'acceptance_ref': 'accepted'}
+        self.assertTrue(verify_bridge(bridge, 'dispatch', 'parent', dispatch_binding=dispatch,
+                                      concierge='concierge', concierge_binding=concierge, owner_binding=owner))
+        self.assertEqual(bridge.call.call_count, 4)
+
+    def test_recipient_rename_does_not_change_stable_identity(self):
+        bridge = Mock()
+        bridge.call.return_value = {'thread': {'id': 'accepted-recipient', 'hostId': 'local', 'title': 'Renamed chat'}}
+        binding = {'thread_id': 'accepted-recipient', 'host_id': 'local', 'role': 'dispatch', 'acceptance_ref': 'reviewed-acceptance'}
+        self.assertTrue(verify_destination(bridge, 'accepted-recipient', 'foreman', role_binding=binding))
+        bridge.call.return_value = {'thread': {'id': 'different-recipient', 'title': 'Codex Foreman'}}
+        with self.assertRaises(NativeBridgeError):
+            verify_destination(bridge, 'accepted-recipient', 'foreman', role_binding=binding)
+        bridge.call.return_value = {'thread': {'id': 'accepted-recipient', 'title': 'Codex Foreman'}}
+        with self.assertRaises(NativeBridgeError):
+            verify_destination(bridge, 'accepted-recipient', 'foreman',
+                               role_binding={**binding, 'acceptance_ref': ''})
+        bridge.call.return_value = {'thread': {'id': 'accepted-recipient', 'hostId': 'other', 'title': 'Renamed'}}
+        with self.assertRaises(NativeBridgeError):
+            verify_destination(bridge, 'accepted-recipient', 'foreman', role_binding=binding)
+
     def test_identical_destinations_fail_before_native_reads(self):
         bridge = Mock()
         with self.assertRaises(NativeBridgeError) as caught:

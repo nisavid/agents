@@ -1,4 +1,5 @@
 import copy
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import tempfile
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from controller import dispatch, validate_config, select_main_identity, run
 from safeguard import advance
+from storage import save
 from test_guard import ACCOUNT, sample
 
 CONFIG = {'foremanThreadId': 'foreman', 'parentThreadId': 'parent'}
@@ -28,6 +30,94 @@ class ReceiptTransport:
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_delivery_rechecks_persisted_receipt_after_lock_acquisition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'main.json'
+            state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
+            save(path, state)
+            transport = ReceiptTransport(path)
+
+            @contextmanager
+            def concurrent_receipt():
+                persisted = json.loads(path.read_text())
+                persisted['episode']['events'][0].setdefault('deliveries', {})['foreman'] = {
+                    'status': 'submitted', 'target': 'foreman'}
+                save(path, persisted)
+                yield
+
+            with self.assertRaisesRegex(RuntimeError, 'delivery_state_changed'):
+                dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100),
+                         delivery_lock=concurrent_receipt)
+            self.assertEqual(transport.received, [])
+            self.assertEqual(json.loads(path.read_text())['episode']['events'][0]['deliveries']['foreman']['status'],
+                             'submitted')
+
+    def test_new_routing_requires_both_recipient_role_bindings(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config.update(incidentRoutingEnabled=True, conciergeThreadId='fixture-concierge')
+        with self.assertRaisesRegex(ValueError, 'incident_routing_binding_required'):
+            validate_config(config)
+
+    def test_new_routing_requires_named_repair_owner_binding(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config.update(incidentRoutingEnabled=True, conciergeThreadId='fixture-concierge',
+                      incidentReceiptStore='/fixture/receipts.json', roleBindings={
+                          'foreman': {'thread_id': config['foremanThreadId'], 'host_id': 'local',
+                                      'role': 'dispatch', 'acceptance_ref': 'fixture-dispatch'},
+                          'concierge': {'thread_id': 'fixture-concierge', 'host_id': 'local',
+                                        'role': 'concierge', 'acceptance_ref': 'fixture-concierge'}})
+        with self.assertRaisesRegex(ValueError, 'incident_routing_binding_required'):
+            validate_config(config)
+
+    def test_repair_owner_must_not_alias_an_intake_destination(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config.update(incidentRoutingEnabled=True, conciergeThreadId='fixture-concierge',
+                      incidentReceiptStore='/fixture/receipts.json', roleBindings={
+                          'foreman': {'thread_id': config['foremanThreadId'], 'host_id': 'local',
+                                      'role': 'dispatch', 'acceptance_ref': 'fixture-dispatch'},
+                          'concierge': {'thread_id': 'fixture-concierge', 'host_id': 'local',
+                                        'role': 'concierge', 'acceptance_ref': 'fixture-concierge'},
+                          'repairOwner': {'thread_id': 'fixture-concierge', 'host_id': 'local',
+                                          'role': 'repair_owner', 'acceptance_ref': 'fixture-owner'}})
+        with self.assertRaisesRegex(ValueError, 'distinct_notification_destinations_required'):
+            validate_config(config)
+
+    def test_retained_zero_without_current_observation_cannot_start_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'main.json'
+            transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
+            with self.assertRaisesRegex(RuntimeError, 'current_zero_required_before_delivery'):
+                dispatch(state, ACCOUNT, CONFIG, transport, path)
+            self.assertEqual(transport.received, [])
+            self.assertFalse(state['episode']['events'][0].get('deliveries'))
+
+    def test_new_routing_names_dispatch_as_pause_coordinator(self):
+        account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
+        config = {**CONFIG, 'incidentRoutingEnabled': True}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'daybreak.json'
+            transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), account, now=10)
+            with patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('accountId', 'email')}):
+                dispatch(state, account, config, transport, path, current_observation=sample(100))
+            self.assertEqual([target for target, _ in transport.received], ['foreman', 'parent'])
+            self.assertTrue(all('Dispatch' in prompt for _, prompt in transport.received))
+            self.assertTrue(all('sole pause coordinator' not in prompt for _, prompt in transport.received))
+
+    def test_incomplete_incident_routing_cannot_be_activated(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config['conciergeThreadId'] = 'fixture-concierge'
+        config['incidentRoutingEnabled'] = True
+        with self.assertRaisesRegex(ValueError, 'incident_routing_not_ready'):
+            validate_config(config, activate=True)
+
+    def test_incident_recipient_must_be_distinct(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config['conciergeThreadId'] = config['parentThreadId']
+        with self.assertRaisesRegex(ValueError, 'distinct_notification_destinations_required'):
+            validate_config(config)
+
     def test_submitted_daybreak_pause_is_invalidated_on_switch_and_new_condition_gets_new_id(self):
         account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
         with tempfile.TemporaryDirectory() as directory:
@@ -138,6 +228,7 @@ class DeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('controller.read_account', return_value=reading), \
              patch('controller.default_identity', return_value=identity):
             root = Path(directory)
+            lock = root / 'legacy.lock'; lock.touch(mode=0o600); config['sharedLock'] = str(lock)
             health = run(config, root, once=True, observe_only=True)
             self.assertEqual(health['accounts']['main']['status'], 'covered_by_daybreak')
             events = json.loads((root / 'daybreak.json').read_text())['episode']['events']
@@ -152,6 +243,7 @@ class DeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('controller.read_account', return_value=reading), \
              patch('controller.default_identity', return_value=identity):
             root = Path(directory)
+            lock = root / 'legacy.lock'; lock.touch(mode=0o600); config['sharedLock'] = str(lock)
             health = run(config, root, once=True, observe_only=True)
             self.assertEqual(health['accounts']['main']['status'], 'covered_by_daybreak')
             self.assertNotIn('episode', json.loads((root / 'main.json').read_text()))
@@ -181,6 +273,18 @@ class DeliveryTests(unittest.TestCase):
             again_account, again = select_main_identity(root, {'name': 'main', 'dynamicDefault': True}, sample(0))
             self.assertNotIn('episode', again)
             self.assertNotEqual(again['identityGeneration'], 'old-generation')
+
+    def test_missing_selector_does_not_replace_existing_main_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, _ = advance({}, sample(100), ACCOUNT, now=10)
+            old['identityGeneration'] = 'old-generation'
+            from controller import save
+            save(root / 'main.json', old); before = (root / 'main.json').read_bytes()
+            with self.assertRaisesRegex(ValueError, 'main_selection_state_mismatch'):
+                select_main_identity(root, {'name': 'main', 'dynamicDefault': True}, sample(0))
+            self.assertEqual((root / 'main.json').read_bytes(), before)
+            self.assertFalse((root / 'main-selection.json').exists())
 
     def test_foreman_owns_pause_and_restart_does_not_resend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -231,6 +335,19 @@ class DeliveryTests(unittest.TestCase):
         config['policy']['pauseWhenUnmetered'] = True
         with self.assertRaisesRegex(ValueError, 'unmetered_fallback_not_approved'):
             validate_config(config, activate=True)
+
+    def test_fallback_reference_must_be_nonempty_text(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config['enabled'] = True
+        config['policy'] = {'pauseWhenUnmetered': True, 'fallbackDecision': 'pause_at_zero_when_unmetered',
+                            'usdPerCredit': '0.04', 'pauseAtUsd': '8', 'usdRateEvidence': 'fixture-rate'}
+        for value in (True, 1, ['fixture'], {'id': 'fixture'}, '', '   '):
+            with self.subTest(reference=value):
+                config['policy']['fallbackDecisionReference'] = value
+                with self.assertRaisesRegex(ValueError, 'unmetered_fallback_not_approved'):
+                    validate_config(config, activate=True)
+        config['policy']['fallbackDecisionReference'] = 'fixture-decision-reference'
+        validate_config(config, activate=True)
 
     def test_simultaneous_pause_and_confirmation_notify_parent_once(self):
         with tempfile.TemporaryDirectory() as directory:

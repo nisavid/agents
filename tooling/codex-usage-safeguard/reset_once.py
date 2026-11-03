@@ -6,14 +6,16 @@ pointer; the calling agent must actually verify the human reply in the main chat
 """
 import argparse
 import datetime as dt
-import fcntl
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 
-from controller import ROOT, NODE, read_account, save
+from controller import ROOT, NODE, read_account, save, save_account, check_account_custody, reset_evidence
 from safeguard import number
 from configuration import load_config, runtime_arguments
+from activation import reset_operation_lock
+from storage import read_private
 
 
 def prepare(account, episode, usage, inventory, confirmation, now):
@@ -53,13 +55,31 @@ def execute(config, runtime, account_name, episode_id, confirmation):
     if account_name != 'daybreak':
         raise ValueError('use_native_reset_tool_for_main_after_confirmation')
     account = next(a for a in config['accounts'] if a['name'] == account_name)
-    with (runtime / 'reset.lock').open('a+') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        episode = json.loads((runtime / f'{account_name}.json').read_text())['episode']
+    with reset_operation_lock(runtime, blocking=False):
+        check_account_custody(runtime / f'{account_name}.json')
+        state = json.loads((runtime / f'{account_name}.json').read_text())
+        episode = state['episode']
         if episode['id'] != episode_id:
             raise ValueError('episode_mismatch')
+        reset_evidence(runtime, state)
         path = runtime / f'reset-{episode_id}.json'
-        previous = json.loads(path.read_text()) if path.exists() else None
+        marker_path = runtime / f'reset-custody-{episode_id}.json'
+        absent = object()
+        marker = read_private(marker_path, absent)
+        present = path.exists()
+        previous = json.loads(path.read_text()) if present else None
+        if present and (not isinstance(previous, dict) or not previous):
+            raise ValueError('reset_reconciliation_required')
+        expected = {'episodeId': episode_id, 'accountId': account['accountId'],
+                    'idempotencyKey': episode['resetIdempotencyKey']}
+        if marker is not absent and (marker != expected or not isinstance(previous, dict) or not previous):
+            raise ValueError('reset_reconciliation_required')
+        if previous:
+            request_identity = previous.get('request') if isinstance(previous, dict) else None
+            if not isinstance(request_identity, dict) or any(request_identity.get(k) != v for k, v in expected.items()):
+                raise ValueError('reset_reconciliation_required')
+        if previous and marker is absent:
+            save(marker_path, expected)
         if previous and previous.get('status') in ('reset', 'already_redeemed', 'no_credit', 'nothing_to_reset'):
             return previous
         if previous and previous.get('status') in ('attempting', 'outcome_unknown', 'reconciliation_required'):
@@ -68,7 +88,7 @@ def execute(config, runtime, account_name, episode_id, confirmation):
             # uncertain consume automatically; make the reconciliation gate explicit.
             previous.setdefault('priorAttemptStatus', previous['status'])
             previous.update(status='reconciliation_required', reason='prior_reset_outcome_unconfirmed')
-            save(path, previous)
+            save_reset_transition(path, runtime / f'{account_name}.json', state, previous)
             raise ValueError('reset_reconciliation_required')
         if previous:
             raise ValueError('invalid_saved_reset_status')
@@ -76,7 +96,8 @@ def execute(config, runtime, account_name, episode_id, confirmation):
         inventory = read_account(account, mode='resets', node=config['nodeBinary'])
         request = prepare(account, episode, usage, inventory, confirmation, dt.datetime.now(dt.UTC).isoformat())
         record = {'request': request, 'status': 'attempting'}
-        save(path, record)
+        save(marker_path, expected)
+        save_reset_transition(path, runtime / f'{account_name}.json', state, record)
         try:
             result = subprocess.run([config['nodeBinary'], str(ROOT / 'consume_reset.mjs'), config['_configPath']],
                                     input=json.dumps(request), capture_output=True, text=True, timeout=55)
@@ -86,10 +107,19 @@ def execute(config, runtime, account_name, episode_id, confirmation):
             record.update(status=value['code'], response=value)
         except Exception:
             record['status'] = 'outcome_unknown'
-            save(path, record)
+            save_reset_transition(path, runtime / f'{account_name}.json', state, record)
             raise
-        save(path, record)
+        save_reset_transition(path, runtime / f'{account_name}.json', state, record)
         return record
+
+
+def save_reset_transition(path, account_path, state, record):
+    """Persist both sides; an interruption between them requires reconciliation."""
+    save(path, record)
+    state['resetEvidence'] = hashlib.sha256(json.dumps(record, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    state['resetEvidenceEpisode'] = state['episode']['id']
+    state['fallbackEvidenceValid'] = False
+    save_account(account_path, state)
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import {providerFetch} from './http.mjs';
 import {readCredentials} from './credentials.mjs';
 import {resetResult} from './reset_result.mjs';
+import {eligibleUsage, eligibleCredit} from './reset_eligibility.mjs';
 
 try {
   const request = JSON.parse(readFileSync(0, 'utf8'));
@@ -28,15 +29,10 @@ try {
   }
   const usage = await api('usage');
   if (usage.account_id !== request.accountId || usage.email !== request.email) throw new Error('response_identity_mismatch');
-  const exhausted = ['primary_window', 'secondary_window'].some(k => {
-    const used = usage.rate_limit?.[k]?.used_percent;
-    return typeof used === 'number' && Number.isFinite(used) && used >= 100;
-  });
-  if (!exhausted || !(usage.rate_limit_reset_credits?.applicable_available_count > 0)) throw new Error('not_eligible');
+  if (!eligibleUsage(usage)) throw new Error('not_eligible');
   const inventory = await api('rate-limit-reset-credits');
   const credit = inventory.credits?.find(c => c.id === request.creditId);
-  if (credit?.status !== 'available' || credit?.reset_type !== 'codex_rate_limits' || credit?.is_supported_by_plan !== true ||
-      (credit.expires_at && Date.parse(credit.expires_at) <= Date.now())) throw new Error('credit_not_available');
+  if (!eligibleCredit(credit, Date.now())) throw new Error('credit_not_available');
   const result = await api('rate-limit-reset-credits/consume', {
     method: 'POST', headers: {'content-type': 'application/json'},
     body: JSON.stringify({credit_id: request.creditId, redeem_request_id: request.idempotencyKey})

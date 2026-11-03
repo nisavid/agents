@@ -32,6 +32,26 @@ def decision_lock(state_dir):
         yield
 
 
+class ResetOperationBusy(BlockingIOError):
+    """Another operation owns the reset lock."""
+
+
+@contextmanager
+def reset_operation_lock(state_dir, *, blocking=True, create=True):
+    """Serialize Daybreak episode transitions with a confirmed reset attempt."""
+    root = private_directory(state_dir, create=False)
+    fd = os.open(root / 'reset.lock', (os.O_CREAT if create else 0) | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'r+') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('private_owned_reset_lock_required')
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as error:
+            raise ResetOperationBusy() from error
+        yield
+
+
 def delivery_status(config, state_dir):
     """Missing, malformed or obsolete activation is maintenance, never auto-arm."""
     try:

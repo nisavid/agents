@@ -16,7 +16,10 @@ The example's registration values are placeholders and cannot be used live.
 The config must be a user-owned file with mode `0600`, and state a user-owned
 directory with mode `0700`. State must live outside the release directory.
 `sharedLock` names the existing predecessor singleton lock; it must already exist
-and differ from the current state's `observer.lock`. Preserve both lock inodes.
+and differ from the current state's `observer.lock`. It must be a user-owned
+regular file with no group or other permissions, in a user-owned directory with
+no group or other permissions. Verify the existing lock and directory meet these
+requirements without replacing the lock. Preserve both lock inodes.
 Do not create a second state directory to get around a running watcher.
 
 The config stores the originating caller's thread, turn, and host, separately
@@ -27,18 +30,95 @@ authorization. MCP initialize does not supply fresh caller identity. Do not
 infer or manufacture an identity from thread listings, copy another owner's
 context, scrape a pipe from logs, or resume an owner into another app-server.
 
-From a reviewed staged release, run:
+With the observer stopped and reset activity quiescent, run from a reviewed
+staged release:
 
 ```sh
 python3 preflight.py --config "$private_config" --state-dir "$existing_state"
 python3 preflight.py --config "$private_config" --state-dir "$existing_state" --check-live
 ```
 
+Preflight takes the existing shared singleton lock exclusively, without creating
+or replacing it, and holds it through the local scan and optional live checks.
+A running observer, including maintenance or observe-only mode, causes
+`observer_stop_required_for_preflight`. It also takes the existing reset lock for
+the ledger scan and validates the main ledger and selector as one snapshot.
+Preflight never creates missing locks, custody markers, or ledger bindings.
+
 The live check requires a genuinely inherited `CODEX_APP_TOOLS_PIPE_PATH`. It
 reads both configured accounts and verifies exact Foreman and parent routes;
 it sends nothing and redeems nothing. Capture its output privately. A successful
 read is evidence only for that app generation and registration, not proof that
 a later pause will be acknowledged.
+
+## Hatchery adoption prerequisites
+
+The deployed installation is the user account on Hatchery. This source candidate
+has not inventoried its installed revision, unit state, private config, locks,
+ledgers, or caller registration. Those observations and any required migration
+are part of this delivery's deployment work. Source integration alone does not
+qualify that installation, and these instructions authorize no live action.
+
+Before cutover, record privately the installed revision and launcher target,
+unit active/enablement states, config binding, state directory, shared-lock inode,
+reset-lock presence, account/selector identities, all episode/reset keys, custody
+records, closed histories, and submitted or uncertain receipts. Do not collect
+credential contents into this record. Identify any in-flight reset invocation;
+complete or reconcile it before migration. Use a private offline copy to prepare
+and review the specific translation before applying it to the stopped original.
+Retain a byte inventory before and after migration and a verified operator
+reference approving the precise changes. Do not put these private records in Git.
+
+The supported direct handoff has an existing private shared lock, an existing
+private `reset.lock`, coherent main generation/selector state, structurally valid
+account ledgers, paired reset records/custody markers, and matching surviving
+reset digests. Markerless account ledgers are validated before the first normal
+write adds custody; this proves current shape, not earlier completeness.
+
+When the inventory shows older metadata, prepare the following offline adoption
+under the same approved stop. Hold the existing shared singleton lock and, after
+creation if required, the reset lock exclusively while applying it, with every
+observer and reset writer stopped:
+
+- If `reset.lock` is absent, explicitly approve creating that empty user-owned
+  `0600` file in the existing `0700` state directory. Create it exclusively; if a
+  lock appears meanwhile, stop and re-inventory. Never replace a surviving lock.
+  Preflight remains read-only and cannot perform this step.
+- If a main ledger has neither generation nor selector, validate its account and
+  email against retained identity evidence and the fresh server-validated default
+  identity. Bind a new UUID in `identityGeneration` and create
+  `main-selection.json` with the same `generation`, `accountId`, `email`, and fresh
+  `observedAt`, preserving the ledger's episode, reset key, and receipts. A
+  mismatch needs an explicit account-transition decision; do not erase the old
+  ledger or let an unqualified empty selector discard its active episode.
+  `main_selection_adoption_required` blocks preflight and runtime for an active
+  predecessor episode until this binding is complete.
+- For each reset record missing custody, verify its complete retained request
+  against its account/episode or closed history, including `episodeId`,
+  `accountId`, and `idempotencyKey`, and inspect its known or uncertain result.
+  Preserve the record and its status. The new `reset-custody-<episode>.json`
+  contains exactly those three identity fields. A surviving conflicting marker,
+  missing ledger, mismatched request, malformed delivery, or unexplained orphan
+  requires reconciliation, not a replacement or a retry.
+- Bind a validated active Daybreak record using the SHA-256 of its canonical JSON
+  (`sort_keys=True`, separators `(',', ':')`) as `resetEvidence`, with the episode
+  UUID in `resetEvidenceEpisode`; set `fallbackEvidenceValid` to `false` until a
+  new successful quota observation. Preserve or add the same digest to the
+  matching closed episode when adopting historical reset evidence. Never replace
+  an existing disagreeing digest. Do not invent a digest for a no-reset episode,
+  a missing record, or a missing history.
+- Retain a separate adoption receipt identifying the reviewed input bytes,
+  precise edits, operator reference, and the point at which custody begins.
+  Neither newly created metadata nor a successful preflight proves that evidence
+  was complete before adoption. Missing all copies and loss before this boundary
+  remain unknown; never describe them as verified history.
+
+No general legacy schema conversion is selected. If Hatchery's inventory does
+not fit these shapes, prepare the smallest installation-specific translation and
+its synthetic regression before applying it. The outstanding fact is the actual
+installed state, not whether a manual lifecycle or migration step is allowed in
+the deployment plan. Complete that migration and its verification before calling
+the Hatchery delivery complete.
 
 ## Controlled release handoff
 
@@ -48,10 +128,16 @@ a later pause will be acknowledged.
    dependencies before changing the live launcher. Publication and production
    installation require their own explicit approvals.
 2. Capture the current unit, code selection, config and state evidence privately.
+   Preserve account-custody and reset-custody records with the corresponding
+   account and reset ledgers. If surviving custody evidence conflicts with a
+   missing ledger, stop the affected account or reset and reconcile its history;
+   do not recreate records or retry a consume request to clear the error. Local
+   custody records cannot detect loss of every copy or loss before their adoption.
    Record open episode IDs, identity generations, reset keys, approval references,
    and delivery receipts. Backups are evidence; never restore them over later
-   actions. Run the new release's read-only preflight with the actual config and
-   state. Resolve failures before stopping the existing observer.
+   actions. Inspect paths and permissions before stopping; the coherent new-release
+   preflight runs after the stop. Prepare any required adoption from the inventory
+   above and obtain its exact approval as part of the deployment.
 3. Before an intentional stop or withheld activation on a maintenance-aware
    release, persist the hold using the command below. For the **first upgrade
    from an older release that ignores activation.json**, explicitly stop and
@@ -61,7 +147,10 @@ a later pause will be acknowledged.
    `codex-usage-safeguard.service`. Confirm it stopped. Materialize only the reviewed
    launcher, immutable release and unit selection; retain the same unit identity,
    private config, state paths and both locks. Install locked dependencies if they
-   were not already staged. Do not enable a parallel watcher.
+   were not already staged. Apply and verify the approved offline adoption, if
+   needed, preserving the original state and surviving lock inodes. Run local
+   preflight while stopped; a failure keeps the unit stopped and delivery held.
+   Do not enable a parallel watcher.
 4. Register the companion through the normal supported Codex MCP configuration:
 
    ```toml
@@ -75,12 +164,17 @@ a later pause will be acknowledged.
    it. Preserve all unrelated MCP settings. The app must load the new normal MCP
    entry; its startup publishes the route. A launch from a CLI without the app
    route is a no-op. Do not embed a socket path or caller identity in this block.
-5. Reload systemd and start the same unit in maintenance. Restore previous
-   enablement only within the approved deployment. Quota observation should be
-   fresh, with delivery held. After reviewing current episodes and obtaining the
-   explicit activation decision, run the activation command below; it repeats
-   exact live preflight and the running observer notices the transition.
-   Inspect `codex-quota-safeguard status`
+5. Reload systemd and start the same unit in maintenance. Inspect fresh quota
+   observations and preserved state while delivery is held. Then stop that same
+   unit again and confirm it stopped; maintenance alone does not release the
+   snapshot lock. From the still-authorized app caller with its genuinely
+   inherited route, review current episodes, obtain the explicit activation
+   decision, and run the activation command below while the observer is stopped.
+   It repeats the coherent local scan, live account reads, and exact destination
+   preflight. A failed activation leaves maintenance intact and the unit stopped.
+   After success, start the same unit and restore prior enablement only within
+   the approved deployment. Neither activation nor this restart releases
+   independent work holds or replays receipts. Inspect `codex-quota-safeguard status`
    and the journal. Require fresh samples for both accounts and transport health
    `healthy=true` with exact destination checks. Compare the preserved episode,
    reset and delivery fields; expect fresh observations, not identical whole-file
@@ -197,7 +291,8 @@ decision supersedes an older activation still running preflight. Keep
 both locks and all account/approval/delivery state. Observe the recorded
 maintenance mode before proceeding with a handoff.
 
-Activation writes maintenance first, then performs fresh read-only account and
+Activation requires the observer to be stopped. It writes maintenance first,
+then performs a locked local snapshot, fresh read-only account and
 exact-destination preflight, then binds the approved activation to this private
 configuration. A failed check leaves maintenance intact. Inspect existing
 pending episodes and uncertain receipts before activation; do not rewind or
@@ -264,3 +359,7 @@ that are null are not substitutes for that evidence. Keep API assumptions in the
 small adapters and fail visibly when they no longer hold. Account-wide debit
 estimates include other concurrent activity and can undercount when grants mask
 consumption; the configured $8 threshold leaves headroom, not a guarantee.
+
+## Incident routing candidate
+
+The proposed Dispatch and Concierge routing is activation-blocked in this source candidate. Its receipt contract, operator invocation, and separate native-qualification gates are described in `INCIDENT-RECEIPT-DRAFT.md`. Do not enable the candidate or replace the existing caller and runtime state on the strength of fixture tests or a submitted message.

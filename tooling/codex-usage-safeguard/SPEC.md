@@ -5,6 +5,12 @@ Daybreak profile. A normal MCP companion can renew its connection to the app.
 It owns no quota policy, never launches another observer, and exposes no action
 tools. Configuration and all runtime state remain private and outside releases.
 
+The operational contract below describes the installed legacy route. The
+Dispatch/Concierge routing candidate is described in `INCIDENT-RECEIPT-DRAFT.md`;
+its activation is explicitly blocked in this source until the candidate and
+concrete handover are ready. The candidate does not change reset, account,
+episode, caller, singleton, or release authority.
+
 ## Quota and account policy
 
 - Main follows the credentials at the user's default `.codex/auth.json`, ignoring
@@ -99,6 +105,13 @@ A send already in flight may finish before the maintenance command returns; stop
 
 ## Acceptance and installation
 
+Account custody records and reset-attempt custody records provide separate
+evidence of initialized ledgers and started attempts. When surviving evidence
+shows a required account or reset record is missing or inconsistent, defer that
+account or reset for reconciliation; do not recreate the missing record or
+repeat a consume request. Loss of all evidence, or loss predating custody-record
+adoption, cannot be detected by these local records alone.
+
 Tests use fixture accounts, subprocesses, and sockets. No real reset or pause is
 an acceptance test. Required evidence covers quota/account boundaries, durable
 receipts, concurrent publication, missing/stale routes, exact targets, rejected
@@ -111,3 +124,23 @@ in `nisavid/dotfiles`. Keep the same systemd identity and both existing singleto
 locks. Upgrade/rollback changes code, never restores a prior ledger. Publication,
 release selection, production MCP registration, and activation remain explicit
 deployment gates; committing this package does not authorize them.
+
+
+## Coherent release snapshot
+
+Release preflight acquires the existing predecessor singleton lock exclusively
+and nonblockingly through both its local ledger scan and optional live checks.
+The observer holds that same lock in every mode, so preflight and activation
+require a stopped observer. Maintenance alone does not provide this boundary.
+The existing reset lock protects the reset-ledger scan. Main ledger generation,
+account, and email must agree with the persisted selector whenever either side
+of the generation binding exists; an incomplete transition needs reconciliation.
+An active predecessor main episode with neither binding requires explicit offline
+identity adoption before preflight or runtime can select a new generation. Its
+receipts and reset key must remain attached to the same episode.
+
+For the Hatchery user installation, offline inventory, any approved metadata
+adoption, coherent preflight, stopped-observer activation, and restart verification
+are part of deployment. `OPERATING.md` defines that sequence. Preflight never
+creates migration metadata. New custody records establish an adoption boundary;
+they do not prove completeness before adoption or recover missing receipts.

@@ -88,6 +88,13 @@ class GuardTests(unittest.TestCase):
         state, events = advance(state, sample(100), ACCOUNT, now=70, policy=policy)
         self.assertEqual(events[-1]['reason'], 'unmetered_confirmation_wait')
 
+    def test_clock_rollback_treats_meter_as_a_sampling_gap(self):
+        policy = {'usdPerCredit': '0.04', 'pauseWhenUnmetered': True}
+        state, _ = advance({}, sample(100), ACCOUNT, now=100, policy=policy)
+        state, events = advance(state, sample(100), ACCOUNT, now=90, policy=policy)
+        self.assertEqual(state['episode']['budgetStatus'], 'observed_debits_across_sampling_gap')
+        self.assertEqual([e['reason'] for e in events], ['unmetered_confirmation_wait'])
+
     def test_meter_recovers_observed_debits_across_a_read_outage(self):
         policy = {'usdPerCredit': '0.04', 'pauseWhenUnmetered': False}
         state, _ = advance({}, sample(100), ACCOUNT, now=10, policy=policy)
@@ -122,6 +129,15 @@ class GuardTests(unittest.TestCase):
         state, _ = advance({}, sample(100), ACCOUNT, now=10)
         state, events = observation_failed(state, {'pauseWhenUnmetered': True})
         self.assertEqual(events[0]['reason'], 'observation_failed_during_confirmed_exhaustion')
+
+    def test_outage_does_not_create_fallback_after_restored_or_unknown_sample(self):
+        for value in (0, None):
+            with self.subTest(used=value):
+                state, _ = advance({}, sample(100), ACCOUNT, now=10)
+                state, _ = advance(state, sample(value), ACCOUNT, now=20)
+                state, events = observation_failed(state, {'pauseWhenUnmetered': True})
+                self.assertEqual(events, [])
+                self.assertTrue(state['episode']['active'])
 
     def test_losing_applicable_resets_during_wait_requests_pause(self):
         policy = {'usdPerCredit': '0.04'}

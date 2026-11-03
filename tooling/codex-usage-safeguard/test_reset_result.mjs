@@ -14,3 +14,11 @@ test('recognized outcomes preserve the existing credit and omit unrelated fields
       {code, creditId: 'same-credit', observedAt: 'now'});
   }
 });
+
+test('a mismatched or malformed supplied credit cannot become a terminal result', () => {
+  for (const id of ['other-credit', null, 7, '']) {
+    assert.throws(() => resetResult({code: 'reset', credit: {id}}, 'same-credit', 'now'), /credit_identity_mismatch/);
+  }
+  assert.deepEqual(resetResult({code: 'reset', credit: {id: 'same-credit'}}, 'same-credit', 'now'),
+    {code: 'reset', creditId: 'same-credit', observedAt: 'now'});
+});

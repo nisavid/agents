@@ -1243,6 +1243,59 @@ class RuntimeTests(unittest.TestCase):
                     self.assertFalse(unknown_event.get('deliveries'))
                 self.assertEqual(retained['lastSample'], zero)
 
+    def test_failed_main_poll_preserves_incoherent_retained_identity_without_fallback_sends(self):
+        for retained_pause in (False, True):
+            for changed in ('generation', 'accountId', 'email', 'missing_generation',
+                            'sample_accountId', 'sample_email'):
+                for custody_present in (False, True):
+                    with self.subTest(retained_pause=retained_pause, changed=changed,
+                                      custody_present=custody_present), tempfile.TemporaryDirectory() as name:
+                        root = Path(name); config = self.config(root); pinned = config['accounts'][1]
+                        config['policy'].update(pauseWhenUnmetered=True,
+                            fallbackDecision='pause_at_zero_when_unmetered', fallbackDecisionReference='fixture-approval')
+                        save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
+                                                       'reference': 'fixture-approval'})
+                        state, _ = advance({}, sample(100), ACCOUNT, now=10, policy=config['policy'])
+                        state['identityGeneration'] = 'fixture-generation'
+                        state['episode']['events'][0]['deliveries'] = {
+                            'parent': {'status': 'outcome_unknown', 'target': config['parentThreadId'], 'at': 11}}
+                        if retained_pause:
+                            state, _ = observation_failed(state, config['policy'])
+                            self.assertEqual(state['episode']['events'][-1]['reason'],
+                                             'observation_failed_during_confirmed_exhaustion')
+                            self.assertFalse(state['episode']['events'][-1].get('deliveries'))
+                        if changed == 'generation':
+                            state['identityGeneration'] = 'different-generation'
+                        elif changed == 'missing_generation':
+                            del state['identityGeneration']
+                        elif changed.startswith('sample_'):
+                            state['lastSample'][changed.removeprefix('sample_')] = 'different'
+                        else:
+                            state['episode'][changed] = 'different'
+                            state['lastSample'][changed] = 'different'
+                            if changed == 'accountId':
+                                state['accountId'] = 'different'
+                        save(root / 'main.json', state)
+                        save(root / 'main-selection.json', {'generation': 'fixture-generation',
+                             'accountId': ACCOUNT['accountId'], 'email': ACCOUNT['email'],
+                             'observedAt': sample(100)['observedAt']})
+                        if custody_present:
+                            save(root / 'account-custody-main.json', {'account': 'main', 'initialized': True})
+                        evidence_paths = ('main.json', 'main-selection.json', 'account-custody-main.json')
+                        before = {path: (root / path).read_bytes() for path in evidence_paths if (root / path).exists()}
+                        bridge = ReceiptTransport(root / 'main.json')
+                        def failed_main(account, **kwargs):
+                            if account['name'] == 'main': raise RuntimeError('fixture_quota_read_failed')
+                            value = sample(0); value.update({k: pinned[k] for k in ('email', 'accountId')})
+                            return value
+                        for _ in range(2):
+                            health = self.fixture_poll(root, config, failed_main, bridge, now=20)
+                            self.assertEqual(health['accounts']['main']['observationStatus'], 'unavailable')
+                            self.assertEqual({path: (root / path).read_bytes() for path in evidence_paths
+                                              if (root / path).exists()}, before)
+                            self.assertFalse((root / 'account-history').exists())
+                            self.assertEqual(bridge.received, [])
+
     def test_failed_poll_fallback_preserves_main_receipts_and_generation_across_restart(self):
         for receipt_status in ('submitted', 'attempting', 'outcome_unknown'):
             with self.subTest(receipt_status=receipt_status), tempfile.TemporaryDirectory() as name:

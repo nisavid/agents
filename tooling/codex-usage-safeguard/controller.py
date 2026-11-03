@@ -174,7 +174,6 @@ def check_main_selection(root, state=None):
     sample = old.get('lastSample') or {}
     if not isinstance(episode, dict) or not isinstance(sample, dict):
         raise ValueError('main_selection_state_mismatch')
-    old_email = episode.get('email') or sample.get('email')
     if not present and not old.get('identityGeneration') and episode.get('active'):
         raise ValueError('main_selection_adoption_required')
     # A predecessor with neither generation nor selector can be adopted. Once
@@ -184,7 +183,8 @@ def check_main_selection(root, state=None):
                 or selected.get('generation') != old['identityGeneration']
                 or selected.get('accountId') != old.get('accountId')
                 or not isinstance(selected.get('email'), str) or not selected['email']
-                or (old_email is not None and selected['email'] != old_email)):
+                or (episode.get('email') is not None and selected['email'] != episode['email'])
+                or (sample and any(sample.get(key) != selected.get(key) for key in ('accountId', 'email')))):
             raise ValueError('main_selection_state_mismatch')
     return old, selected
 
@@ -675,7 +675,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                         if name == 'daybreak' and retained.get('resetEvidence') != reset_evidence(state_dir, retained):
                                             continue
                                         if configured.get('dynamicDefault'):
-                                            selected = json.loads((state_dir / 'main-selection.json').read_text())
+                                            _, selected = check_main_selection(state_dir, retained)
                                             if default_identity() != {'email': selected['email'], 'accountId': selected['accountId']}:
                                                 continue
                                             account = {**configured, 'email': selected['email'], 'accountId': selected['accountId'],

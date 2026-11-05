@@ -148,6 +148,21 @@ class RoutingReadinessTests(unittest.TestCase):
         self.assertEqual(read_private(self.root / 'activation.json')['routingReadiness'], evidence_digest(self.packet))
         self.assertTrue({'dispatch', 'parent', 'concierge', 'owner'} <= set(self.native.calls))
 
+    def test_activation_accepts_private_receipt_store_outside_state_directory(self):
+        with tempfile.TemporaryDirectory() as external:
+            store = Path(external) / 'receipts.json'
+            self.assertFalse(store.is_relative_to(self.root))
+            original = Path(self.config['incidentReceiptStore']).read_bytes()
+            store.write_bytes(original)
+            os.chmod(store, 0o600)
+            self.config['incidentReceiptStore'] = str(store)
+            self.packet['configurationBinding'] = configuration_binding(self.config)
+            save(self.root / 'routing-readiness.json', self.packet)
+            self.assertEqual(self.activate()['mode'], 'active')
+            self.assertEqual(delivery_status(copy.deepcopy(self.config), self.root)['mode'], 'active')
+            self.assertEqual(store.read_bytes(), original)
+            self.assertTrue({'dispatch', 'parent', 'concierge', 'owner'} <= set(self.native.calls))
+
     def test_oversized_qualification_inhibits_delivery(self):
         self.activate()
         (self.root / 'routing-readiness.json').write_bytes(b'x' * (256 * 1024 + 1))

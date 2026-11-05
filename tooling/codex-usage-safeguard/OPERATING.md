@@ -1,7 +1,7 @@
 # Operate the quota safeguard
 
-Keep one observer, the existing private state, and the verified Codex Foreman as
-the sole pause coordinator. Use this procedure for a release handoff, connection
+Keep one observer and the existing private state. Use the qualified coordinator:
+Dispatch for the new route or Foreman for the legacy route. Use this procedure for a release handoff, connection
 incident, pending reset, or uncertain delivery. [SPEC.md](SPEC.md) owns the policy.
 
 ## Configure and preflight
@@ -360,6 +360,107 @@ small adapters and fail visibly when they no longer hold. Account-wide debit
 estimates include other concurrent activity and can undercount when grants mask
 consumption; the configured $8 threshold leaves headroom, not a guarantee.
 
-## Incident routing candidate
+## Qualify Dispatch and Concierge routing
 
-The proposed Dispatch and Concierge routing is activation-blocked in this source candidate. Its receipt contract, operator invocation, and separate native-qualification gates are described in `INCIDENT-RECEIPT-DRAFT.md`. Do not enable the candidate or replace the existing caller and runtime state on the strength of fixture tests or a submitted message.
+The new route sends quota-control requests to the accepted Dispatch and fault
+incidents to Concierge. The repair owner accepts incidents and records their
+continuation. Keep the existing caller, account pins, episode and receipt
+history, and independent holds. This procedure qualifies a selected release and
+configuration; it does not itself approve installation, sends, or activation.
+
+With the observer stopped, delivery held, and reset writers quiescent, set
+`incidentRoutingEnabled` to boolean `true` before collecting configuration
+bindings. Configure the accepted
+Dispatch ID as `foremanThreadId`, the Concierge ID as `conciergeThreadId`, the
+existing parent ID and `parentHostId`, the private `incidentReceiptStore`, and
+`roleBindings` for `foreman` (role `dispatch`), `concierge`, and `repairOwner`.
+Each binding names its accepted thread, host, role, and acceptance reference.
+Preserve the genuinely enrolled `nativeContext`; these fields do not themselves
+prove caller access or recipient acceptance.
+
+From the selected release, run the local check. Add `--check-live` only from the
+genuine app caller with its inherited route and authorization to read the two
+accounts and exact recipients:
+
+```sh
+python3 preflight.py --config "$private_config" --state-dir "$existing_state" --qualify-routing
+python3 preflight.py --config "$private_config" --state-dir "$existing_state" --qualify-routing --check-live
+```
+
+Retain the reported `configurationBinding` and `sourceBinding` privately. The
+live variant checks configured host/thread/role bindings but sends nothing.
+Neither command activates delivery or establishes a received incident.
+
+Prepare a separately authorized harmless native qualification naming the actual
+caller and recipients, exact payloads, incident/attempt identities, selected
+private store and permitted operations. Establish Dispatch submission and its
+correlated assistant receipt; establish Concierge submission, receipt, repair
+owner acceptance, and a recoverable continuation. Confirm the actual writer and
+consumer can commit, reopen and recover the same journal, and qualify writer
+serialization. Use the journal and readback methods in
+[INCIDENT-RECEIPT-DRAFT.md](INCIDENT-RECEIPT-DRAFT.md). An uncertain send stays
+uncertain; reconcile it by its original identity rather than sending again.
+
+Retain private JSON witnesses in `routing-evidence/` beneath the state directory,
+named `caller-provenance`, `recipient-acceptance`, `writer-commit`,
+`writer-restart`, `consumer-restart`, and `serialization`, each with a `.json`
+extension. Each must record the actual source/configuration, actors, operations,
+observations and evidence references for review. The program verifies private
+file properties and witness content digests; it cannot authenticate the operator
+or infer that a witness describes an observed event. Each witness is limited to
+64 KiB, and the packet below to 256 KiB.
+
+Construct private `routing-readiness.json` with exactly these fields:
+
+- `version`: integer `1`.
+- `configurationBinding` and `sourceBinding`: the final preflight bindings.
+- `parentHost`: the configured, verified `parentHostId`.
+- `dispatch`: `identity`, `attempt`, `submission` (`host`, `turn`, `message`),
+  and the Dispatch assistant `receipt` (`turn`, `message`). Identity and
+  attempt use the incident correlation fields in `INCIDENT-RECEIPT-DRAFT.md`.
+- `conciergeIncident`: the selected incident ID already in the retained outbox.
+- `conciergeRecordDigest`: canonical digest of that incident's raw journal record.
+- `artifacts`: the six witness names mapped to their canonical JSON digests.
+
+Canonical digests are SHA-256 over sorted, compact JSON with ASCII escaping and
+nonfinite values rejected, as implemented by `activation.evidence_digest`.
+Both packet and witnesses must be user-owned private regular files beneath a
+private directory. Review their contents and the actual native and store evidence;
+a digest binds content but does not authenticate an attestation.
+
+With the same stopped observer and genuinely inherited route, run the full
+read-only check after preparing the packet:
+
+```sh
+python3 preflight.py --config "$private_config" --state-dir "$existing_state" --check-live
+python3 reconcile_incident.py --config "$private_config" --state-dir "$existing_state" --incident "$qualification_incident"
+```
+
+The first reports `routingReadiness` only after the configured recipients and
+correlated native evidence pass; the second reports the retained incident's
+reconciliation stage without sending. Verify the designated consumers can load
+the same reviewed release and reopen the same journal. A separately reviewed
+activation decision must select the reported packet digest:
+
+```sh
+python3 activation.py --config "$private_config" --state-dir "$existing_state" \
+  --mode active --reference "$verified_activation_decision" \
+  --qualification-sha256 "$reviewed_qualification_sha256"
+```
+
+Activation enters maintenance first, rechecks the real qualification, and commits
+the decision only if the source, configuration and packet remain bound and no
+newer maintenance decision supersedes it. Missing, malformed, changed or
+oversized qualification inhibits delivery. The running guard reads the bounded
+selected packet and witnesses; unrelated live journal growth does not revoke
+that historical qualification. Live incident faults and uncertain sends remain
+subject to their separate handling and must not be silently retried. Requalify
+when the selected source, caller, configuration, bindings or evidence change.
+
+The emergency alert threshold is 95% used for failed intake with active work.
+An uncertain submission or a receipt check attempted without a confirmed receipt
+also counts as failed for this alert when quota or activity is unknown. A known
+unsent incident alone does not qualify for that exception. A matched receipt
+remains matched while owner acceptance or continuation is pending. The observer
+currently reports activity as unknown; it uses fresh quota samples when available.
+An alert does not authorize a resend, reset, account switch or hold release.

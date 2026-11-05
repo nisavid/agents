@@ -234,6 +234,18 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(delivery_status(config, root)['mode'], 'maintenance')
             self.assertEqual((root / 'main.json').read_bytes(), before)
 
+    def test_routing_digest_or_callback_cannot_replace_qualification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            config['incidentRoutingEnabled'] = True
+            for callback in (None, lambda *args, **kwargs: None):
+                with self.subTest(callback=callback):
+                    with self.assertRaisesRegex(ValueError, 'routing_requires_real_preflight' if callback else 'incident_routing_not_ready'):
+                        set_mode(config, root, 'active', 'fixture-decision',
+                                 live_preflight=callback, qualification_digest='0' * 64)
+                    self.assertEqual(delivery_status(config, root)['mode'], 'maintenance')
+
     def test_changed_configuration_and_malformed_record_cannot_implicitly_activate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); config = self.config(root)

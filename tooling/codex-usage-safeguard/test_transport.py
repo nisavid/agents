@@ -33,7 +33,8 @@ class FixtureBridge:
         if mode == 'deny':
             raise RuntimeError('fixture_authorization_rejected')
         target = arguments['threadId']
-        return {'thread': {'id': 'wrong' if mode == 'wrong' else target, 'hostId': 'local',
+        return {'thread': {'id': 'wrong' if mode == 'wrong' else target,
+                           'hostId': 'wrong-host' if mode == 'wrong-host' else 'local',
                            'title': ('Renamed' if mode == 'renamed' else
                                      'Codex Foreman' if target == 'fixture-foreman' else 'Parent')}}
 
@@ -510,6 +511,20 @@ class TransportTests(TransportFixture):
         self.assertEqual(record['status'], 'outcome_unknown')
         transport.close()
 
+    def test_parent_host_is_rechecked_without_disabling_other_recipient(self):
+        config = {**CONFIG, 'parentHostId': 'local'}
+        pipe = self.route('parent.sock')
+        self.publish(pipe, config)
+        manager = self.manager(config)
+        manager.connection()
+        self.assertIsNotNone(manager.for_recipient('parent'))
+        self.registry[pipe] = {'fixture-parent': 'wrong-host'}
+        self.now += 61
+        manager.connection()
+        self.assertIsNone(manager.for_recipient('parent'))
+        self.assertIsNotNone(manager.for_recipient('foreman'))
+        manager.close()
+
     def test_emergency_notice_requires_failed_intake_and_urgent_or_unknown_context(self):
         transport = self.manager()
         self.assertFalse(transport.emergency_notice(intake_failed=False, active=True, used_percent=100))
@@ -518,9 +533,10 @@ class TransportTests(TransportFixture):
         self.assertTrue(transport.emergency_notice(intake_failed=True, active=True, used_percent=95))
         self.assertFalse(transport.emergency_notice(intake_failed=True, active=True, used_percent=95))
         self.now += 3601
-        self.assertTrue(transport.emergency_notice(intake_failed=True, active=None, used_percent=50))
+        self.assertFalse(transport.emergency_notice(intake_failed=True, active=None, used_percent=50))
+        self.assertTrue(transport.emergency_notice(intake_failed=True, active=None, used_percent=50, uncertain=True))
         self.now += 3601
-        self.assertTrue(transport.emergency_notice(intake_failed=True, active=False, used_percent=None))
+        self.assertTrue(transport.emergency_notice(intake_failed=True, active=False, used_percent=None, uncertain=True))
         self.assertEqual(len(self.alerts), 3)
 
     def test_incident_recipient_remains_available_when_dispatch_fails(self):

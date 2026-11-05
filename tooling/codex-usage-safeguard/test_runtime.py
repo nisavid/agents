@@ -469,7 +469,8 @@ class RuntimeTests(unittest.TestCase):
             class FixtureTransport(RealTransport):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs, notifier=notify, clock=lambda: state['clock'])
-                    self.intake_status = 'submitted'; self.closed = False; instances.append(self)
+                    self.intake_status = 'submitted'; self.intake_uncertain = True
+                    self.closed = False; instances.append(self)
                 def connection(self): self.health = {'healthy': True}; return self
                 def observation_recovered(self, _name): pass
                 def reconcile_pending(self): pass
@@ -610,7 +611,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name); config = self.config(root); config['incidentRoutingEnabled'] = True
             save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
-                                            'reference': 'fixture-approval'})
+                                            'reference': 'fixture-approval', 'routingReadiness': 'fixture-component-readiness'})
             pinned = config['accounts'][1]; entered = Event(); release = Event(); held = Event()
             def read(account, **kwargs):
                 value = sample(28)
@@ -621,7 +622,8 @@ class RuntimeTests(unittest.TestCase):
                 if not release.wait(5): raise RuntimeError('fixture-timeout')
             def maintenance():
                 with decision_lock(root): held.set()
-            with patch('controller.validate_config'), patch('controller.read_account', side_effect=read), \
+            with patch('controller.validate_config'), \
+                 patch('activation.routing_readiness', return_value='fixture-component-readiness'), patch('controller.read_account', side_effect=read), \
                  patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
                  patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True), \
                  ThreadPoolExecutor(max_workers=2) as executor:
@@ -662,41 +664,99 @@ class RuntimeTests(unittest.TestCase):
             config = self.config(root)
             config['incidentRoutingEnabled'] = True
             save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
-                                            'reference': 'fixture-approval'})
+                                            'reference': 'fixture-approval', 'routingReadiness': 'fixture-component-readiness'})
             pinned = config['accounts'][1]
             def read(account, **kwargs):
                 value = sample(95)
                 if account['name'] == 'daybreak':
                     value.update(email=pinned['email'], accountId=pinned['accountId'])
                 return value
-            with patch('controller.validate_config'), patch('controller.read_account', side_effect=read), \
+            with patch('controller.validate_config'), \
+                 patch('activation.routing_readiness', return_value='fixture-component-readiness'), patch('controller.read_account', side_effect=read), \
                  patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
                  patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True):
                 transport.return_value.intake_status = 'outcome_unknown'
                 transport.return_value.connection.return_value = transport.return_value
+                transport.return_value.intake_uncertain = True
                 run(config, root, once=True)
                 transport.return_value.emergency_notice.assert_called_once_with(
-                    intake_failed=True, active=None, used_percent=95)
+                    intake_failed=True, active=None, used_percent=95, uncertain=True)
 
-    def test_new_routing_preflight_checks_dispatch_concierge_and_owner(self):
+    def test_new_routing_can_be_qualified_without_arming_delivery(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             config = self.config(root)
-            config.update(incidentRoutingEnabled=True, conciergeThreadId='concierge', roleBindings={
+            config.update(incidentRoutingEnabled=True, conciergeThreadId='concierge',
+                          parentHostId='local', incidentReceiptStore=str(root / 'receipts.json'), roleBindings={
                 'foreman': {'thread_id': config['foremanThreadId'], 'host_id': 'local',
                             'role': 'dispatch', 'acceptance_ref': 'fixture'},
                 'concierge': {'thread_id': 'concierge', 'host_id': 'local',
                               'role': 'concierge', 'acceptance_ref': 'fixture'},
                 'repairOwner': {'thread_id': 'owner', 'host_id': 'local',
                                 'role': 'repair_owner', 'acceptance_ref': 'fixture'}})
-            with patch('preflight.validate_config'), patch('preflight.read_account'), \
-                 patch('preflight.socket_identity'), patch('preflight.NativeBridge') as factory, \
-                 patch('preflight.verify_bridge') as verify, patch.dict(os.environ, {'CODEX_APP_TOOLS_PIPE_PATH': '/fixture'}):
-                preflight(config, root, check_live=True)
-                verify.assert_called_once_with(factory.return_value, config['foremanThreadId'], config['parentThreadId'],
-                                               dispatch_binding=config['roleBindings']['foreman'], concierge='concierge',
-                                               concierge_binding=config['roleBindings']['concierge'],
-                                               owner_binding=config['roleBindings']['repairOwner'])
+            save(root / 'activation.json', {'mode': 'maintenance', 'reference': 'fixture'})
+            before = (root / 'activation.json').read_bytes()
+            report = preflight(config, root, qualify_routing=True)
+            self.assertEqual(report['status'], 'local_checks_passed')
+            self.assertEqual(report['liveChecks'], 'not_requested')
+            self.assertRegex(report['configurationBinding'], r'^[0-9a-f]{64}$')
+            self.assertRegex(report['sourceBinding'], r'^[0-9a-f]{64}$')
+            self.assertEqual((root / 'activation.json').read_bytes(), before)
+            self.assertFalse((root / 'receipts.json').exists())
+
+    def test_routing_qualification_rejects_parent_on_wrong_host(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config = self.config(root)
+            config.update(incidentRoutingEnabled=True, conciergeThreadId='concierge',
+                          parentHostId='local', incidentReceiptStore=str(root / 'receipts.json'),
+                          roleBindings={
+                'foreman': {'thread_id': config['foremanThreadId'], 'host_id': 'local',
+                            'role': 'dispatch', 'acceptance_ref': 'fixture'},
+                'concierge': {'thread_id': 'concierge', 'host_id': 'local',
+                              'role': 'concierge', 'acceptance_ref': 'fixture'},
+                'repairOwner': {'thread_id': 'owner', 'host_id': 'local',
+                                'role': 'repair_owner', 'acceptance_ref': 'fixture'}})
+            save(root / 'activation.json', {'mode': 'maintenance', 'reference': 'fixture'})
+            before = (root / 'activation.json').read_bytes()
+            def read_thread(tool, args):
+                target = args['threadId']
+                host = 'wrong-host' if target == config['parentThreadId'] else 'local'
+                return {'thread': {'id': target, 'hostId': host}}
+            with patch('preflight.read_account'), patch('preflight.socket_identity'), \
+                 patch('preflight.NativeBridge') as factory, \
+                 patch.dict(os.environ, {'CODEX_APP_TOOLS_PIPE_PATH': '/fixture'}):
+                factory.return_value.call.side_effect = read_thread
+                with self.assertRaisesRegex(RuntimeError, 'native_route_identity_mismatch'):
+                    preflight(config, root, check_live=True, qualify_routing=True)
+                factory.return_value.call.side_effect = lambda tool, args: {
+                    'thread': {'id': args['threadId'], 'hostId': 'local'}}
+                report = preflight(config, root, check_live=True, qualify_routing=True)
+                self.assertEqual(report['liveChecks'], 'accounts_and_bound_recipients_readable')
+            self.assertEqual((root / 'activation.json').read_bytes(), before)
+
+    def test_new_routing_preflight_checks_dispatch_concierge_and_owner(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config = self.config(root)
+            config.update(incidentRoutingEnabled=True, conciergeThreadId='concierge',
+                          parentHostId='local', incidentReceiptStore=str(root / 'receipts.json'), roleBindings={
+                'foreman': {'thread_id': config['foremanThreadId'], 'host_id': 'local',
+                            'role': 'dispatch', 'acceptance_ref': 'fixture'},
+                'concierge': {'thread_id': 'concierge', 'host_id': 'local',
+                              'role': 'concierge', 'acceptance_ref': 'fixture'},
+                'repairOwner': {'thread_id': 'owner', 'host_id': 'local',
+                                'role': 'repair_owner', 'acceptance_ref': 'fixture'}})
+            with patch('preflight.read_account'), patch('preflight.socket_identity'), \
+                 patch('preflight.NativeBridge') as factory, \
+                 patch.dict(os.environ, {'CODEX_APP_TOOLS_PIPE_PATH': '/fixture'}):
+                factory.return_value.call.side_effect = lambda tool, args: {
+                    'thread': {'id': args['threadId'], 'hostId': 'local'}}
+                report = preflight(config, root, check_live=True, qualify_routing=True)
+                self.assertEqual(report['liveChecks'], 'accounts_and_bound_recipients_readable')
+                targets = {call.args[1]['threadId'] for call in factory.return_value.call.call_args_list}
+                self.assertEqual(targets, {config['foremanThreadId'], config['parentThreadId'], 'concierge', 'owner'})
+                factory.return_value.send.assert_not_called()
 
     def test_observation_fault_reaches_agent_intake_without_stopping_other_reads(self):
         with tempfile.TemporaryDirectory() as name:
@@ -704,7 +764,7 @@ class RuntimeTests(unittest.TestCase):
             config = self.config(root)
             config['incidentRoutingEnabled'] = True
             save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
-                                            'reference': 'fixture-approval'})
+                                            'reference': 'fixture-approval', 'routingReadiness': 'fixture-component-readiness'})
             pinned = config['accounts'][1]
             def read(account, **kwargs):
                 if account['name'] == 'main':
@@ -712,7 +772,8 @@ class RuntimeTests(unittest.TestCase):
                 value = sample(28)
                 value.update(email=pinned['email'], accountId=pinned['accountId'])
                 return value
-            with patch('controller.validate_config'), patch('controller.read_account', side_effect=read), \
+            with patch('controller.validate_config'), \
+                 patch('activation.routing_readiness', return_value='fixture-component-readiness'), patch('controller.read_account', side_effect=read), \
                  patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
                  patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True):
                 transport.return_value.intake_status = 'submitted'
@@ -727,45 +788,50 @@ class RuntimeTests(unittest.TestCase):
             root = Path(name); config = self.config(root)
             config['incidentRoutingEnabled'] = True
             save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
-                                            'reference': 'fixture-approval'})
+                                            'reference': 'fixture-approval', 'routingReadiness': 'fixture-component-readiness'})
             pinned = config['accounts'][1]
             def read(account, **kwargs):
                 if account['name'] == 'main': raise RuntimeError('fixture-read-failure')
                 value = sample(28); value.update(email=pinned['email'], accountId=pinned['accountId'])
                 return value
-            with patch('controller.validate_config'), patch('controller.read_account', side_effect=read), \
+            with patch('controller.validate_config'), \
+                 patch('activation.routing_readiness', return_value='fixture-component-readiness'), patch('controller.read_account', side_effect=read), \
                  patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
                  patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True):
                 transport.return_value.intake_status = 'not_needed'
+                transport.return_value.intake_uncertain = False
                 transport.return_value.observation_failed.side_effect = OSError('fixture-journal-failure')
                 transport.return_value.connection.return_value = transport.return_value
                 health = run(config, root, once=True)
                 self.assertEqual(health['accounts']['daybreak']['observationStatus'], 'healthy')
                 transport.return_value.emergency_notice.assert_called_once_with(
-                    intake_failed=True, active=None, used_percent=None)
+                    intake_failed=True, active=None, used_percent=None, uncertain=False)
 
     def test_failed_transport_incident_registration_triggers_alert_after_reconciliation(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name); config = self.config(root)
             config['incidentRoutingEnabled'] = True
             save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
-                                            'reference': 'fixture-approval'})
+                                            'reference': 'fixture-approval', 'routingReadiness': 'fixture-component-readiness'})
             pinned = config['accounts'][1]
             def read(account, **kwargs):
                 value = sample(95)
                 if account['name'] == 'daybreak':
                     value.update(email=pinned['email'], accountId=pinned['accountId'])
                 return value
-            with patch('controller.validate_config'), patch('controller.read_account', side_effect=read), \
+            with patch('controller.validate_config'), \
+                 patch('activation.routing_readiness', return_value='fixture-component-readiness'), patch('controller.read_account', side_effect=read), \
                  patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
                  patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True):
                 instance = transport.return_value
                 instance.intake_status = 'not_needed'
+                instance.intake_uncertain = False
                 instance.incident_registration_failed = True
                 instance.connection.side_effect = OSError('fixture-transport-health-write')
                 health = run(config, root, once=True)
                 self.assertEqual(health['accounts']['daybreak']['observationStatus'], 'healthy')
-                instance.emergency_notice.assert_called_once_with(intake_failed=True, active=None, used_percent=95)
+                instance.emergency_notice.assert_called_once_with(intake_failed=True, active=None, used_percent=95,
+                                                                  uncertain=False)
 
     def test_failed_intake_uses_fresh_quota_and_unknown_activity_for_alert(self):
         with tempfile.TemporaryDirectory() as name:
@@ -773,21 +839,23 @@ class RuntimeTests(unittest.TestCase):
             config = self.config(root)
             config['incidentRoutingEnabled'] = True
             save(root / 'activation.json', {'mode': 'active', 'binding': configuration_binding(config),
-                                            'reference': 'fixture-approval'})
+                                            'reference': 'fixture-approval', 'routingReadiness': 'fixture-component-readiness'})
             pinned = config['accounts'][1]
             def read(account, **kwargs):
                 value = sample(28)
                 if account['name'] == 'daybreak':
                     value.update(email=pinned['email'], accountId=pinned['accountId'])
                 return value
-            with patch('controller.validate_config'), patch('controller.read_account', side_effect=read), \
+            with patch('controller.validate_config'), \
+                 patch('activation.routing_readiness', return_value='fixture-component-readiness'), patch('controller.read_account', side_effect=read), \
                  patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('email', 'accountId')}), \
                  patch('controller.Transport') as transport, patch.dict(os.environ, {}, clear=True):
                 transport.return_value.intake_status = 'waiting_for_route'
+                transport.return_value.intake_uncertain = False
                 transport.return_value.connection.return_value = transport.return_value
                 run(config, root, once=True)
                 transport.return_value.emergency_notice.assert_called_once_with(
-                    intake_failed=True, active=None, used_percent=28)
+                    intake_failed=True, active=None, used_percent=28, uncertain=False)
 
     def test_main_receipt_reconciliation_does_not_starve_daybreak_delivery(self):
         with tempfile.TemporaryDirectory() as name:

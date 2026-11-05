@@ -149,7 +149,8 @@ class _Destination:
         candidate = self.factory(self.config, route)
         try:
             verify_destination(candidate, self.config[self.recipient + 'ThreadId'], self.recipient,
-                               role_binding=self.config.get('roleBindings', {}).get(self.recipient))
+                               role_binding=self.config.get('roleBindings', {}).get(self.recipient),
+                               expected_host=(self.config.get('parentHostId') if self.recipient == 'parent' else None))
         except Exception:
             candidate.close()
             raise
@@ -179,7 +180,8 @@ class _Destination:
                 if socket_identity(self.route['pipe']) != self.route['socket']:
                     raise ValueError('socket_generation_changed')
                 verify_destination(self.bridge, self.config[self.recipient + 'ThreadId'], self.recipient,
-                                   role_binding=self.config.get('roleBindings', {}).get(self.recipient))
+                                   role_binding=self.config.get('roleBindings', {}).get(self.recipient),
+                                   expected_host=(self.config.get('parentHostId') if self.recipient == 'parent' else None))
                 self.checked_at = now; self._healthy(self.route)
                 return self.bridge
             except Exception as error:
@@ -246,20 +248,24 @@ class Transport:
                              for role in roles}
         self.health = {}
         self.intake_status = 'not_needed'
+        self.intake_uncertain = False
         self.incident_error = False
         self.incident_registration_failed = False
         self.receipt_checked_at = None
         self.receipt_cursor = 0
+        self.receipt_last_checked = {}
         self.emergency_throttle = emergency_throttle if emergency_throttle is not None else {}
 
-    def emergency_notice(self, *, intake_failed, active, used_percent):
+    def emergency_notice(self, *, intake_failed, active, used_percent, uncertain=False):
         """Issue a bounded alert for failed intake and urgent or unknown context."""
         if intake_failed is not True:
             return False
         unknown_activity = type(active) is not bool
         unknown_quota = (type(used_percent) not in (int, float) or not math.isfinite(used_percent)
                          or not 0 <= used_percent <= 100)
-        if not (unknown_activity or unknown_quota or (active and used_percent >= 95)):
+        ordinary_urgent = active is True and not unknown_quota and used_percent >= 95
+        uncertain_urgent = uncertain is True and (unknown_activity or unknown_quota or used_percent >= 95)
+        if not (ordinary_urgent or uncertain_urgent):
             return False
         path = self.root / 'emergency-notice.json'
         now = self.clock()
@@ -337,6 +343,10 @@ class Transport:
         except Exception:
             self.incident_error = True
             self.intake_status = 'outcome_unknown'
+            try:
+                self._outbox_status()
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
             raise
         return self._outbox_status()
 
@@ -353,6 +363,13 @@ class Transport:
             history = value.get('reconciliation', [])
             if not isinstance(history, list) or not all(isinstance(item, dict) for item in history):
                 raise ValueError('invalid_incident_outbox')
+        matched = ('receipt_matched', 'owner_accepted_matched', 'owned_continuation_matched')
+        self.intake_uncertain = any(
+            not any(item.get('stage') in matched for item in value.get('reconciliation', []))
+            and (value['status'] == 'outcome_unknown'
+                 or (value['status'] == 'submitted'
+                     and any(item.get('stage') == 'pending' for item in value.get('reconciliation', []))))
+            for value in values)
         statuses = [value['status'] for value in values if not (
             isinstance(value.get('reconciliation'), list) and value['reconciliation'] and
             value['reconciliation'][-1].get('stage') in
@@ -373,6 +390,37 @@ class Transport:
         state = read_private(path, {'version': 1, 'incidents': {}})
         if not isinstance(state, dict) or state.get('version') != 1 or not isinstance(state.get('incidents'), dict):
             raise ValueError('invalid_incident_outbox')
+        matched = ('receipt_matched', 'owner_accepted_matched', 'owned_continuation_matched')
+        eligible = []
+        unchecked = []
+        for key, value in state['incidents'].items():
+            if not isinstance(value, dict) or value.get('status') not in ('submitted', 'outcome_unknown'):
+                continue
+            history = value.get('reconciliation', [])
+            if not isinstance(history, list) or not all(isinstance(item, dict) for item in history):
+                raise ValueError('invalid_incident_outbox')
+            eligible.append(key)
+            if (not any(item.get('stage') in matched for item in history)
+                    and not any(item.get('stage') == 'pending' for item in history)):
+                unchecked.append(key)
+        eligible.sort()
+        if not eligible:
+            return
+        checked = [key for key in eligible if key not in unchecked]
+        if unchecked and (not checked or self.receipt_cursor % 2 == 0):
+            selected = unchecked[0]
+        else:
+            selected = min(checked or eligible, key=lambda key: (self.receipt_last_checked.get(key, 0), key))
+        self.receipt_cursor += 1
+        self.receipt_checked_at = now
+        self.receipt_last_checked[selected] = now
+        history = state['incidents'][selected].setdefault('reconciliation', [])
+        if not any(item.get('stage') in matched for item in history):
+            self.intake_uncertain = True
+            if not any(item.get('stage') == 'pending' for item in history):
+                history.append({'stage': 'pending', 'observedAt': now, 'receiptDigest': None,
+                                'receiptRecord': None, 'routeGeneration': None})
+                save(path, state)
         receipt_path = self.config['incidentReceiptStore']
         before = read_private(receipt_path)
         digest = (hashlib.sha256(json.dumps(before, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -390,14 +438,15 @@ class Transport:
                     or history[-1].get('receiptDigest') != digest or history[-1].get('routeGeneration') != generation):
                 candidates.append(key)
         candidates.sort()
-        if not candidates:
+        if selected not in candidates:
             return
-        incident = candidates[self.receipt_cursor % len(candidates)]
-        self.receipt_cursor += 1
-        self.receipt_checked_at = now
+        incident = selected
         if before is None:
             stage = 'pending'
         else:
+            history = state['incidents'][incident].get('reconciliation', [])
+            if not any(item.get('stage') in matched for item in history):
+                self.intake_uncertain = True
             stage = reconcile_snapshot(bridge, state['incidents'][incident], before,
                                        self.config['roleBindings']['repairOwner'])
             after = read_private(receipt_path)

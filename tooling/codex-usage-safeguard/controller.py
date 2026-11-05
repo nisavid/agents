@@ -390,9 +390,10 @@ def dispatch(state, account, config, bridge, path, *, current_observation=None,
         raise RuntimeError(';'.join(sorted(set(failures))))
 
 
-def validate_config(config, activate=False):
+def validate_config(config, activate=False, qualify=False):
     if activate and config.get('incidentRoutingEnabled') is True:
-        raise ValueError('incident_routing_not_ready')
+        from activation import routing_readiness
+        routing_readiness(config, config['stateDir'])
     destinations = [config['foremanThreadId'], config['parentThreadId']]
     if 'conciergeThreadId' in config:
         destinations.append(config['conciergeThreadId'])
@@ -419,6 +420,8 @@ def validate_config(config, activate=False):
             raise ValueError('incident_routing_binding_required')
         if owner['thread_id'] in destinations:
             raise ValueError('distinct_notification_destinations_required')
+        if not isinstance(config.get('parentHostId'), str) or not config['parentHostId'].strip():
+            raise ValueError('parent_host_required')
     accounts = config['accounts']
     if len({a['name'] for a in accounts}) != len(accounts):
         raise ValueError('duplicate_account_configuration')
@@ -431,7 +434,7 @@ def validate_config(config, activate=False):
             raise ValueError('daybreak_must_remain_pinned')
     if not 5 <= config['intervalSeconds'] <= 60:
         raise ValueError('invalid_interval')
-    if activate:
+    if activate or qualify:
         policy = config['policy']
         if config.get('enabled') is not True:
             raise ValueError('activation_policy_not_approved')
@@ -717,7 +720,8 @@ def run(config, state_dir, *, once=False, observe_only=False):
                     try:
                         with decision_lock(state_dir):
                             if delivery_status(config, state_dir)['mode'] == 'active':
-                                transport.emergency_notice(intake_failed=True, active=None, used_percent=used)
+                                transport.emergency_notice(intake_failed=True, active=None, used_percent=used,
+                                                           uncertain=transport.intake_uncertain)
                     except Exception:
                         health['emergencyNotice'] = 'failed'
                 if intake_errors:

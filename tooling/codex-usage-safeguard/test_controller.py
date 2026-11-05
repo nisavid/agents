@@ -58,6 +58,19 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'incident_routing_binding_required'):
             validate_config(config)
 
+    def test_new_routing_requires_parent_host(self):
+        config = json.loads(Path(__file__).with_name('config.example.json').read_text())
+        config.update(incidentRoutingEnabled=True, conciergeThreadId='fixture-concierge',
+                      incidentReceiptStore='/fixture/receipts.json', roleBindings={
+                          'foreman': {'thread_id': config['foremanThreadId'], 'host_id': 'local',
+                                      'role': 'dispatch', 'acceptance_ref': 'fixture-dispatch'},
+                          'concierge': {'thread_id': 'fixture-concierge', 'host_id': 'local',
+                                        'role': 'concierge', 'acceptance_ref': 'fixture-concierge'},
+                          'repairOwner': {'thread_id': 'fixture-owner', 'host_id': 'local',
+                                          'role': 'repair_owner', 'acceptance_ref': 'fixture-owner'}})
+        with self.assertRaisesRegex(ValueError, 'parent_host_required'):
+            validate_config(config)
+
     def test_new_routing_requires_named_repair_owner_binding(self):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         config.update(incidentRoutingEnabled=True, conciergeThreadId='fixture-concierge',

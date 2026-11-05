@@ -13,11 +13,13 @@ from controller import open_singleton_lock, read_account, validate_config, check
 from native_bridge import NativeBridge, verify_bridge
 from storage import read_private
 from transport import socket_identity
-from activation import reset_operation_lock
+from activation import reset_operation_lock, routing_readiness, configuration_binding, source_binding
 
 
-def preflight(config, state_dir, *, check_live=False):
-    validate_config(config, activate=True)
+def preflight(config, state_dir, *, check_live=False, qualify_routing=False):
+    if qualify_routing and config.get('incidentRoutingEnabled') is not True:
+        raise ValueError('incident_routing_not_configured')
+    validate_config(config, activate=not qualify_routing, qualify=qualify_routing)
     root = Path(state_dir)
     # The observer owns this lock for its lifetime, including maintenance and
     # observe-only. A stopped cutover is the supported snapshot boundary.
@@ -68,6 +70,8 @@ def preflight(config, state_dir, *, check_live=False):
                 preserved[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
         report = {'status': 'local_checks_passed', 'preservedLedgerHashes': preserved,
                   'policy': config['policy'], 'liveChecks': 'not_requested'}
+        if qualify_routing:
+            report.update(configurationBinding=configuration_binding(config), sourceBinding=source_binding())
         if check_live:
             for account in config['accounts']:
                 read_account(account, node=config['nodeBinary'])
@@ -77,9 +81,15 @@ def preflight(config, state_dir, *, check_live=False):
             try:
                 if config.get('incidentRoutingEnabled') is True:
                     bindings = config['roleBindings']
+                    parent_host = config.get('parentHostId')
+                    if not isinstance(parent_host, str) or not parent_host.strip():
+                        raise ValueError('parent_host_required')
                     verify_bridge(bridge, config['foremanThreadId'], config['parentThreadId'],
                                   dispatch_binding=bindings['foreman'], concierge=config['conciergeThreadId'],
-                                  concierge_binding=bindings['concierge'], owner_binding=bindings['repairOwner'])
+                                  concierge_binding=bindings['concierge'], owner_binding=bindings['repairOwner'],
+                                  parent_host=parent_host)
+                    if not qualify_routing:
+                        report['routingReadiness'] = routing_readiness(config, root, bridge=bridge)
                 else:
                     verify_bridge(bridge, config['foremanThreadId'], config['parentThreadId'])
             finally: bridge.close()
@@ -91,6 +101,8 @@ def preflight(config, state_dir, *, check_live=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__); runtime_arguments(parser)
     parser.add_argument('--check-live', action='store_true')
+    parser.add_argument('--qualify-routing', action='store_true',
+                        help='Read-only routing qualification; does not arm delivery')
     args = parser.parse_args()
     print(json.dumps(preflight(load_config(args.config, args.state_dir), args.state_dir,
-                               check_live=args.check_live), indent=2))
+                               check_live=args.check_live, qualify_routing=args.qualify_routing), indent=2))

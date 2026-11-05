@@ -2,13 +2,13 @@
 
 Monitor the default Codex account and one pinned Daybreak account with a local
 observer. At exact quota exhaustion, request a reset confirmation or ask the
-verified Codex Foreman to coordinate the authorized pause. The observer never
+configured, qualified coordinator to manage the authorized pause. The observer never
 redeems resets, buys credits, or resumes work.
 
 The companion renews an app connection through normal MCP startup. It publishes
 the inherited route; the observer validates the existing registration and exact
 destinations independently before sending. A failed chat destination does not
-block a reachable Foreman. Outages produce bounded retries and hourly local
+block an independently reachable coordinator. Outages produce bounded retries and hourly local
 reminders without recurring model turns. Delivery remains in persistent
 maintenance until explicitly activated after live preflight.
 

@@ -5,11 +5,11 @@ Daybreak profile. A normal MCP companion can renew its connection to the app.
 It owns no quota policy, never launches another observer, and exposes no action
 tools. Configuration and all runtime state remain private and outside releases.
 
-The operational contract below describes the installed legacy route. The
-Dispatch/Concierge routing candidate is described in `INCIDENT-RECEIPT-DRAFT.md`;
-its activation is explicitly blocked in this source until the candidate and
-concrete handover are ready. The candidate does not change reset, account,
-episode, caller, singleton, or release authority.
+The legacy contract below assigns pause coordination to Foreman. The optional
+Dispatch/Concierge route assigns quota control to Dispatch and fault intake to
+Concierge. Its activation requires the qualification and separate decision in
+`OPERATING.md`. Neither route changes reset, account, episode, caller, singleton,
+or release authority.
 
 ## Quota and account policy
 
@@ -144,3 +144,26 @@ adoption, coherent preflight, stopped-observer activation, and restart verificat
 are part of deployment. `OPERATING.md` defines that sequence. Preflight never
 creates migration metadata. New custody records establish an adoption boundary;
 they do not prove completeness before adoption or recover missing receipts.
+
+## Dispatch and Concierge qualification
+
+The new route binds Dispatch, Concierge, the parent and repair owner by their
+configured thread and host identities. A display title does not assign a role.
+A read-only stopped-observer preflight checks configuration and reports source
+and configuration digests; its optional live mode reads the configured accounts
+and destinations but sends nothing.
+
+Activation requires a selected, private qualification packet bound to the final
+source and configuration. It checks correlated Dispatch submission and receipt,
+Concierge submission and receipt, repair-owner acceptance and continuation, and
+the selected journal record through native readback. The reviewed decision also
+attests caller provenance, role acceptance, and actual writer/consumer store
+operations. Witness hashes bind content; they do not authenticate those claims.
+A submitted or uncertain incident remains retained without automatic resend.
+
+The running guard rechecks current source contents and a bounded packet and
+witnesses with the current maintenance/configuration decision. It does not read
+the full mutable incident history for each effect. A changed or unreadable
+qualification inhibits delivery; live journal faults remain a separate incident
+condition. The package source binding excludes the installed app, runtime and
+dependency bytes. See `OPERATING.md` for qualification and recovery.

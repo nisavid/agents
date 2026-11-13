@@ -7,10 +7,10 @@ Python with zero external dependencies.
 
 ## Why
 
-Codex Desktop gates certain features behind Statsig feature flags that require
-ChatGPT authentication to evaluate. In air-gapped or restricted environments
-where ChatGPT auth is unavailable, these flags default to `false`, hiding
-features like the worktree option in the "select where to run" menu.
+The ChatGPT desktop app gates certain features behind Statsig feature flags
+that require ChatGPT authentication to evaluate. In air-gapped or restricted
+environments where ChatGPT auth is unavailable, these flags default to `false`,
+hiding features like the worktree option in the "select where to run" menu.
 
 This tool lets you bypass specific feature gates by patching the minified JS
 bundles inside `app.asar`, without needing ChatGPT login or network access to

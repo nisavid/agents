@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ChatGPT FFS — TUI for managing app.asar patches.
 
-Manages search-and-replace patches against the Codex Desktop (ChatGPT.app)
-app.asar bundle. Handles extraction, patching, repacking, integrity hash
+Manages search-and-replace patches to app.asar in the ChatGPT desktop app
+(ChatGPT.app). Handles extraction, patching, repacking, integrity hash
 updates, and code signing with proper Electron entitlements.
 
 Requires no external dependencies — asar format is implemented in pure Python.
@@ -373,7 +373,7 @@ Patch(
         category="workspace",
         labels=["local-only", "workspace", "local-dev", "user-facing", "agent-facing"],
         description=(
-            "Enables the worktree option in Codex Desktop's \"select where to run\" menu by bypassing Statsig feature flag 505458, which requires ChatGPT authentication to evaluate.\n\nIn air-gapped or restricted environments where ChatGPT auth is unavailable, the flag defaults to false, hiding the worktree option. This patch replaces all checkGate('505458') calls with true (!0), unconditionally enabling the feature."
+            "Enables the worktree option in the ChatGPT desktop app's \"select where to run\" menu.\n\nBypasses Statsig feature flag 505458, which requires ChatGPT authentication to evaluate. In air-gapped or restricted environments where ChatGPT auth is unavailable, the flag defaults to false, hiding the worktree option. This patch replaces all checkGate('505458') calls with true (!0), unconditionally enabling the feature."
         ),
         modifications=[
             Modification(

@@ -117,6 +117,14 @@ def observation_failed(previous, policy):
     return state, events
 
 
+def exhausted(sample):
+    """Only a finite core-window value at or above 100 is a zero allowance."""
+    return any(isinstance(window, dict) and number(window.get('used_percent'))
+               and window['used_percent'] >= 100
+               for key, window in (sample.get('rate_limit') or {}).items()
+               if key in ('primary_window', 'secondary_window'))
+
+
 def advance(previous, sample, account, *, now, policy=None):
     """Consume one fresh profile reading; emit persistent intents, never actions."""
     state = copy.deepcopy(previous)
@@ -128,7 +136,7 @@ def advance(previous, sample, account, *, now, policy=None):
     windows = [v for k, v in (sample.get('rate_limit') or {}).items()
                if k in ('primary_window', 'secondary_window') and isinstance(v, dict)]
     used = [v['used_percent'] for v in windows if number(v.get('used_percent')) and v['used_percent'] >= 0]
-    exhausted = any(v >= 100 for v in used)
+    at_zero = exhausted(sample)
     main_scope = account['name'] == 'main' or account.get('alsoCurrentMain') is True
     state.update(accountId=account['accountId'], lastSample=sample, lastReadAt=now)
     events = []
@@ -136,7 +144,7 @@ def advance(previous, sample, account, *, now, policy=None):
     if episode and episode.get('active'):
         invalidate_daybreak_pauses(episode, account, now)
         # An available blip never rearms. A deliberate, verified release is needed.
-        if not exhausted:
+        if not at_zero:
             if used and len(used) == len(windows):
                 episode['budgetStatus'] = 'allowance_restored_pending_rearm'
                 balance = decimal((sample.get('credits') or {}).get('balance'))
@@ -166,7 +174,7 @@ def advance(previous, sample, account, *, now, policy=None):
             if reason:
                 emit(episode, events, 'foreman_pause_required', reason)
         return state, events
-    if not exhausted:
+    if not at_zero:
         return state, events
     count = reset_count(sample)
     episode = {'id': str(uuid.uuid4()), 'active': True, 'accountId': account['accountId'],

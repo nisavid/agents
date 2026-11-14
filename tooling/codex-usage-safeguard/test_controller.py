@@ -34,16 +34,29 @@ class DeliveryTests(unittest.TestCase):
             path = Path(directory) / 'daybreak.json'; transport = ReceiptTransport(path)
             state, _ = advance({}, sample(100, resets=0), account, now=10)
             with patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('accountId', 'email')}):
-                dispatch(state, account, CONFIG, transport, path)
+                dispatch(state, account, CONFIG, transport, path, current_observation=sample(100))
             old_receipts = copy.deepcopy(state['episode']['events'][0]['deliveries'])
             with patch('controller.default_identity', return_value={}):
-                dispatch(state, account, CONFIG, transport, path)
+                dispatch(state, account, CONFIG, transport, path, current_observation=sample(100))
             old = state['episode']['events'][0]
             self.assertTrue(old['invalidated'])
             self.assertEqual(old['deliveries'], old_receipts)
             self.assertEqual(len(transport.received), 2)
             state, events = advance(state, sample(100, resets=0), account, now=20)
             self.assertNotEqual(events[0]['id'], old['id'])
+
+    def test_retained_zero_without_current_observation_cannot_start_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'main.json'; transport = ReceiptTransport(path)
+            state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
+            episode = copy.deepcopy(state['episode'])
+            with self.assertRaisesRegex(RuntimeError, 'current_zero_required_before_delivery'):
+                dispatch(state, ACCOUNT, CONFIG, transport, path)
+            self.assertEqual(transport.received, [])
+            self.assertFalse(state['episode']['events'][0].get('deliveries'))
+            self.assertEqual(state['lastSample'], sample(100, resets=0))
+            for key in ('id', 'resetIdempotencyKey', 'accountId', 'email', 'resetCount'):
+                self.assertEqual(state['episode'][key], episode[key])
 
     def test_identical_destinations_cannot_activate(self):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
@@ -56,7 +69,7 @@ class DeliveryTests(unittest.TestCase):
             path = Path(directory) / 'main.json'; transport = ReceiptTransport(path, fail='parent')
             state, _ = advance({}, sample(100), ACCOUNT, now=10, policy={'pauseWhenUnmetered': True})
             with self.assertRaisesRegex(RuntimeError, 'reconciliation'):
-                dispatch(state, ACCOUNT, CONFIG, transport, path)
+                dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([t for t, _ in transport.received], ['foreman', 'parent'])
             recovered = json.loads(path.read_text())
             confirmation, pause = recovered['episode']['events']
@@ -64,7 +77,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(receipt['status'], 'outcome_unknown')
             self.assertEqual(receipt['coalescedInto'], pause['id'])
             with self.assertRaisesRegex(RuntimeError, 'reconciliation'):
-                dispatch(recovered, ACCOUNT, CONFIG, transport, path)
+                dispatch(recovered, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual(len(transport.received), 2)
 
     def test_combined_attempting_receipt_survives_restart_and_destination_change(self):
@@ -76,7 +89,7 @@ class DeliveryTests(unittest.TestCase):
                 'foreman': {'status': 'submitted', 'target': 'foreman'},
                 'parent': {'status': 'attempting', 'target': 'old-parent', 'includesEvent': confirmation['id']}}
             with self.assertRaisesRegex(RuntimeError, 'reconciliation'):
-                dispatch(state, ACCOUNT, CONFIG, transport, path)
+                dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual(transport.received, [])
             self.assertEqual(confirmation['deliveries']['parent']['status'], 'attempting')
             self.assertEqual(confirmation['deliveries']['parent']['target'], 'old-parent')
@@ -88,11 +101,11 @@ class DeliveryTests(unittest.TestCase):
             state, _ = advance({}, sample(100, resets=0), account, now=10)
             old = state['episode']['events'][0]
             with patch('controller.default_identity', return_value={'accountId': 'different', 'email': 'different'}):
-                dispatch(state, account, CONFIG, transport, path)
+                dispatch(state, account, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual(old['invalidated']['reason'], 'daybreak_no_longer_main')
             recovered = json.loads(path.read_text())
             with patch('controller.default_identity', return_value={k: ACCOUNT[k] for k in ('accountId', 'email')}):
-                dispatch(recovered, account, CONFIG, transport, path)
+                dispatch(recovered, account, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual(transport.received, [])
             # A fresh waiting-budget condition remains effective and uses a new ID.
             state, _ = advance(recovered, sample(100), dict(account, alsoCurrentMain=False), now=20,
@@ -109,7 +122,7 @@ class DeliveryTests(unittest.TestCase):
             path = Path(directory) / 'daybreak.json'; transport = ReceiptTransport(path)
             state, _ = advance({}, sample(100, resets=0), account, now=10)
             with patch('controller.default_identity', side_effect=[identity, {}]):
-                dispatch(state, account, CONFIG, transport, path)
+                dispatch(state, account, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([t for t, _ in transport.received], ['foreman'])
             pause = state['episode']['events'][0]
             self.assertEqual(pause['deliveries']['foreman']['status'], 'submitted')
@@ -134,8 +147,10 @@ class DeliveryTests(unittest.TestCase):
     def test_main_on_daybreak_uses_one_canonical_episode(self):
         config = json.loads(Path(__file__).with_name('config.example.json').read_text())
         pinned = next(a for a in config['accounts'] if a['name'] == 'daybreak')
-        reading = sample(100); reading.update(email=pinned['email'], accountId=pinned['accountId'])
-        with tempfile.TemporaryDirectory() as directory, patch('controller.read_account', return_value=reading):
+        identity = {'email': pinned['email'], 'accountId': pinned['accountId']}
+        reading = sample(100); reading.update(identity)
+        with tempfile.TemporaryDirectory() as directory, patch('controller.read_account', return_value=reading), \
+             patch('controller.default_identity', return_value=identity):
             root = Path(directory)
             health = run(config, root, once=True, observe_only=True)
             self.assertEqual(health['accounts']['main']['status'], 'covered_by_daybreak')
@@ -171,12 +186,12 @@ class DeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'main.json'; transport = ReceiptTransport(path)
             state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
-            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([t for t, _ in transport.received], ['foreman', 'parent'])
             self.assertIn('Steer', transport.received[0][1])
             self.assertIn('sole pause coordinator', transport.received[1][1])
             recovered = json.loads(path.read_text())
-            dispatch(recovered, ACCOUNT, CONFIG, transport, path)
+            dispatch(recovered, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual(len(transport.received), 2)
 
     def test_uncertain_foreman_delivery_notifies_parent_but_never_retries_send(self):
@@ -184,18 +199,18 @@ class DeliveryTests(unittest.TestCase):
             path = Path(directory) / 'main.json'; transport = ReceiptTransport(path, fail='foreman')
             state, _ = advance({}, sample(100, resets=0), ACCOUNT, now=10)
             with self.assertRaises(RuntimeError):
-                dispatch(state, ACCOUNT, CONFIG, transport, path)
+                dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([t for t, _ in transport.received], ['foreman', 'parent'])
             recovered = json.loads(path.read_text())
             with self.assertRaises(RuntimeError):
-                dispatch(recovered, ACCOUNT, CONFIG, transport, path)
+                dispatch(recovered, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual(len(transport.received), 2)
 
     def test_confirmations_only_go_to_parent_and_never_redeem(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'daybreak.json'; transport = ReceiptTransport(path)
             state, _ = advance({}, sample(100), ACCOUNT, now=10)
-            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([t for t, _ in transport.received], ['parent'])
             self.assertIn('explicit human confirmation', transport.received[0][1])
             self.assertIn(state['episode']['resetIdempotencyKey'], transport.received[0][1])
@@ -221,7 +236,7 @@ class DeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'main.json'; transport = ReceiptTransport(path)
             state, _ = advance({}, sample(100), ACCOUNT, now=10, policy={'pauseWhenUnmetered': True})
-            dispatch(state, ACCOUNT, CONFIG, transport, path)
+            dispatch(state, ACCOUNT, CONFIG, transport, path, current_observation=sample(100))
             self.assertEqual([t for t, _ in transport.received], ['foreman', 'parent'])
 
 if __name__ == '__main__':

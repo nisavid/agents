@@ -45,30 +45,65 @@ tools. Configuration and all runtime state remain private and outside releases.
 ## Connection renewal
 
 The companion publishes only its inherited `CODEX_APP_TOOLS_PIPE_PATH`, bound
-to the existing genuine owner registration and exact configured destinations.
-Multiple copies coalesce the same socket generation; a CLI invocation without
-an inherited route publishes nothing. There is no socket discovery, caller
-identity synthesis, credential refresh, permission change, owner recreation,
-or model polling.
+to the existing genuine owner and adapter. Each destination has an independent
+connection: exact Foreman ID and title `Codex Foreman`, or exact parent ID,
+must pass before that recipient can receive a message. An unavailable parent
+cannot block a verified Foreman, and an unavailable Foreman cannot prevent the
+parent being informed. Known-unavailable recipients acquire no send intent;
+uncertain actual sends still require reconciliation and are never retried.
 
-The observer validates the exact Foreman ID and title `Codex Foreman`, plus the
-exact parent ID, before adopting a candidate. A healthy accepted route remains
-stable. Route failures permit another candidate with the same configuration
-binding. Validation and local retries are bounded. Rejection cannot cause a
-send or overwrite quota, approval, episode, or delivery state.
+Multiple companions coalesce the same socket generation; a CLI without an
+inherited route publishes nothing. Destination edits do not grant access or
+change caller identity. Legacy route records require their original complete
+configuration binding; newer records bind the caller/adapter separately and
+still verify each exact current destination. There is no socket discovery,
+caller synthesis, credential refresh, permission change, or model polling.
 
-An unavailable connection produces one durable incident and one attempted local
-desktop notice. Notification intent is persisted before the attempt; failure or
-uncertainty is recorded, never described as delivered. Repeated failures reuse
-the incident until verified recovery. Loss of caller authorization requires
-explicit supported re-registration; access is never expanded to recover.
+Each destination independently checks liveness every 60 seconds and tries at
+most two candidate routes per poll, with retry backoff capped at five minutes.
+Observation-failure fallback reuses that poll's verified recipient connections;
+it does not begin another round of route checks.
+Health separates quota observation, delivery mode and destination availability.
+An outage retains one incident until both destinations recover. A desktop
+notice is attempted initially and at most hourly thereafter, including after
+restart and after a failed or uncertain notice. Intent and timestamp precede
+each attempt. Submission does not prove a person saw it. Reminders perform no
+model turn, reset, resume or repeated pause send.
+
+## Persistent maintenance
+
+`activation.json` outside the release controls delivery. Missing, malformed,
+explicitly held or configuration-mismatched activation means maintenance:
+quota observation continues under the same singleton locks, but native
+connection and delivery are inhibited. Restart, reboot, MCP route publication
+and successful quota reads cannot activate delivery.
+
+The operator records maintenance before an intentional service stop or a
+withheld activation. Activation requires an explicit verified decision
+reference and fresh read-only preflight of both accounts and exact recipients.
+The helper persists maintenance before preflight, so a failed check stays held.
+Activation never changes credentials, caller identity, destinations or ledgers.
+The controller serializes each intent/send/receipt with maintenance decisions;
+an older activation preflight cannot overwrite a newer decision. It rechecks
+maintenance before every new intent. Ordinary new delivery attempts also require
+a successful reading from the current observer poll with a finite exhausted core
+window. Retained `lastSample` and earlier preflight readings do not qualify.
+During an existing reset-confirmation wait, the separately approved
+observation-failure fallback admits only its newly generated pause and that
+pause's parent status notification, including the existing confirmation
+coalescing. It cannot admit separate sends for unrelated pending events.
+A current observer reading with restored or unknown allowance blocks unsent old
+events without releasing holds or changing receipts.
+A send already in flight may finish before the maintenance command returns; stopping work remains the Foreman's job.
+
 
 ## Acceptance and installation
 
 Tests use fixture accounts, subprocesses, and sockets. No real reset or pause is
 an acceptance test. Required evidence covers quota/account boundaries, durable
 receipts, concurrent publication, missing/stale routes, exact targets, rejected
-registration, restart/recovery, one notice per incident, and preservation of open
+registration, independent destination outages, maintenance across boots, hourly
+notice bounds across restart, and preservation of open
 episodes through code upgrade and rollback.
 
 Source belongs in `nisavid/agents`; the opt-in immutable-release adapter belongs

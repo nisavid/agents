@@ -7,8 +7,10 @@ redeems resets, buys credits, or resumes work.
 
 The companion renews an app connection through normal MCP startup. It publishes
 the inherited route; the observer validates the existing registration and exact
-destinations before adoption. Rejection produces one local alert and bounded
-retries without recurring model turns.
+destinations independently before sending. A failed chat destination does not
+block a reachable Foreman. Outages produce bounded retries and hourly local
+reminders without recurring model turns. Delivery remains in persistent
+maintenance until explicitly activated after live preflight.
 
 - [Policy and acceptance contract](SPEC.md)
 - [Operating procedure, installation, and recovery](OPERATING.md)
@@ -17,7 +19,8 @@ retries without recurring model turns.
 `safeguard.py` owns quota policy; `controller.py` owns the singleton and durable
 delivery receipts; `transport.py` owns connection renewal. `native_bridge.py`
 isolates the installed app's private MCP adapter. `companion.py` exposes no action
-tools. Credentials are read from the existing profiles without refresh or changes.
+tools. `activation.py` records persistent maintenance and explicit activation.
+Credentials are read from the existing profiles without refresh or changes.
 
 The supported target is Linux, Python 3.11+, Node 22+, systemd user services, and
 the ChatGPT app's installed native MCP server. The private native and WHAM APIs

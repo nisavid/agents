@@ -389,7 +389,7 @@ for line in sys.stdin:
                 path = Path(name) / 'main.json'; transport = ReceiptTransport(path)
                 config = dict(CONFIG, parentThreadId='appointed-approval-chat')
                 state, _ = advance({}, sample(100, resets=resets), ACCOUNT, now=10)
-                dispatch(state, ACCOUNT, config, transport, path)
+                dispatch(state, ACCOUNT, config, transport, path, current_observation=sample(100))
                 for target, prompt in transport.received:
                     self.assertIn('configured approval/status chat appointed-approval-chat', prompt)
                     self.assertNotIn('main chat', prompt)

@@ -429,7 +429,7 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(self.produce().returncode, 0)
         config = load_config(self.config_path, self.root)
         original = json.loads((self.root / 'main.json').read_text())
-        for opened in (False, True, -1, float('nan'), None, 'a'):
+        for opened in (False, True, -1, float('nan'), float('inf'), 10 ** 400, None, 'a'):
             state = json.loads(json.dumps(original))
             state['episode']['openedAt'] = opened
             save(self.root / 'main.json', state)

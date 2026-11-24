@@ -1,5 +1,6 @@
 """Completion CLI and observer boundaries use only disposable private state."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -376,6 +377,40 @@ class CompletionTests(unittest.TestCase):
         archive.symlink_to(self.root / 'input.json')
         self.assertEqual(status(self.config_path, self.root)['episodes']['main']['protectiveStop']['status'], 'unconfirmed')
         self.assertNotEqual(self.produce().returncode, 0)
+
+    def test_hostile_completion_files_leave_status_unconfirmed_without_stopping_observation(self):
+        import hashlib
+        import signal
+        from status import status
+        self.assertEqual(self.produce().returncode, 0)
+        pointer_path = self.root / 'pause-completion-main.json'
+        valid_pointer = json.loads(pointer_path.read_text())
+        archive_directory = self.root / 'pause-completions'
+        nested = b'[' * 200000
+
+        def protective_stop():
+            signal.alarm(10)
+            try:
+                return status(self.config_path, self.root)['episodes']['main']['protectiveStop']
+            finally:
+                signal.alarm(0)
+
+        pointer_path.write_bytes(nested)
+        pointer_path.chmod(0o600)
+        self.assertEqual(protective_stop()['status'], 'unconfirmed')
+        pointer_path.unlink()
+        os.mkfifo(pointer_path, 0o600)
+        self.assertEqual(protective_stop()['status'], 'unconfirmed')
+        pointer_path.unlink()
+        digest = hashlib.sha256(nested).hexdigest()
+        archived = archive_directory / (digest + '.json')
+        archived.write_bytes(nested)
+        archived.chmod(0o600)
+        save(pointer_path, {'schemaVersion': 1, 'sha256': digest})
+        self.assertEqual(protective_stop()['status'], 'unconfirmed')
+        archived.unlink()
+        os.mkfifo(archived, 0o600)
+        self.assertEqual(protective_stop()['status'], 'unconfirmed')
 
     def test_armed_restart_does_not_replay_submitted_pause_or_consume_reset(self):
         import os

@@ -144,7 +144,7 @@ def record_completion(record, config, directory, name):
 
 
 def read_archive(directory, fingerprint):
-    fd = os.open(directory / f'{fingerprint}.json', os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(directory / f'{fingerprint}.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
         info = os.fstat(stream.fileno())
         require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077,
@@ -152,6 +152,18 @@ def read_archive(directory, fingerprint):
         data = stream.read()
     require(hashlib.sha256(data).hexdigest() == fingerprint, 'completion_digest_mismatch')
     return json.loads(data)
+
+
+def read_pointer(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077,
+                'private_owned_file_required')
+        return json.load(stream)
 
 
 def validate_pointer(pointer):
@@ -163,7 +175,7 @@ def validate_pointer(pointer):
 def completion_status(config, directory, name):
     try:
         directory = private_directory(directory, create=False)
-        pointer = read_private(directory / f'pause-completion-{name}.json')
+        pointer = read_pointer(directory / f'pause-completion-{name}.json')
         if pointer is None:
             return {'status': 'unconfirmed', 'reason': 'no_completion_record'}
         validate_pointer(pointer)
@@ -173,5 +185,5 @@ def completion_status(config, directory, name):
         bind(record, config, directory, name)
         return {'status': result, 'sha256': pointer['sha256'], 'observedAt': record['observedAt'],
                 'evidenceAuthority': 'local_writer_observation'}
-    except (ValueError, OSError, KeyError, TypeError, StopIteration) as error:
+    except (ValueError, OSError, KeyError, TypeError, StopIteration, RecursionError) as error:
         return {'status': 'unconfirmed', 'reason': str(error) if isinstance(error, ValueError) else 'completion_record_unavailable'}

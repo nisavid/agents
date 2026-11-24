@@ -412,6 +412,17 @@ class CompletionTests(unittest.TestCase):
         os.mkfifo(archived, 0o600)
         self.assertEqual(protective_stop()['status'], 'unconfirmed')
 
+    def test_degraded_account_state_leaves_completion_unconfirmed(self):
+        from configuration import load_config
+        from pause_completion import completion_status
+        self.assertEqual(self.produce().returncode, 0)
+        config = load_config(self.config_path, self.root)
+        for contents in ('[]', '{"episode": "x"}', '{"episode": {"active": true, "events": [1]}}'):
+            (self.root / 'main.json').write_text(contents)
+            (self.root / 'main.json').chmod(0o600)
+            self.assertEqual(completion_status(config, self.root, 'main'),
+                             {'status': 'unconfirmed', 'reason': 'completion_record_unavailable'})
+
     def test_armed_restart_does_not_replay_submitted_pause_or_consume_reset(self):
         import os
         from unittest.mock import patch

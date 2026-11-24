@@ -185,5 +185,5 @@ def completion_status(config, directory, name):
         bind(record, config, directory, name)
         return {'status': result, 'sha256': pointer['sha256'], 'observedAt': record['observedAt'],
                 'evidenceAuthority': 'local_writer_observation'}
-    except (ValueError, OSError, KeyError, TypeError, StopIteration, RecursionError) as error:
+    except Exception as error:
         return {'status': 'unconfirmed', 'reason': str(error) if isinstance(error, ValueError) else 'completion_record_unavailable'}

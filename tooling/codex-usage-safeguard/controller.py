@@ -2,6 +2,7 @@
 """Single local service: fresh reads, durable intents, native Steer dispatch."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import datetime as dt
 import fcntl
 import json
@@ -12,8 +13,9 @@ import subprocess
 import time
 import uuid
 
-from safeguard import advance, settle, observation_failed, decimal, invalidate_daybreak_pauses
+from safeguard import advance, settle, observation_failed, decimal, invalidate_daybreak_pauses, exhausted
 from transport import Transport, publish_candidate
+from activation import delivery_status, decision_lock
 from storage import save
 from configuration import load_config, runtime_arguments
 
@@ -125,7 +127,8 @@ def make_prompt(event, episode, account, state_path, recipient):
             "is unknown, describe it as unknown and investigate once. Preserve independent holds.")
 
 
-def dispatch(state, account, config, bridge, path):
+def dispatch(state, account, config, bridge, path, *, current_observation=None,
+             fallback_event_ids=(), delivery_guard=None, delivery_lock=None):
     episode = state.get('episode')
     if not episode or not episode.get('active'):
         return
@@ -175,22 +178,36 @@ def dispatch(state, account, config, bridge, path):
                     if delivered['status'] != 'submitted':
                         failures.append('delivery_outcome_requires_reconciliation')
                     continue
-            event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
-            if event['kind'] == 'foreman_pause_required' and key == 'parent':
-                confirmation = next((e for e in episode['events'] if e['kind'] in (
-                    'reset_confirmation_required', 'reset_availability_unknown')), None)
-                if confirmation:
-                    event['deliveries'][key]['includesEvent'] = confirmation['id']
-            save(path, state)
-            try:
-                bridge.send(target, make_prompt(event, episode, account, path, key))
-            except Exception:
-                event['deliveries'][key]['status'] = 'outcome_unknown'
+            with delivery_lock() if delivery_lock is not None else nullcontext():
+                fallback_pause = (event['id'] in fallback_event_ids and
+                                  event['kind'] == 'foreman_pause_required' and
+                                  event.get('reason') == 'observation_failed_during_confirmed_exhaustion')
+                if not exhausted(current_observation or {}) and not fallback_pause:
+                    failures.append('current_zero_required_before_delivery')
+                    continue
+                if delivery_guard is not None and not delivery_guard():
+                    failures.append('maintenance_delivery_inhibited')
+                    continue
+                recipient_bridge = bridge.for_recipient(key) if hasattr(bridge, 'for_recipient') else bridge
+                if recipient_bridge is None:
+                    failures.append(key + '_destination_unavailable')
+                    continue  # Known unsent: no uncertain receipt and no replay permission needed.
+                event['deliveries'][key] = {'status': 'attempting', 'target': target, 'at': time.time()}
+                if event['kind'] == 'foreman_pause_required' and key == 'parent':
+                    confirmation = next((e for e in episode['events'] if e['kind'] in (
+                        'reset_confirmation_required', 'reset_availability_unknown')), None)
+                    if confirmation:
+                        event['deliveries'][key]['includesEvent'] = confirmation['id']
                 save(path, state)
-                failures.append('delivery_outcome_unknown')
-                continue
-            event['deliveries'][key]['status'] = 'submitted'
-            save(path, state)
+                try:
+                    recipient_bridge.send(target, make_prompt(event, episode, account, path, key))
+                except Exception:
+                    event['deliveries'][key]['status'] = 'outcome_unknown'
+                    save(path, state)
+                    failures.append('delivery_outcome_unknown')
+                    continue
+                event['deliveries'][key]['status'] = 'submitted'
+                save(path, state)
     if failures:
         raise RuntimeError(';'.join(sorted(set(failures))))
 
@@ -227,7 +244,7 @@ def validate_config(config, activate=False):
 
 
 def run(config, state_dir, *, once=False, observe_only=False):
-    validate_config(config, activate=not observe_only)
+    validate_config(config, activate=False)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (state_dir / 'observer.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -237,17 +254,28 @@ def run(config, state_dir, *, once=False, observe_only=False):
             # boundary across deployment, rollback, and accidental old restarts.
             shared = Path(config['sharedLock']).open('r')
             fcntl.flock(shared, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        transport = Transport(state_dir, config) if not observe_only else None
-        if transport and os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
-            try:
-                publish_candidate(state_dir, config, os.environ)
-            except (OSError, ValueError):
-                pass  # A stale bootstrap route must not stop quota observation.
+        transport = None
         try:
             while True:
                 started = time.monotonic()
                 health = {'observedAt': dt.datetime.now(dt.UTC).isoformat(), 'pid': os.getpid(),
                           'observeOnly': observe_only, 'accounts': {}}
+                activation = ({'mode': 'observe_only'} if observe_only else delivery_status(config, state_dir))
+                armed = activation['mode'] == 'active'
+                if armed:
+                    try:
+                        validate_config(config, activate=True)
+                    except ValueError:
+                        armed = False
+                        activation = {'mode': 'maintenance', 'reason': 'activation_policy_invalid'}
+                health['delivery'] = activation
+                if armed and transport is None:
+                    transport = Transport(state_dir, config)
+                    if os.environ.get('CODEX_APP_TOOLS_PIPE_PATH'):
+                        try: publish_candidate(state_dir, config, os.environ)
+                        except (OSError, ValueError): pass
+                elif not armed and transport is not None:
+                    transport.close(); transport = None
                 bridge = None
                 # Both profile reads start together; one slow/failing account cannot
                 # indefinitely starve the other account's threshold check.
@@ -256,7 +284,7 @@ def run(config, state_dir, *, once=False, observe_only=False):
                     if transport:
                         try:
                             bridge = transport.connection()
-                            health['transport'] = 'verified'
+                            health['transport'] = 'verified' if transport.health.get('healthy') else 'partial'
                         except Exception:
                             health['transport'] = 'unavailable'
                     alias_reading = None
@@ -299,19 +327,28 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                 save(state_dir / ('closed-' + prior_episode['id'] + '.json'), state['episode'])
                             state, _ = advance(state, reading, account, now=time.time(), policy=config['policy'])
                             save(path, state)
-                            if not observe_only:
+                            if armed:
                                 if bridge is None:
                                     raise RuntimeError('native_transport_unavailable')
-                                dispatch(state, account, config, bridge, path)
-                            health['accounts'][name] = {'status': 'healthy', 'sampleAt': reading['observedAt'],
+                                dispatch(state, account, config, bridge, path,
+                                         current_observation=reading,
+                                         delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',
+                                         delivery_lock=lambda: decision_lock(state_dir))
+                            health['accounts'][name] = {'status': 'healthy', 'observationStatus': 'healthy',
+                                                       'deliveryStatus': health.get('transport', 'unavailable') if armed else activation['mode'],
+                                                       'sampleAt': reading['observedAt'],
                                                        'email': reading['email'], 'accountId': reading['accountId']}
                         except Exception as error:
-                            health['accounts'][name] = {'status': 'degraded', 'errorType': type(error).__name__,
+                            health['accounts'][name] = {'status': 'degraded',
+                                                       'observationStatus': 'healthy' if observation_acquired else 'unavailable',
+                                                       'sampleAt': reading['observedAt'] if observation_acquired else None,
+                                                       'deliveryStatus': 'degraded' if armed else activation['mode'],
+                                                       'errorType': type(error).__name__,
                                                        'reason': str(error) if isinstance(error, (RuntimeError, ValueError)) else 'read_or_dispatch_failed'}
                             if (bridge is not None and isinstance(error, RuntimeError) and
                                     'delivery_outcome_unknown' in str(error).split(';')):
                                 transport.close(); bridge = None
-                            if not observation_acquired and not observe_only and path.exists():
+                            if not observation_acquired and armed and path.exists():
                                 try:
                                     retained = json.loads(path.read_text())
                                     if configured.get('dynamicDefault'):
@@ -323,8 +360,14 @@ def run(config, state_dir, *, once=False, observe_only=False):
                                     retained, new_events = observation_failed(retained, config['policy'])
                                     if new_events:
                                         save(path, retained)
-                                        bridge = transport.connection()
-                                        dispatch(retained, account, config, bridge, path)
+                                        # Reuse this poll's recipient checks so a slow
+                                        # quota failure cannot reset its route budget.
+                                        if bridge is None:
+                                            raise RuntimeError('native_transport_unavailable')
+                                        dispatch(retained, account, config, bridge, path,
+                                                 fallback_event_ids={e['id'] for e in new_events},
+                                                 delivery_guard=lambda: delivery_status(config, state_dir)['mode'] == 'active',
+                                                 delivery_lock=lambda: decision_lock(state_dir))
                                 except Exception:
                                     health['accounts'][name]['fallbackDelivery'] = 'unconfirmed'
                 save(state_dir / 'health.json', health)

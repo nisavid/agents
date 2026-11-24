@@ -128,7 +128,7 @@ def record_completion(record, config, directory, name):
         result = validate(record)
         bind(record, config, directory, name)
         latest = directory / f'pause-completion-{name}.json'
-        pointer = read_private(latest)
+        pointer = read_pointer(latest)
         if pointer is not None:
             validate_pointer(pointer)
         archive = private_directory(directory / 'pause-completions')
@@ -190,7 +190,7 @@ def completion_status(config, directory, name):
         record = read_archive(archive, pointer['sha256'])
         result = validate(record)
         bind(record, config, directory, name)
-        return {'status': result, 'sha256': pointer['sha256'], 'observedAt': record['observedAt'],
+        return {'status': result, 'sha256': pointer['sha256'], 'observedAt': record['observedAt'], 'episodeId': record['episodeId'],
                 'evidenceAuthority': 'local_writer_observation'}
     except Exception as error:
         return {'status': 'unconfirmed', 'reason': str(error) if isinstance(error, ValueError) else 'completion_record_unavailable'}

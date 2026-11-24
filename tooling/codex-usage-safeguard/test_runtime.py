@@ -23,6 +23,13 @@ from test_controller import CONFIG, ReceiptTransport
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_empty_capture_receipt_is_rejected_instead_of_selecting_normal_mode(self):
+        command = [sys.executable, '-B', str(Path(__file__).with_name('companion.py')),
+                   '--capture-receipt', '', '--config', '/nonexistent-config.json', '--state-dir', '/nonexistent-state']
+        result = subprocess.run(command, input='', capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('capture requires', result.stderr)
+
     def capture_process(self, root, requests, *, receipt=None, receipt_bytes=None,
                         environment=None, bridge_script=None, output_limit=None):
         receipt_path = root / 'creation-receipt.json'

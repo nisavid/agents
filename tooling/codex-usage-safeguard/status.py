@@ -21,7 +21,10 @@ def status(config_path, state_dir, now=None):
         episode = read_private(root / f'{name}.json', {}).get('episode')
         if episode:
             episodes[name] = {key: episode.get(key) for key in ('id', 'active', 'budgetStatus', 'waitingSpendUsd')}
-            episodes[name]['protectiveStop'] = completion_status(config, root, name)
+            stop = completion_status(config, root, name)
+            if stop.get('episodeId') not in (None, episode.get('id')):
+                stop = {'status': 'unconfirmed', 'reason': 'completion_episode_changed'}
+            episodes[name]['protectiveStop'] = stop
             episodes[name]['deliveries'] = {event['kind']: event.get('deliveries', {}) for event in episode['events']}
     modified = (root / 'health.json').stat().st_mtime if (root / 'health.json').exists() else 0
     age = (time.time() if now is None else now) - modified

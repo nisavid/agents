@@ -5,8 +5,7 @@ import json
 import sys
 
 from configuration import load_config, runtime_arguments
-from pause_completion import record_completion
-from storage import read_private
+from pause_completion import read_pointer, record_completion
 
 
 def main():
@@ -17,8 +16,8 @@ def main():
     args = parser.parse_args()
     try:
         config = load_config(args.config, args.state_dir)
-        result = record_completion(read_private(args.record), config, args.state_dir, args.account)
-    except (ValueError, OSError, KeyError, TypeError, StopIteration) as error:
+        result = record_completion(read_pointer(args.record), config, args.state_dir, args.account)
+    except (ValueError, OSError, KeyError, TypeError, StopIteration, RecursionError) as error:
         print(str(error), file=sys.stderr)
         return 2
     print(json.dumps(result))

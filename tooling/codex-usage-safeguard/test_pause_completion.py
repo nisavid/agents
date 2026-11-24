@@ -435,6 +435,53 @@ class CompletionTests(unittest.TestCase):
             save(self.root / 'main.json', state)
             self.assertEqual(completion_status(config, self.root, 'main')['status'], 'unconfirmed', repr(opened))
 
+    def test_recorder_rejects_unusable_episode_open_times_cleanly(self):
+        self.assertEqual(self.produce().returncode, 0)
+        original = json.loads((self.root / 'main.json').read_text())
+        for opened in (10 ** 400, float('inf'), float('nan'), False):
+            state = json.loads(json.dumps(original))
+            state['episode']['openedAt'] = opened
+            save(self.root / 'main.json', state)
+            result = self.produce()
+            self.assertEqual(result.returncode, 2, (opened, result.stderr))
+            self.assertIn('invalid_episode_open_time', result.stderr)
+
+    def test_recorder_rejects_fifo_inputs_without_blocking(self):
+        self.assertEqual(self.produce().returncode, 0)
+        pointer_path = self.root / 'pause-completion-main.json'
+        valid_pointer = pointer_path.read_bytes()
+        pointer_path.unlink()
+        os.mkfifo(pointer_path, 0o600)
+        result = subprocess.run([
+            sys.executable, '-B', str(PACKAGE / 'record_pause_completion.py'),
+            '--config', str(self.config_path), '--state-dir', str(self.root),
+            '--account', 'main', '--record', str(self.root / 'input.json')],
+            text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        pointer_path.unlink()
+        pointer_path.write_bytes(valid_pointer); pointer_path.chmod(0o600)
+        record_path = self.root / 'input.json'
+        record_path.unlink()
+        os.mkfifo(record_path, 0o600)
+        result = subprocess.run([
+            sys.executable, '-B', str(PACKAGE / 'record_pause_completion.py'),
+            '--config', str(self.config_path), '--state-dir', str(self.root),
+            '--account', 'main', '--record', str(record_path)],
+            text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_status_does_not_attach_a_stop_to_a_different_episode(self):
+        from unittest.mock import patch
+        from status import status
+        self.assertEqual(self.produce().returncode, 0)
+        self.assertEqual(status(self.config_path, self.root)['episodes']['main']['protectiveStop']['status'], 'stopped')
+        real = __import__('pause_completion').completion_status
+        def other_episode(config, directory, name):
+            return {**real(config, directory, name), 'episodeId': 'a-different-episode'}
+        with patch('status.completion_status', side_effect=other_episode):
+            stop = status(self.config_path, self.root)['episodes']['main']['protectiveStop']
+        self.assertEqual(stop, {'status': 'unconfirmed', 'reason': 'completion_episode_changed'})
+
     def test_armed_restart_does_not_replay_submitted_pause_or_consume_reset(self):
         import os
         from unittest.mock import patch

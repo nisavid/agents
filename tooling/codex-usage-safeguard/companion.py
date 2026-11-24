@@ -62,8 +62,8 @@ if __name__ == '__main__':
     parser.add_argument('--capture-receipt')
     parser.add_argument('--node-binary'); parser.add_argument('--native-bridge-script')
     args = parser.parse_args()
-    if args.capture_receipt:
-        if args.config or args.state_dir or not args.node_binary or not args.native_bridge_script:
+    if args.capture_receipt is not None:
+        if not args.capture_receipt or args.config or args.state_dir or not args.node_binary or not args.native_bridge_script:
             parser.error('capture requires the receipt and adapter paths, without production config or state')
         capture = capture_settings(args.capture_receipt, args.node_binary, args.native_bridge_script)
         serve(None, None, sys.stdin, sys.stdout, os.environ, capture=capture)

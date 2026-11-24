@@ -93,7 +93,9 @@ def bind(record, config, directory, name):
               if e.get('kind') == 'foreman_pause_required' and not e.get('invalidated')]
     require(bool(events), 'no_current_pause_event')
     require(record['episodeId'] == episode.get('id') and record['eventId'] == events[-1].get('id'), 'completion_episode_or_event_mismatch')
-    require(record['observedAt'] >= episode['openedAt'], 'completion_before_episode')
+    opened = episode.get('openedAt')
+    require(type(opened) in (int, float) and math.isfinite(opened) and opened >= 0, 'invalid_episode_open_time')
+    require(record['observedAt'] >= opened, 'completion_before_episode')
     require(record['accountId'] == state.get('accountId') == episode.get('accountId'), 'completion_account_mismatch')
     require(record['foremanThreadId'] == config['foremanThreadId'], 'completion_foreman_mismatch')
     if name == 'main':

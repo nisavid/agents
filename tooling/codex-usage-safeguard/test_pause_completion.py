@@ -423,6 +423,18 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(completion_status(config, self.root, 'main'),
                              {'status': 'unconfirmed', 'reason': 'completion_record_unavailable'})
 
+    def test_invalid_episode_open_time_never_admits_an_earlier_observation(self):
+        from configuration import load_config
+        from pause_completion import completion_status
+        self.assertEqual(self.produce().returncode, 0)
+        config = load_config(self.config_path, self.root)
+        original = json.loads((self.root / 'main.json').read_text())
+        for opened in (False, True, -1, float('nan'), None, 'a'):
+            state = json.loads(json.dumps(original))
+            state['episode']['openedAt'] = opened
+            save(self.root / 'main.json', state)
+            self.assertEqual(completion_status(config, self.root, 'main')['status'], 'unconfirmed', repr(opened))
+
     def test_armed_restart_does_not_replay_submitted_pause_or_consume_reset(self):
         import os
         from unittest.mock import patch

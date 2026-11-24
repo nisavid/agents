@@ -40,6 +40,92 @@ it sends nothing and redeems nothing. Capture its output privately. A successful
 read is evidence only for that app generation and registration, not proof that
 a later pause will be acknowledged.
 
+## Capture and adopt a local caller
+
+Use this procedure when an explicitly appointed local control chat needs genuine
+caller capture or when the operator chooses to replace an inaccessible caller.
+Read it at the reviewed source revision and retain that revision with the private
+evidence. [SPEC.md, Local caller and approval inbox](SPEC.md#local-caller-and-approval-inbox)
+defines the candidate and its evidence. Source tests qualify synthetic boundaries;
+live enrollment, installation, inbox transfer, and activation need their own
+explicit operational scope.
+
+1. Obtain authority for the reviewed installation, temporary MCP exposure, local
+   chat creation, and bounded initial capture turn. Keep the current account and
+   exact Foreman unless the approved scope expressly changes them. Complete
+   source review and package/repository checks before installation. Creating a
+   chat, selecting a title, or reading history does not establish caller context.
+2. Create the approved ordinary local chat through the native app. Retain its
+   actual final creation result privately as a user-owned `0600` JSON file. Its
+   direct `threadId` and `hostId: "local"` fields constrain enrollment. A queued
+   `clientThreadId` is insufficient; wait for the final result. Keep the complete
+   receipt bytes unchanged after capture. The receipt is a constraint against
+   enrolling another chat, not an authenticated substitute for the invocation.
+3. Configure a temporary MCP entry to run the reviewed package directly in capture
+   mode. Supply the private receipt and reviewed adapter paths:
+
+   ```sh
+   python3 companion.py --capture-receipt "$private_creation_receipt" \
+     --node-binary "$reviewed_node_binary" --native-bridge-script "$native_adapter"
+   ```
+
+   This is the MCP server command, not a shell capture invocation. Forward only
+   the genuinely inherited `CODEX_APP_TOOLS_PIPE_PATH` and, when supplied by the
+   runtime, `CODEX_APP_TOOLS_CALLER_HOST_ID`. Preserve the normal companion entry
+   and unrelated MCP settings. Capture mode requires no production configuration
+   or state and publishes no route. A configured or copied host/socket value is
+   not runtime provenance. Absence of the host variable qualifies local only
+   with all independent checks defined in the specification.
+4. Have the approved initial turn in that exact chat explicitly invoke
+   `capture_native_context` with `{}`. The tool must receive its thread, turn, and
+   model/native tool-call ID in actual runtime metadata. It uses the inherited
+   native route for one bounded read of that chat and checks returned ID, Codex
+   kind, and local host. If it returns `unsupported_capture`, retain the bounded
+   reason and stop before adoption. Missing tool-call metadata is a supported
+   refusal; request IDs, shell variables, and transcripts cannot repair it.
+   Malformed MCP frames produce an unsupported-capture parse error.
+5. Retain the returned `candidateJson` string as exact UTF-8 bytes without adding
+   a newline, together with the returned lowercase hexadecimal SHA-256. Recompute
+   that digest independently. Verify the recorded receipt digest against the
+   retained file, the runtime metadata sources, explicit or default-derived host
+   provenance, and exact local native readback. A mismatch rejects the candidate.
+   Remove only the temporary MCP entry within the approved cleanup scope. This
+   step ends with a reviewable candidate and evidence; it changes no stored caller,
+   inbox, activation, route registry, receipt, or quota policy.
+6. Before adoption, obtain explicit decisions appointing the captured chat as
+   native caller and as approval/status inbox. Those are separate responsibilities;
+   the Foreman remains the pause coordinator. Authorize the minimal context
+   handoff to the new inbox and exact Foreman. Refresh current episodes and
+   receipts. Retain submitted, `attempting`, and `outcome_unknown` receipts with
+   their original targets; uncertain outcomes require reconciliation rather than
+   retry. Define whether known-unsent active events may transfer. Preserve the
+   previous inbox as history, without fallback delivery or archived-event backfill.
+7. Qualify the captured context through the current inherited app route and read
+   both exact proposed recipients. A read proves access in that app generation.
+   If delivery proof is required, separately authorize one harmless, uniquely
+   marked message to each recipient and verify readback. Qualify saved-caller use
+   after the originating turn and after an approved app restart before claiming
+   persistence. An actual account switch requires its own approved test and
+   observations; synthetic account-environment changes do not establish it.
+   Self-delivery remains unqualified until observed. A real pause or reset is
+   never a qualification test.
+8. Adopt only within the controlled release handoff below, preserving both locks
+   and all current ledgers. Caller changes invalidate caller-bound routes, and
+   configuration changes invalidate activation. Start the normal companion to
+   renew the inherited route. Obtain fresh activation approval and strict live
+   preflight of both recipients before enabling delivery. Observe quota and
+   delivery health separately. Compatible rollback retains current ledgers;
+   restoring an inaccessible historical caller is not a verified recovery.
+
+Fixture qualification runs through `test_runtime.py` at the companion process/MCP
+boundary. It exercises discovery, capture success/refusal, metadata conflicts,
+exact receipt bytes, inherited-route and local-readback requirements, stable output
+across fixture process restarts and changed account environment, and production
+file preservation. No live capture, new chat, self-send, restart, account switch,
+installation, or adoption is established by that suite. Future capture consumers
+load this procedure before execution, retain its reviewed revision, and compare
+their actual result to its completion criteria.
+
 ## Controlled release handoff
 
 1. Complete local tests, independent review, source publication approval, and
@@ -134,10 +220,9 @@ are unavailable.
 
 If opening the app and loading a Codex session supplies a valid route, renewal
 is automatic for the existing registration. If caller authorization is rejected,
-stop at that boundary. Establish whether the app can supply fresh genuine caller
-context through its normal integration, and verify that context's permitted use
-before changing the stored caller. Do not assume a separate persistent grant is
-required or available. Creating or reading a task alone does not establish this
+stop at that boundary. Use [Capture and adopt a local caller](#capture-and-adopt-a-local-caller)
+when the operator authorizes that recovery direction. A candidate is not a
+persistent grant, and creating or reading a task alone does not establish caller
 context. The current sending method requires an explicit recipient thread ID;
 successful sending does not imply automatic discovery of the current dot.
 Normal companion startup supplies a connection route, not that recipient.
@@ -264,3 +349,85 @@ that are null are not substitutes for that evidence. Keep API assumptions in the
 small adapters and fail visibly when they no longer hold. Account-wide debit
 estimates include other concurrent activity and can undercount when grants mask
 consumption; the configured $8 threshold leaves headroom, not a guarantee.
+
+## Protective-stop completion
+
+After a pause request, collect the actual root roster, each root's stopped state,
+its owned workers or processes, and held continuation wakes. Record coverage
+limits and evidence references. A submitted message proves delivery only;
+missing return messages require supported readback or an explicit unknown.
+Retain verified human approval with its source, target, and scope. Distinguish
+an instruction refusal from an actual tool denial and escalate either unresolved
+stop through the existing parent route without bypassing a denial.
+
+Use the maintained producer from this package after collecting those observations:
+
+```sh
+python3 record_pause_completion.py --config "$private_config" \
+  --state-dir "$existing_state" --account main --record "$private_observations"
+```
+
+The private input has exactly these fields (identifiers and evidence below are
+synthetic; read the current identifiers from private state before invoking):
+
+```json
+{
+  "schemaVersion": 1,
+  "episodeId": "current-episode",
+  "eventId": "current-episode:foreman_pause_required",
+  "accountId": "current-account",
+  "identityGeneration": "current-main-generation",
+  "foremanThreadId": "configured-foreman",
+  "observedAt": 1791240000,
+  "inventory": {"complete": true, "evidenceReferences": ["private-roster-observation"]},
+  "roots": [{
+    "threadId": "observed-root",
+    "status": "stopped",
+    "workersComplete": true,
+    "workers": [{"id": "owned-worker-or-process", "status": "stopped"}],
+    "continuationHeld": true,
+    "failureKind": null,
+    "evidenceReferences": ["private-root-worker-and-wake-observations"]
+  }]
+}
+```
+
+Use `--account daybreak` with its pinned account ID and `identityGeneration: null`.
+Root and worker states are `stopped`, `blocked`, `unknown`, or `running`.
+`failureKind` is null, `instruction_refusal`, `tool_denial`, or `unknown`; blocked
+roots require a non-null kind. Stopped roots require complete worker coverage,
+all workers stopped, held continuation wakes, and a null failure kind. An empty
+root roster can establish a stop only with a complete, evidenced inventory.
+Incomplete inventories stay unknown or partial. Mixed root states stay partial;
+uniform blocked roots stay blocked; running or unknown roots never count as
+stopped. Evidence references must be nonempty; their contents and authority must
+be verified by the caller. This file interface does not authenticate its writer
+as Foreman or attest product state.
+
+The producer validates private ownership and modes, current account, main
+selection generation, active episode, latest valid pause event, and configured
+Foreman. It retains observations in `pause-completions/<sha256>.json` and updates
+`pause-completion-main.json` or `pause-completion-daybreak.json` separately from
+policy and delivery receipts. Older observations cannot replace newer ones for
+the same episode and event. At an equal timestamp, only a retry with the identical
+currently selected record digest is accepted. A conflicting tie is rejected and
+leaves the pointer, archives, and receipts intact. Inspect the producer's exit
+status: the retained record does not prove that a rejected submission was accepted.
+Use the actual observation time; do not alter it to bypass a rejection.
+
+The producer and consumers compare `observedAt` directly with the active episode's
+`openedAt`, with no tolerance: an earlier time is rejected on submission and reads
+as unconfirmed if already retained. Equal or later times satisfy this lower bound,
+subject to the other checks. It is not an expiry interval or proof of observation
+after the current pause request; collect the evidence after that request as above.
+
+The observer's one-pass run and `status.py` revalidate
+that record and expose `protectiveStop` independently of delivery health. Invalid,
+missing, or stale records report unconfirmed. A restart performs no completion
+message replay, release, reset, or automatic resume.
+
+Read this procedure at the reviewed source revision before producing a record.
+Preserve that revision with the observation evidence. Qualification uses the CLI
+and observer boundaries in `test_pause_completion.py`, with disposable state.
+Installing this producer or writing live completion evidence remains a separate
+approved rollout; source tests do not establish either.

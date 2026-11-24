@@ -28,6 +28,22 @@ class ReceiptTransport:
 
 
 class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        attempts = []
+        original_read_text = Path.read_text
+
+        def fixture_read_text(path, *args, **kwargs):
+            if path.name == 'auth.json' and path.parent.name == '.codex':
+                attempts.append(True)
+                raise PermissionError('ambient credential read refused by controller fixture')
+            return original_read_text(path, *args, **kwargs)
+
+        guard = patch.object(Path, 'read_text', fixture_read_text)
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.addCleanup(self.assertEqual, attempts, [],
+                        'controller fixture attempted an ambient credential read')
+
     def test_submitted_daybreak_pause_is_invalidated_on_switch_and_new_condition_gets_new_id(self):
         account = dict(ACCOUNT, name='daybreak', alsoCurrentMain=True)
         with tempfile.TemporaryDirectory() as directory:

@@ -32,9 +32,7 @@ Rolecasting, Tricritical, Versionkeeping, Mergecraft, Artifact Customs, Task
 Witness, and Tidesmith live in
 [`nisavid/provingkit`](https://github.com/nisavid/provingkit). Do not add or
 restore their source here; change them in Provingkit.
-`scripts/validate_provingkit_retirement.py` rejects the retired paths it lists;
-it does not detect member source added elsewhere, so check new paths against
-this boundary.
+Check new paths against this boundary.
 
 `tooling/` owns the personal tools that remain here, each with its own
 documentation. `.scratch/` holds unrelated experiments and is not a supported
@@ -46,14 +44,8 @@ Use Conventional Commits for commits and pull request titles; Cocogitto
 enforces them through the `commit-msg` and `pre-push` hooks that
 `cog install-hook --all` installs. Every change requires `git diff --check`.
 
-Before publication, validate the repository boundary:
-
-```sh
-python -m unittest tests.test_validate_provingkit_retirement
-python scripts/validate_provingkit_retirement.py .
-```
-
-Also run the checks documented by any touched tool under `tooling/`.
+Before publication, also run the checks documented by any touched tool under
+`tooling/`.
 
 ## Operating Policy
 

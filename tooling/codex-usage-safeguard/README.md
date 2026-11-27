@@ -52,7 +52,5 @@ explicit, read-only operational check.
 The repository checks also apply:
 
 ```sh
-python3 -m unittest tests.test_validate_provingkit_retirement
-python3 scripts/validate_provingkit_retirement.py .
 git diff --check
 ```

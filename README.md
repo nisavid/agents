@@ -29,13 +29,7 @@ use Provingkit for current member source and policy.
 
 ## Development
 
-Commits use Conventional Commits, enforced by Cocogitto. Validate the current
-repository boundary with:
-
-```sh
-python -m unittest tests.test_validate_provingkit_retirement
-python scripts/validate_provingkit_retirement.py .
-```
+Commits use Conventional Commits, enforced by Cocogitto.
 
 ## License
 
